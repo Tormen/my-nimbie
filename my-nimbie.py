@@ -102,6 +102,7 @@ _my-nimbie() {
         'accept:Tell paused batch/next to accept the disc'
         'retry:Tell paused batch/next to retry the command'
         'stop:Tell paused batch/next to reject and stop'
+        'unmount:Unmount disc from optical drive'
         'cancel:Cancel running batch/next (sends SIGINT to the process)'
         'reset:Recover Nimbie from error states (bootloader, stuck disc)'
     )
@@ -1869,15 +1870,38 @@ def _recover_drive_state(nimbie, mount_point):
     return False
 
 
+def cmd_unmount(_nimbie, config, _args):
+    """Unmount the disc from the optical drive."""
+    mount_point = config.get("nimbie", "mount_point")
+    if not os.path.ismount(mount_point):
+        msg(f"Not mounted: {mount_point}")
+        return
+    if unmount_disc(mount_point):
+        msg(f"Unmounted {mount_point}")
+    else:
+        err(f"Failed to unmount {mount_point}\n\n"
+            f"  The disc may be in use by another process.\n"
+            f"  Try: diskutil unmount force {mount_point}")
+
 def cmd_eject(nimbie, config, _args):
     mount_point = config.get("nimbie", "mount_point")
-    unmount_disc(mount_point)
+    if os.path.ismount(mount_point):
+        msg(f"Unmounting {mount_point}...")
+        if not unmount_disc(mount_point):
+            err(f"Cannot unmount {mount_point} — disc may be in use\n\n"
+                f"  Try: diskutil unmount force {mount_point}\n"
+                f"  Then: my-nimbie eject")
     msg("Accepting disc (eject to done bin)...")
     nimbie.eject_accept()
 
 def cmd_reject(nimbie, config, _args):
     mount_point = config.get("nimbie", "mount_point")
-    unmount_disc(mount_point)
+    if os.path.ismount(mount_point):
+        msg(f"Unmounting {mount_point}...")
+        if not unmount_disc(mount_point):
+            err(f"Cannot unmount {mount_point} — disc may be in use\n\n"
+                f"  Try: diskutil unmount force {mount_point}\n"
+                f"  Then: my-nimbie reject")
     msg("Rejecting disc (eject to reject bin)...")
     nimbie.eject_reject()
 
@@ -3177,7 +3201,7 @@ class TestArgvExpansion(unittest.TestCase):
                 expanded.extend(["-D"] * len(arg[1:]))
             else:
                 expanded.append(arg)
-        subcommands = {"load", "eject", "reject", "status", "next", "batch", "reset", "cancel"}
+        subcommands = {"load", "eject", "reject", "unmount", "status", "next", "batch", "reset", "cancel"}
         global_flags = {"-D", "-v", "-V", "-d", "--debug", "--verbose", "--dry", "--deepdbg"}
         hoisted = []
         rest = []
@@ -3405,6 +3429,7 @@ Monitoring a running batch:
     sub.add_parser("load",   help="Load next disc from hopper into drive")
     sub.add_parser("eject",  help="Eject current disc to accept (done) bin")
     sub.add_parser("reject", help="Reject current disc to reject bin (or: tell paused batch to reject)")
+    sub.add_parser("unmount", help="Unmount disc from optical drive")
     sub.add_parser("status", help="Show Nimbie device state (or batch progress if running)")
     sub.add_parser("accept", help="Tell a paused batch/next to accept the disc")
     sub.add_parser("retry",  help="Tell a paused batch/next to retry the command")
@@ -3547,7 +3572,7 @@ def main():
         else:
             expanded.append(arg)
     # Hoist global flags (-D, -v, -d, --debug, --verbose, --dry) before the subcommand
-    subcommands = {"load", "eject", "reject", "status", "next", "batch", "reset", "cancel"}
+    subcommands = {"load", "eject", "reject", "unmount", "status", "next", "batch", "reset", "cancel"}
     global_flags = {"-D", "-v", "-V", "-d", "--debug", "--verbose", "--dry", "--deepdbg"}
     hoisted = []
     rest = []
@@ -3590,6 +3615,11 @@ def main():
 
     config_path = find_config_file(args.config)
     config = load_config(config_path)
+
+    # Unmount command: no USB needed
+    if args.command == "unmount":
+        cmd_unmount(None, config, args)
+        return
 
     # Cancel command: send SIGINT to running batch/next process
     if args.command == "cancel":
