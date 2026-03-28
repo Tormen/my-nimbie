@@ -2353,9 +2353,9 @@ def cmd_status(nimbie, config, _args):
     if sf and sf.get("state") in ("finished", "interrupted"):
         mode_label = "my-nimbie batch" if is_batch else "my-nimbie next"
         msg(f"Last '{mode_label}': {sf.get('flavor', '?')} — {sf.get('state')}")
+        if sf.get("last_disc"):
+            msg(f"  Last disc:   {sf['last_disc']}")
         msg(f"  Accepted: {sf.get('accepted', '?')}, Rejected: {sf.get('rejected', '?')}")
-        if is_batch and sf.get("last_disc"):
-            msg(f"  Last disc: {sf['last_disc']}")
         msg("")
 
     # No batch running — query USB device directly
