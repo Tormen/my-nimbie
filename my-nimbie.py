@@ -156,7 +156,6 @@ DEFAULT_CONFIG = {
 CONFIG_SEARCH_PATHS = [
     os.path.expanduser("~/.my-nimbie.conf"),
     "/etc/my-nimbie.conf",
-    "/LINKS/global/etc/my-nimbie",
     "/LINKS/default/my-nimbie",
 ]
 
@@ -387,7 +386,7 @@ def generate_example_config():
     return """\
 # my-nimbie configuration
 #
-# Search order: ~/.my-nimbie.conf, /etc/my-nimbie.conf, /LINKS/global/etc/my-nimbie, /LINKS/default/my-nimbie
+# Search order: ~/.my-nimbie.conf, /etc/my-nimbie.conf, /LINKS/default/my-nimbie
 # Or specify explicitly: my-nimbie --config /path/to/config <command>
 
 [nimbie]
@@ -1437,8 +1436,7 @@ Examples:
 Config file search order:
   1. ~/.my-nimbie.conf
   2. /etc/my-nimbie.conf
-  3. /LINKS/global/etc/my-nimbie
-  4. /LINKS/default/my-nimbie
+  3. /LINKS/default/my-nimbie
 
 Batch flavors and their config keys:
   (none)      → [commands] on_load_DEFAULT      [target_dirs] default
