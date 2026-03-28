@@ -650,7 +650,7 @@ def load_config(config_path):
         config[section] = values
 
     config.read(config_path)
-    vrb(f"  Config loaded from: {config_path}")
+    vrb(f"Config loaded from: {config_path}")
 
     config.config_path = config_path  # store for status display
     return config
@@ -1041,7 +1041,7 @@ class NimbieDevice:
                 break
         ddbg(f"  Drained {drain_count} stale packet(s)")
 
-        vrb(f"  Nimbie connected (VID={self.vid:#06x}, PID={self.pid:#06x})")
+        vrb(f"Nimbie connected (VID={self.vid:#06x}, PID={self.pid:#06x})")
 
     def disconnect(self):
         """Release the USB device."""
