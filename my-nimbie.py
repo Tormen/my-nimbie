@@ -1866,12 +1866,6 @@ def cmd_status(nimbie, config, _args):
         msg(f"    my-nimbie eject    — eject disc to accept bin")
         msg(f"    my-nimbie reject   — eject disc to reject bin")
 
-        # Clean up stale files
-        for stale_f in (STATUS_FILE, PROGRESS_FILE):
-            try:
-                os.unlink(stale_f)
-            except FileNotFoundError:
-                pass
         msg("")
         # Fall through to show hardware state below
 
