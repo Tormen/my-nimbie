@@ -102,6 +102,7 @@ _my-nimbie() {
         'accept:Tell paused batch/next to accept the disc'
         'retry:Tell paused batch/next to retry the command'
         'stop:Tell paused batch/next to reject and stop'
+        'cancel:Cancel running batch/next (sends SIGINT to the process)'
         'reset:Recover Nimbie from error states (bootloader, stuck disc)'
     )
 
@@ -2241,13 +2242,20 @@ def cmd_status(nimbie, config, _args):
         # Query hardware to check if disc is stuck
         msg("")
         state = nimbie.get_state()
-        disc_stuck = state["disc_in_tray"] or state["disc_lifted"]
-        if disc_stuck:
+        disc_in_closed_drive = not state["tray_out"] and not state["disc_in_tray"] and not state["disc_lifted"]
+        disc_stuck = state["disc_in_tray"] or state["disc_lifted"] or disc_in_closed_drive
+        if state["disc_in_tray"] or state["disc_lifted"]:
             msg(f"  Disc in drive! (in_tray={state['disc_in_tray']}, lifted={state['disc_lifted']})")
             msg(f"    my-nimbie eject    — eject disc to accept bin")
             msg(f"    my-nimbie reject   — eject disc to reject bin")
+        elif disc_in_closed_drive:
+            msg(f"  Disc likely in closed drive (tray closed, crashed during '{sf.get('state', '?')}')")
+            msg(f"    my-nimbie eject    — open tray, lift disc, drop to accept bin")
+            msg(f"    my-nimbie reject   — open tray, lift disc, drop to reject bin")
         else:
-            msg(f"  No disc in drive.")
+            msg(f"  No disc in drive (tray open, nothing detected).")
+
+        if not disc_stuck:
             # Safe to clean up stale status file
             try:
                 os.unlink(STATUS_FILE)
@@ -3137,7 +3145,7 @@ class TestArgvExpansion(unittest.TestCase):
                 expanded.extend(["-D"] * len(arg[1:]))
             else:
                 expanded.append(arg)
-        subcommands = {"load", "eject", "reject", "status", "next", "batch", "reset"}
+        subcommands = {"load", "eject", "reject", "status", "next", "batch", "reset", "cancel"}
         global_flags = {"-D", "-v", "-V", "-d", "--debug", "--verbose", "--dry", "--deepdbg"}
         hoisted = []
         rest = []
@@ -3333,6 +3341,7 @@ Monitoring a running batch:
     sub.add_parser("accept", help="Tell a paused batch/next to accept the disc")
     sub.add_parser("retry",  help="Tell a paused batch/next to retry the command")
     sub.add_parser("stop",   help="Tell a paused batch/next to reject and stop")
+    sub.add_parser("cancel", help="Cancel running batch/next (sends SIGINT to the process)")
 
     reset_parser = sub.add_parser("reset", help="Recover Nimbie from error states (bootloader mode, stuck disc)",
                                   formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3470,7 +3479,7 @@ def main():
         else:
             expanded.append(arg)
     # Hoist global flags (-D, -v, -d, --debug, --verbose, --dry) before the subcommand
-    subcommands = {"load", "eject", "reject", "status", "next", "batch", "reset"}
+    subcommands = {"load", "eject", "reject", "status", "next", "batch", "reset", "cancel"}
     global_flags = {"-D", "-v", "-V", "-d", "--debug", "--verbose", "--dry", "--deepdbg"}
     hoisted = []
     rest = []
@@ -3513,6 +3522,26 @@ def main():
 
     config_path = find_config_file(args.config)
     config = load_config(config_path)
+
+    # Cancel command: send SIGINT to running batch/next process
+    if args.command == "cancel":
+        sf = BatchStatus.read_file()
+        if not sf or sf.get("state") in ("finished", "interrupted"):
+            err("No running batch/next process to cancel.\n\n"
+                "  There is no active batch or next process.")
+        pid_str = sf.get("pid")
+        if not pid_str:
+            err("No PID in status file — cannot cancel.")
+        pid = int(pid_str)
+        try:
+            os.kill(pid, 0)  # check if alive
+        except OSError:
+            err(f"Process {pid} is not running (already dead).\n\n"
+                f"  Run 'my-nimbie status' to see crash details.")
+        import signal
+        os.kill(pid, signal.SIGINT)
+        msg(f"Sent SIGINT to PID {pid} — batch/next should stop gracefully.")
+        return
 
     # Pause control commands: send command to paused batch/next process, no USB needed
     if args.command in ("accept", "retry", "stop"):
