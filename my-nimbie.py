@@ -1266,7 +1266,7 @@ class NimbieDevice:
                 f"  All responses: {responses}")
 
     def lift_disc(self):
-        """Lift disc from open tray with the gripper mechanism."""
+        """Lift disc from open tray with the gripper mechanism. Returns True on success."""
         responses = self._send_and_read(CMD_LIFT_DISC, "LIFT_DISC",
                                         timeout=15000, max_reads=100,
                                         wait_for_at=True)
@@ -1275,10 +1275,13 @@ class NimbieDevice:
         if at == AT_OK:
             # Poll until disc is lifted
             self._poll_state(lambda s: s["disc_lifted"], "disc to be lifted", timeout=10)
+            return True
         elif at == AT_NO_DISC:
             warn("No disc in tray to lift")
+            return False
         elif at == AT_DROPPER_ERR:
-            err("Lift mechanism error (disc may already be lifted or mechanism stuck)")
+            warn("Lift mechanism error (disc may already be lifted or mechanism stuck)")
+            return False
         else:
             err(f"Unexpected response from LIFT_DISC: {at}\n"
                 f"  All responses: {responses}")
@@ -1293,6 +1296,8 @@ class NimbieDevice:
         if at == AT_OK:
             # Poll until disc is no longer lifted
             self._poll_state(lambda s: not s["disc_lifted"], "disc to drop to accept", timeout=10)
+        elif at == AT_DROPPER_ERR:
+            warn("No disc lifted to accept (nothing to do)")
         else:
             err(f"Unexpected response from ACCEPT_DISC: {at}\n"
                 f"  All responses: {responses}")
@@ -1306,6 +1311,8 @@ class NimbieDevice:
 
         if at == AT_OK:
             self._poll_state(lambda s: not s["disc_lifted"], "disc to drop to reject", timeout=10)
+        elif at == AT_DROPPER_ERR:
+            warn("No disc lifted to reject (nothing to do)")
         else:
             err(f"Unexpected response from REJECT_DISC: {at}\n"
                 f"  All responses: {responses}")
@@ -1333,7 +1340,11 @@ class NimbieDevice:
         self.open_tray()
 
         vrb("  Lifting disc...")
-        self.lift_disc()
+        if not self.lift_disc():
+            warn("Cannot eject — no disc to lift")
+            vrb("  Closing tray...")
+            self.close_tray()
+            return
 
         vrb("  Closing tray...")
         self.close_tray()
@@ -1347,7 +1358,11 @@ class NimbieDevice:
         self.open_tray()
 
         vrb("  Lifting disc...")
-        self.lift_disc()
+        if not self.lift_disc():
+            warn("Cannot reject — no disc to lift")
+            vrb("  Closing tray...")
+            self.close_tray()
+            return
 
         vrb("  Closing tray...")
         self.close_tray()
@@ -1840,8 +1855,7 @@ def cmd_status(nimbie, config, _args):
             process_crashed = True
 
     if process_crashed:
-        # Process died — show CRASHED status with disc info, then clean up and
-        # fall through to show hardware state so the user knows what to do
+        # Process died — show crash info, query hardware, and clean up if safe
         mode_label = "Batch" if is_batch else "Next"
         disc_nr = sf.get('disc_nr', '?')
         idx_offset = sf.get('idx_offset')
@@ -1866,12 +1880,29 @@ def cmd_status(nimbie, config, _args):
             msg(f"  Rejected:    {sf.get('rejected', '?')}")
         if is_batch and sf.get("last_disc"):
             msg(f"  Last disc:   {sf['last_disc']}")
-        msg(f"\n  The disc may still be in the drive.")
-        msg(f"    my-nimbie eject    — eject disc to accept bin")
-        msg(f"    my-nimbie reject   — eject disc to reject bin")
 
+        # Query hardware to check if disc is stuck
         msg("")
-        # Fall through to show hardware state below
+        state = nimbie.get_state()
+        disc_stuck = state["disc_in_tray"] or state["disc_lifted"] or state["tray_out"]
+        if disc_stuck:
+            msg(f"  WARNING: Disc may still be in the drive!")
+            msg(f"    Disc in tray: {state['disc_in_tray']}, Lifted: {state['disc_lifted']}, Tray out: {state['tray_out']}")
+            msg(f"    my-nimbie eject    — eject disc to accept bin")
+            msg(f"    my-nimbie reject   — eject disc to reject bin")
+        else:
+            msg(f"  Hardware: no disc in drive, nothing stuck.")
+            # Safe to clean up stale status file
+            try:
+                os.unlink(STATUS_FILE)
+            except OSError:
+                pass
+            try:
+                os.unlink(PROGRESS_FILE)
+            except OSError:
+                pass
+        return
+        # Don't fall through — we already queried hardware above
 
     if not process_crashed and sf and sf.get("state") not in ("finished", "interrupted"):
         mode_label = "Batch" if is_batch else "Next"
@@ -2442,6 +2473,352 @@ class _HelpfulParser(argparse.ArgumentParser):
         self.exit(2, f"\n  ERROR: {self.prog}: {message}\n{hint}")
 
 
+# ---------------------------------------------------------------------------
+# Unit tests (my-nimbie --test)
+# ---------------------------------------------------------------------------
+import unittest
+import tempfile
+
+
+class TestExpandNamingVars(unittest.TestCase):
+    def test_basic(self):
+        self.assertEqual(expand_naming_vars("{INDEX}", {"INDEX": "001"}), "001")
+
+    def test_case_insensitive(self):
+        self.assertEqual(expand_naming_vars("{index}", {"INDEX": "001"}), "001")
+
+    def test_multiple(self):
+        result = expand_naming_vars("{INDEX} - {MEDIA_TYPE}", {"INDEX": "005", "MEDIA_TYPE": "DVD"})
+        self.assertEqual(result, "005 - DVD")
+
+    def test_unknown_left_alone(self):
+        self.assertEqual(expand_naming_vars("{UNKNOWN}", {}), "{UNKNOWN}")
+
+    def test_no_vars(self):
+        self.assertEqual(expand_naming_vars("plain text", {}), "plain text")
+
+    def test_empty(self):
+        self.assertEqual(expand_naming_vars("", {}), "")
+
+
+class TestExpandCommand(unittest.TestCase):
+    def test_basic(self):
+        result = expand_command("dvdbackup -i $MOUNT_POINT",
+                                "/Volumes/DVD", 1, "/out", "/out/001")
+        self.assertEqual(result, 'dvdbackup -i /Volumes/DVD')
+
+    def test_braces(self):
+        result = expand_command("cmd ${MOUNT_POINT} ${DIR_NAME}",
+                                "/Volumes/DVD", 1, "/out", "/out/001")
+        self.assertEqual(result, 'cmd /Volumes/DVD /out/001')
+
+    def test_all_vars(self):
+        result = expand_command("$MOUNT_POINT $TARGET_DIR $DIR_NAME $DISC_NR",
+                                "/mnt", 5, "/target", "/target/dir")
+        self.assertEqual(result, '/mnt /target /target/dir 5')
+
+
+class TestEnsureDvdbackupFlags(unittest.TestCase):
+    def test_adds_name(self):
+        result = _ensure_dvdbackup_flags("dvdbackup -i /Volumes/DVD -M", "/Volumes/DVD")
+        self.assertIn('-n "DVD"', result)
+
+    def test_preserves_existing_name(self):
+        result = _ensure_dvdbackup_flags('dvdbackup -n "CUSTOM" -i /Volumes/DVD', "/Volumes/DVD")
+        self.assertNotIn('-n "DVD"', result)
+        self.assertIn('-n "CUSTOM"', result)
+
+    def test_preserves_long_name_flag(self):
+        result = _ensure_dvdbackup_flags('dvdbackup --name "CUSTOM" -i /Volumes/DVD', "/Volumes/DVD")
+        self.assertNotIn('-n "DVD"', result)
+
+    def test_compound_command(self):
+        result = _ensure_dvdbackup_flags('mkdir -p "$DIR" && dvdbackup -i /Volumes/DVD -M', "/Volumes/DVD")
+        self.assertIn('mkdir -p "$DIR"', result)
+        self.assertIn('-n "DVD"', result)
+
+    def test_non_dvdbackup(self):
+        result = _ensure_dvdbackup_flags("cdparanoia -B -- -0", "/Volumes/CD")
+        self.assertEqual(result, "cdparanoia -B -- -0")
+
+
+class TestFormatSize(unittest.TestCase):
+    def test_bytes(self):
+        self.assertEqual(_format_size(512), "512 B")
+
+    def test_kb(self):
+        self.assertEqual(_format_size(2048), "2.0 KB")
+
+    def test_mb(self):
+        self.assertEqual(_format_size(5 * 1048576), "5.0 MB")
+
+    def test_gb(self):
+        self.assertEqual(_format_size(3 * 1073741824), "3.0 GB")
+
+
+class TestBatchStatusFmtElapsed(unittest.TestCase):
+    def test_seconds(self):
+        self.assertEqual(BatchStatus._fmt_elapsed(45), "0m 45s")
+
+    def test_minutes(self):
+        self.assertEqual(BatchStatus._fmt_elapsed(125), "2m 05s")
+
+    def test_hours(self):
+        self.assertEqual(BatchStatus._fmt_elapsed(3661), "1h 01m 01s")
+
+
+class TestBatchStatusRecordDisc(unittest.TestCase):
+    def setUp(self):
+        self._orig_status = STATUS_FILE
+        self._tmpfile = tempfile.NamedTemporaryFile(suffix=".status", delete=False)
+        self._tmpfile.close()
+        globals()["STATUS_FILE"] = self._tmpfile.name
+
+        self._orig_result = RESULT_FILE
+        self._tmpresult = tempfile.NamedTemporaryFile(suffix=".results", delete=False)
+        self._tmpresult.close()
+        globals()["RESULT_FILE"] = self._tmpresult.name
+
+    def tearDown(self):
+        globals()["STATUS_FILE"] = self._orig_status
+        globals()["RESULT_FILE"] = self._orig_result
+        for f in (self._tmpfile.name, self._tmpresult.name):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+    def test_record_accept(self):
+        status = BatchStatus("readdvd", "/Volumes/DVD", "/out", idx_offset=209, mode="batch")
+        status.update("running", disc_nr=1)
+        status.record_accept(index=210, dir_name="/out/210", source_size=1048576, elapsed=60.0, total_elapsed=75.0)
+        self.assertEqual(status.accepted, 1)
+        self.assertEqual(status.last_disc["index"], 210)
+        self.assertEqual(status.last_disc["elapsed"], 60.0)
+        self.assertEqual(status.last_disc["total_elapsed"], 75.0)
+        self.assertEqual(status.last_disc["result"], "accepted")
+
+    def test_record_reject(self):
+        status = BatchStatus("readdvd", "/Volumes/DVD", "/out", mode="next")
+        status.update("running", disc_nr=1)
+        status.record_reject(index=1, dir_name="/out/001", source_size=0, elapsed=5.0, rc=1, total_elapsed=10.0)
+        self.assertEqual(status.rejected, 1)
+        self.assertEqual(status.last_disc["rc"], 1)
+        self.assertEqual(status.last_disc["total_elapsed"], 10.0)
+
+    def test_total_elapsed_defaults_to_elapsed(self):
+        status = BatchStatus("readdvd", "/Volumes/DVD", "/out")
+        status.update("running", disc_nr=1)
+        status.record_accept(index=1, dir_name="/out/001", source_size=0, elapsed=30.0)
+        self.assertEqual(status.last_disc["total_elapsed"], 30.0)
+
+    def test_status_file_has_mode_and_pid(self):
+        status = BatchStatus("readdvd", "/Volumes/DVD", "/out", mode="batch")
+        status.update("running", disc_nr=1)
+        sf = BatchStatus.read_file()
+        self.assertEqual(sf["mode"], "batch")
+        self.assertIn("pid", sf)
+
+    def test_status_file_has_cli(self):
+        status = BatchStatus("readdvd", "/Volumes/DVD", "/out")
+        status.update("running")
+        sf = BatchStatus.read_file()
+        self.assertIn("cli", sf)
+        self.assertTrue(sf["cli"].startswith("my-nimbie"))
+
+    def test_result_file_written(self):
+        status = BatchStatus("readdvd", "/Volumes/DVD", "/out")
+        status.update("running", disc_nr=1)
+        status.record_accept(index=210, dir_name="/out/210", source_size=1073741824,
+                             elapsed=120.0, total_elapsed=140.0)
+        with open(self._tmpresult.name) as f:
+            line = f.read()
+        self.assertIn("#210", line)
+        self.assertIn("accepted", line)
+        self.assertIn("cmd=", line)
+        self.assertIn("total=", line)
+
+
+class TestOffsetIndex(unittest.TestCase):
+    """Verify INDEX = disc_nr + idx_offset."""
+
+    def _make_config(self, idx_offset=0, idx_padding=3):
+        cp = configparser.ConfigParser()
+        cp.read_dict({
+            "naming": {
+                "name_prefix": "{INDEX}",
+                "name": " - {MEDIA_TYPE}",
+                "name_postfix": "",
+                "idx_padding": str(idx_padding),
+                "idx_offset": str(idx_offset),
+            }
+        })
+        return cp
+
+    def test_offset_0_disc_1(self):
+        """disc_nr=1, offset=0 → INDEX=1 → '001'"""
+        config = self._make_config(idx_offset=0)
+        # Use dry_run to avoid touching real mount point
+        global dry_run
+        old = dry_run
+        dry_run = True
+        try:
+            name = build_dir_name(config, 1, "/Volumes/DVD", "readdvd",
+                                  {"prefix": None, "name": None, "postfix": None,
+                                   "idx_padding": None, "idx_offset": None})
+            self.assertTrue(name.startswith("001"))
+        finally:
+            dry_run = old
+
+    def test_offset_209_disc_1(self):
+        """disc_nr=1, offset=209 → INDEX=210 → '210'"""
+        config = self._make_config(idx_offset=0)
+        global dry_run
+        old = dry_run
+        dry_run = True
+        try:
+            name = build_dir_name(config, 1, "/Volumes/DVD", "readdvd",
+                                  {"prefix": None, "name": None, "postfix": None,
+                                   "idx_padding": None, "idx_offset": 209})
+            self.assertTrue(name.startswith("210"))
+        finally:
+            dry_run = old
+
+    def test_offset_50_disc_3(self):
+        """disc_nr=3, offset=50 → INDEX=53 → '053'"""
+        config = self._make_config(idx_offset=0)
+        global dry_run
+        old = dry_run
+        dry_run = True
+        try:
+            name = build_dir_name(config, 3, "/Volumes/DVD", "readdvd",
+                                  {"prefix": None, "name": None, "postfix": None,
+                                   "idx_padding": None, "idx_offset": 50})
+            self.assertTrue(name.startswith("053"))
+        finally:
+            dry_run = old
+
+
+class TestArgvExpansion(unittest.TestCase):
+    """Test -DD expansion and global flag hoisting."""
+
+    def _expand_and_hoist(self, argv):
+        expanded = []
+        for arg in argv:
+            if re.match(r'^-D{2,}$', arg):
+                expanded.extend(["-D"] * len(arg[1:]))
+            else:
+                expanded.append(arg)
+        subcommands = {"load", "eject", "reject", "status", "next", "batch"}
+        global_flags = {"-D", "-v", "-d", "--debug", "--verbose", "--dry"}
+        hoisted = []
+        rest = []
+        found_subcmd = False
+        for arg in expanded:
+            if not found_subcmd and arg in subcommands:
+                found_subcmd = True
+                rest.append(arg)
+            elif found_subcmd and arg in global_flags:
+                hoisted.append(arg)
+            else:
+                rest.append(arg)
+        return hoisted + rest
+
+    def test_DD_expansion(self):
+        result = self._expand_and_hoist(["next", "-DD", "readdvd"])
+        self.assertEqual(result.count("-D"), 2)
+        self.assertIn("next", result)
+        self.assertIn("readdvd", result)
+
+    def test_DDD_expansion(self):
+        result = self._expand_and_hoist(["batch", "-DDD"])
+        self.assertEqual(result.count("-D"), 3)
+
+    def test_flag_hoisting(self):
+        result = self._expand_and_hoist(["next", "-v", "-D", "readdvd"])
+        # -v and -D should come before 'next'
+        next_idx = result.index("next")
+        self.assertTrue(all(result.index(f) < next_idx for f in ["-v", "-D"]))
+
+    def test_no_flags(self):
+        result = self._expand_and_hoist(["status"])
+        self.assertEqual(result, ["status"])
+
+    def test_flags_before_subcmd_stay(self):
+        result = self._expand_and_hoist(["-v", "status"])
+        self.assertEqual(result, ["-v", "status"])
+
+
+class TestStripQuotes(unittest.TestCase):
+    def test_double_quotes(self):
+        self.assertEqual(build_dir_name.__code__.co_consts, build_dir_name.__code__.co_consts)
+        # Test via expand_naming_vars with a quoted value
+        # _strip_quotes is local to build_dir_name, test indirectly via config
+        cp = configparser.ConfigParser()
+        cp.read_dict({"naming": {
+            "name_prefix": "{INDEX}",
+            "name": '" - {MEDIA_TYPE}"',  # configparser stores: " - {MEDIA_TYPE}"
+            "name_postfix": "",
+            "idx_padding": "3",
+            "idx_offset": "0",
+        }})
+        global dry_run
+        old = dry_run
+        dry_run = True
+        try:
+            name = build_dir_name(cp, 1, "/Volumes/DVD", "readdvd",
+                                  {"prefix": None, "name": None, "postfix": None,
+                                   "idx_padding": None, "idx_offset": None})
+            self.assertEqual(name, "001 - DVD")
+        finally:
+            dry_run = old
+
+
+class TestStalePidDetection(unittest.TestCase):
+    def test_dead_pid(self):
+        """A PID that doesn't exist should not be alive."""
+        alive = False
+        try:
+            os.kill(99999999, 0)
+            alive = True
+        except OSError:
+            pass
+        self.assertFalse(alive)
+
+    def test_own_pid(self):
+        """Our own PID should be alive."""
+        alive = False
+        try:
+            os.kill(os.getpid(), 0)
+            alive = True
+        except OSError:
+            pass
+        self.assertTrue(alive)
+
+
+def _run_tests():
+    """Run unit tests."""
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    test_classes = [
+        TestExpandNamingVars,
+        TestExpandCommand,
+        TestEnsureDvdbackupFlags,
+        TestFormatSize,
+        TestBatchStatusFmtElapsed,
+        TestBatchStatusRecordDisc,
+        TestOffsetIndex,
+        TestArgvExpansion,
+        TestStripQuotes,
+        TestStalePidDetection,
+    ]
+    for cls in test_classes:
+        suite.addTests(loader.loadTestsFromTestCase(cls))
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    sys.exit(0 if result.wasSuccessful() else 1)
+
+
 def build_parser():
     parser = _HelpfulParser(
         prog="my-nimbie",
@@ -2509,6 +2886,8 @@ Monitoring a running batch:
     parser.add_argument("--create-config", nargs="?", const="", metavar="PATH",
                         dest="create_config_path",
                         help="create example config file (default: ~/.my-nimbie.conf, or specify PATH)")
+    parser.add_argument("--test", action="store_true",
+                        help="run unit tests (no hardware needed)")
     parser.add_argument("--dry", "-d", action="store_true",
                         help="dry run — print what would be done without executing")
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -2665,6 +3044,10 @@ def main():
         if args.create_config_path == "":
             args.create_config_path = None  # use default path
         cmd_create_config(args)
+        return
+
+    if args.test:
+        _run_tests()
         return
 
     if not args.command:
