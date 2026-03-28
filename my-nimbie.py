@@ -3645,7 +3645,20 @@ def main():
                 # Batch/next is running — show status from file, don't grab USB
                 cmd_status(None, config, args)
                 return
-            # Process crashed — fall through to connect USB and show full status
+            # Process crashed — try to connect USB for hardware query, but don't fail if busy
+            try:
+                vid = int(config.get("nimbie", "vid"), 16)
+                pid = int(config.get("nimbie", "pid"), 16)
+                nimbie = NimbieDevice(vid, pid)
+                nimbie.connect()
+                try:
+                    cmd_status(nimbie, config, args)
+                finally:
+                    nimbie.disconnect()
+            except (SystemExit, Exception):
+                # USB unavailable — show status without hardware info
+                cmd_status(None, config, args)
+            return
 
     # reset command handles its own USB (may talk to bootloader, not normal Nimbie)
     if args.command == "reset":
