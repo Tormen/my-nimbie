@@ -2371,6 +2371,24 @@ def cmd_status(nimbie, config, _args):
     except (FileNotFoundError, OSError):
         pass
 
+    # Always show optical drive media status
+    import subprocess
+    result = subprocess.run(["drutil", "status"], capture_output=True, text=True)
+    drive_lines = result.stdout.strip().split("\n")
+    drive_name = ""
+    media_type = "Unknown"
+    for line in drive_lines:
+        stripped = line.strip()
+        if stripped.startswith("Vendor"):
+            continue  # header line
+        if stripped.startswith("Type:"):
+            media_type = stripped
+        elif stripped and not stripped.startswith("---") and not drive_name:
+            drive_name = stripped
+    if drive_name:
+        msg(f"\n  Drive:  {drive_name}")
+    msg(f"  Media:  {media_type}")
+
     msg(f"""
   Mechanism stages:
     1. Open tray
