@@ -72,6 +72,7 @@ import argparse
 import configparser
 import datetime
 import re
+import shutil
 import signal
 import time
 
@@ -1346,6 +1347,45 @@ def cmd_batch(nimbie, config, args):
     }
 
     flavor_label = flavor or "default"
+
+    # -- Pre-flight checks --
+    # Catch problems BEFORE the first disc loads, not halfway through a stack.
+
+    # 1. Target directory must exist and be writable
+    if not os.path.isdir(target_dir):
+        err(f"Target directory does not exist: {target_dir}\n\n"
+            f"  Create it first:\n"
+            f"    mkdir -p {target_dir}")
+    if not os.access(target_dir, os.W_OK):
+        err(f"Target directory is not writable: {target_dir}\n\n"
+            f"  Check permissions:\n"
+            f"    ls -ld {target_dir}")
+
+    # 2. Command binary must exist (check first word of the command)
+    cmd_binary = on_load.split()[0] if on_load else ""
+    # Expand ~ and env vars but skip if it contains $VAR (runtime variable)
+    if cmd_binary and not cmd_binary.startswith("$"):
+        cmd_binary_expanded = os.path.expanduser(os.path.expandvars(cmd_binary))
+        if not shutil.which(cmd_binary_expanded):
+            err(f"Command not found: {cmd_binary}\n\n"
+                f"  The on_load command's binary does not exist or is not executable.\n"
+                f"  Check your config: [commands] on_load_{BATCH_FLAVORS.get(flavor, 'DEFAULT')}")
+
+    # 3. Validate command if set
+    if on_validate:
+        val_binary = on_validate.split()[0]
+        if val_binary and not val_binary.startswith("$"):
+            val_binary_expanded = os.path.expanduser(os.path.expandvars(val_binary))
+            if not shutil.which(val_binary_expanded):
+                err(f"Validation command not found: {val_binary}\n\n"
+                    f"  Check your config: [commands] on_validate")
+
+    # 4. Mount point path must be a valid parent directory
+    mount_parent = os.path.dirname(mount_point)
+    if not os.path.isdir(mount_parent):
+        err(f"Mount point parent directory does not exist: {mount_parent}\n\n"
+            f"  The mount_point is set to: {mount_point}\n"
+            f"  Check your config: [nimbie] mount_point")
 
     # Initialize status tracking
     status = BatchStatus(flavor, mount_point, target_dir)
