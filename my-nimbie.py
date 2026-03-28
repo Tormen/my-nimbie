@@ -2320,7 +2320,7 @@ def cmd_status(nimbie, config, _args):
             msg(f"  Last disc:   {sf['last_disc']}")
 
         # Verbose: show hardware diagnostics even during active job
-        if verbose:
+        if verbose and nimbie is not None:
             msg("")
             msg("  Hardware diagnostics (CMD 0x49):")
             diag_resps = nimbie._send_and_read((0x49,), "DIAGNOSTICS", timeout=3000)
@@ -2341,6 +2341,7 @@ def cmd_status(nimbie, config, _args):
             msg(f"  Disc lifted:    {state['disc_lifted']}")
             msg(f"  Tray out:       {state['tray_out']}")
 
+        if verbose:
             msg("")
             import subprocess
             msg("  Optical drive:")
