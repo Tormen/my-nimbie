@@ -696,10 +696,16 @@ def build_dir_name(config, disc_nr, mount_point, flavor, cli_naming):
 
     cli_naming is a dict with optional keys: prefix, name, postfix, idx_offset, idx_padding.
     """
+    def _strip_quotes(s):
+        """Strip surrounding quotes from config values (preserves inner whitespace)."""
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+            return s[1:-1]
+        return s
+
     # Read naming settings: CLI overrides > config
-    name_prefix  = cli_naming.get("prefix")  if cli_naming.get("prefix")  is not None else config.get("naming", "name_prefix",  fallback="{INDEX}")
-    name         = cli_naming.get("name")    if cli_naming.get("name")    is not None else config.get("naming", "name",         fallback=" - {MEDIA_TYPE}")
-    name_postfix = cli_naming.get("postfix") if cli_naming.get("postfix") is not None else config.get("naming", "name_postfix", fallback="")
+    name_prefix  = cli_naming.get("prefix")  if cli_naming.get("prefix")  is not None else _strip_quotes(config.get("naming", "name_prefix",  fallback="{INDEX}"))
+    name         = cli_naming.get("name")    if cli_naming.get("name")    is not None else _strip_quotes(config.get("naming", "name",         fallback=" - {MEDIA_TYPE}"))
+    name_postfix = cli_naming.get("postfix") if cli_naming.get("postfix") is not None else _strip_quotes(config.get("naming", "name_postfix", fallback=""))
     idx_padding  = cli_naming.get("idx_padding") if cli_naming.get("idx_padding") is not None else config.getint("naming", "idx_padding", fallback=3)
     idx_offset   = cli_naming.get("idx_offset")  if cli_naming.get("idx_offset")  is not None else config.getint("naming", "idx_offset",  fallback=0)
 
@@ -708,6 +714,15 @@ def build_dir_name(config, disc_nr, mount_point, flavor, cli_naming):
 
     index_val = disc_nr + idx_offset
     index_str = str(index_val).zfill(idx_padding)
+
+    dbg(f"build_dir_name: disc_nr={disc_nr}, idx_offset={idx_offset}, "
+        f"idx_padding={idx_padding} → index_val={index_val}, index_str='{index_str}'")
+    ddbg(f"build_dir_name: name_prefix='{name_prefix}', name='{name}', name_postfix='{name_postfix}'")
+    ddbg(f"build_dir_name: sources — prefix:{'CLI' if cli_naming.get('prefix') is not None else 'config'}, "
+         f"name:{'CLI' if cli_naming.get('name') is not None else 'config'}, "
+         f"postfix:{'CLI' if cli_naming.get('postfix') is not None else 'config'}, "
+         f"offset:{'CLI' if cli_naming.get('idx_offset') is not None else 'config'}, "
+         f"padding:{'CLI' if cli_naming.get('idx_padding') is not None else 'config'}")
 
     # Build variables dict — lazy-evaluate DVD_TITLE only if referenced
     full_template = name_prefix + name + name_postfix
@@ -745,6 +760,8 @@ def build_dir_name(config, disc_nr, mount_point, flavor, cli_naming):
                expand_naming_vars(name, variables) + \
                expand_naming_vars(name_postfix, variables)
 
+    dbg(f"build_dir_name: result='{dir_name}'")
+    ddbg(f"build_dir_name: variables={variables}")
     return dir_name
 
 
@@ -1173,16 +1190,24 @@ class NimbieDeviceDryRun:
 def wait_for_mount(mount_point, timeout, poll_interval):
     """Wait for a disc to appear at mount_point. Returns True if mounted."""
     vrb(f"  Waiting for disc to mount at {mount_point} (timeout: {timeout}s)...")
+    dbg(f"wait_for_mount: mount_point={mount_point}, timeout={timeout}s, poll={poll_interval}s")
     start = time.time()
 
     while time.time() - start < timeout:
         if interrupted:
+            dbg("wait_for_mount: interrupted")
             return False
-        if os.path.ismount(mount_point) or os.path.isdir(os.path.join(mount_point, "VIDEO_TS")):
+        is_mount = os.path.ismount(mount_point)
+        has_video_ts = os.path.isdir(os.path.join(mount_point, "VIDEO_TS"))
+        ddbg(f"wait_for_mount: is_mount={is_mount}, has_video_ts={has_video_ts}, "
+             f"elapsed={time.time() - start:.1f}s")
+        if is_mount or has_video_ts:
+            dbg(f"wait_for_mount: mounted after {time.time() - start:.1f}s")
             vrb(f"  Disc mounted at {mount_point}")
             return True
         time.sleep(poll_interval)
 
+    dbg(f"wait_for_mount: timed out after {timeout}s")
     return False
 
 
@@ -1219,6 +1244,9 @@ def expand_command(cmd_template, mount_point, disc_nr, target_dir, dir_name):
                      ("DIR_NAME", dir_name), ("DISC_NR", str(disc_nr))]:
         cmd = cmd.replace(f"${{{var}}}", val)
         cmd = cmd.replace(f"${var}", val)
+    ddbg(f"expand_command: '{cmd_template}' → '{cmd}'")
+    ddbg(f"expand_command: MOUNT_POINT={mount_point}, TARGET_DIR={target_dir}, "
+         f"DIR_NAME={dir_name}, DISC_NR={disc_nr}")
     return cmd
 
 
@@ -1227,13 +1255,17 @@ def run_command(cmd_template, mount_point, disc_nr, target_dir, dir_name):
     cmd = expand_command(cmd_template, mount_point, disc_nr, target_dir, dir_name)
 
     msg(f"\n  Running: {cmd}")
+    dbg(f"run_command: template='{cmd_template}'")
+    dbg(f"run_command: expanded='{cmd}'")
 
     if dry_run:
         msg("  [DRY-RUN] Would execute above command")
         return 0
 
     try:
+        dbg("run_command: executing via shell...")
         result = subprocess.run(cmd, shell=True)
+        dbg(f"run_command: exit code {result.returncode}")
         vrb(f"  Command exited with code: {result.returncode}")
         return result.returncode
     except KeyboardInterrupt:
@@ -1266,6 +1298,7 @@ def _format_flavor_list(config):
 
 def resolve_batch_flavor(config, flavor, cli_target_dir):
     """Resolve flavor to (on_load_command, target_dir). Exits on error."""
+    dbg(f"resolve_batch_flavor: flavor={flavor}, cli_target_dir={cli_target_dir}")
     if flavor is None:
         # No flavor specified — check if on_load_DEFAULT is set
         default_val = config.get("commands", "on_load_default", fallback="")
@@ -1292,6 +1325,7 @@ def resolve_batch_flavor(config, flavor, cli_target_dir):
 
     on_load_key = f"on_load_{config_suffix}".lower()
     on_load = config.get("commands", on_load_key, fallback="")
+    dbg(f"resolve_batch_flavor: config_suffix={config_suffix}, on_load_key={on_load_key}, on_load='{on_load}'")
 
     if not on_load:
         err(f"No command configured for [commands] on_load_{config_suffix}\n\n"
@@ -1303,8 +1337,10 @@ def resolve_batch_flavor(config, flavor, cli_target_dir):
     # target_dir: CLI param overrides config
     if cli_target_dir:
         target_dir = cli_target_dir
+        dbg(f"resolve_batch_flavor: target_dir from CLI: {target_dir}")
     else:
         target_dir = config.get("target_dirs", target_key, fallback="")
+        dbg(f"resolve_batch_flavor: target_dir from config [{target_key}]: '{target_dir}'")
 
     if not target_dir:
         err(f"No target directory configured for flavor '{target_key}'.\n\n"
@@ -1444,15 +1480,23 @@ def cmd_status(nimbie, config, _args):
 
 def cmd_next(nimbie, config, args):
     """Process exactly one disc: load → run command → accept/reject."""
+    dbg("cmd_next: starting")
     mount_point = config.get("nimbie", "mount_point")
     on_validate = config.get("commands", "on_validate")
     mount_timeout = config.getfloat("batch", "mount_timeout")
     poll_interval = config.getfloat("batch", "poll_interval")
     settle_time = config.getfloat("batch", "load_settle_time")
 
+    dbg(f"cmd_next: mount_point={mount_point}, mount_timeout={mount_timeout}s, "
+        f"poll_interval={poll_interval}s, settle_time={settle_time}s")
+    dbg(f"cmd_next: on_validate={'(none)' if not on_validate else on_validate}")
+
     flavor = args.flavor
     cli_target_dir = args.target_dir
+    dbg(f"cmd_next: flavor={flavor}, cli_target_dir={cli_target_dir}")
     on_load, target_dir = resolve_batch_flavor(config, flavor, cli_target_dir)
+    dbg(f"cmd_next: resolved on_load={on_load}")
+    dbg(f"cmd_next: resolved target_dir={target_dir}")
 
     cli_naming = {
         "prefix":      args.prefix,
@@ -1461,14 +1505,18 @@ def cmd_next(nimbie, config, args):
         "idx_padding": args.padding,
         "idx_offset":  args.offset,
     }
+    dbg(f"cmd_next: cli_naming={cli_naming}")
 
     flavor_label = flavor or "default"
 
     # Pre-flight checks (same as batch)
+    dbg("cmd_next: pre-flight checks starting")
     cmd_binary = on_load.split()[0] if on_load else ""
     if cmd_binary and not cmd_binary.startswith("$"):
         cmd_binary_expanded = os.path.expanduser(os.path.expandvars(cmd_binary))
-        if not shutil.which(cmd_binary_expanded):
+        resolved = shutil.which(cmd_binary_expanded)
+        dbg(f"cmd_next: command binary '{cmd_binary}' → which: {resolved}")
+        if not resolved:
             err(f"Command not found: {cmd_binary}\n\n"
                 f"  The on_load command's binary does not exist or is not executable.\n"
                 f"  Check your config: [commands] on_load_{BATCH_FLAVORS.get(flavor, 'DEFAULT')}")
@@ -1477,17 +1525,23 @@ def cmd_next(nimbie, config, args):
         val_binary = on_validate.split()[0]
         if val_binary and not val_binary.startswith("$"):
             val_binary_expanded = os.path.expanduser(os.path.expandvars(val_binary))
-            if not shutil.which(val_binary_expanded):
+            resolved = shutil.which(val_binary_expanded)
+            dbg(f"cmd_next: validate binary '{val_binary}' → which: {resolved}")
+            if not resolved:
                 err(f"Validation command not found: {val_binary}\n\n"
                     f"  Check your config: [commands] on_validate")
 
     mount_parent = os.path.dirname(mount_point)
+    dbg(f"cmd_next: mount parent '{mount_parent}' exists: {os.path.isdir(mount_parent)}")
     if not os.path.isdir(mount_parent):
         err(f"Mount point parent directory does not exist: {mount_parent}\n\n"
             f"  The mount_point is set to: {mount_point}\n"
             f"  Check your config: [nimbie] mount_point")
 
+    dbg("cmd_next: pre-flight checks passed")
+
     disc_nr = 1
+    dbg(f"cmd_next: disc_nr={disc_nr}")
     dir_name_part = build_dir_name(config, disc_nr, mount_point, flavor, cli_naming)
     dir_name = os.path.join(target_dir, dir_name_part) if target_dir else dir_name_part
 
@@ -1499,19 +1553,25 @@ def cmd_next(nimbie, config, args):
 
     # Load
     msg("\n  Loading disc from hopper...")
+    dbg("cmd_next: calling nimbie.load_disc()")
     has_more = nimbie.load_disc()
+    dbg(f"cmd_next: load_disc returned has_more={has_more}")
 
     if not dry_run:
         vrb(f"  Waiting {settle_time}s for disc to settle...")
         time.sleep(settle_time)
 
+        dbg(f"cmd_next: waiting for mount at {mount_point}")
         if not wait_for_mount(mount_point, mount_timeout, poll_interval):
             warn(f"Disc did not mount within {mount_timeout}s — rejecting")
+            dbg("cmd_next: mount timeout, rejecting disc")
             nimbie.eject_reject()
             return
+        dbg("cmd_next: disc mounted successfully")
 
     # Clear DVD title cache for new disc
     _dvd_title_cache.clear()
+    dbg("cmd_next: DVD title cache cleared, rebuilding dir_name with mounted disc")
 
     # Rebuild dir_name now that disc is mounted (DVD_TITLE may be available)
     dir_name_part = build_dir_name(config, disc_nr, mount_point, flavor, cli_naming)
@@ -1519,26 +1579,36 @@ def cmd_next(nimbie, config, args):
     msg(f"  Dir name:   {dir_name}")
 
     # Run command
+    dbg(f"cmd_next: running on_load command")
     rc = run_command(on_load, mount_point, disc_nr, target_dir, dir_name)
+    dbg(f"cmd_next: on_load returned rc={rc}")
 
     # Validate
     if on_validate:
+        dbg(f"cmd_next: running on_validate command")
         rc = run_command(on_validate, mount_point, disc_nr, target_dir, dir_name)
+        dbg(f"cmd_next: on_validate returned rc={rc}")
+    else:
+        dbg("cmd_next: no on_validate configured, skipping")
 
     # Accept or reject
+    dbg(f"cmd_next: unmounting disc before eject")
     unmount_disc(mount_point)
 
     if rc == 0:
         msg("  ACCEPTING (command succeeded)")
+        dbg("cmd_next: ejecting to accept bin")
         nimbie.eject_accept()
     else:
         msg(f"  REJECTING (command failed with exit code {rc})")
+        dbg("cmd_next: ejecting to reject bin")
         nimbie.eject_reject()
 
     if has_more:
         msg("  Hopper has more discs available.")
     else:
         msg("  Hopper is empty — that was the last disc.")
+    dbg("cmd_next: done")
 
 
 def cmd_batch(nimbie, config, args):
