@@ -1824,6 +1824,7 @@ def cmd_status(nimbie, config, _args):
     is_batch = sf.get("mode") == "batch" if sf else False
 
     # Detect stale status file: process died without cleaning up
+    process_crashed = False
     if sf and sf.get("state") not in ("finished", "interrupted"):
         pid_str = sf.get("pid")
         process_alive = False
@@ -1834,17 +1835,47 @@ def cmd_status(nimbie, config, _args):
             except (OSError, ValueError):
                 pass
         if not process_alive:
-            # Process is dead — mark status as crashed
-            msg(f"WARNING: Previous process (pid {pid_str or '?'}) is no longer running.")
-            msg(f"  Status file shows state '{sf.get('state')}' but process has died.")
-            msg(f"  Cleaning up stale status file.\n")
-            try:
-                os.unlink(STATUS_FILE)
-            except OSError:
-                pass
-            sf["state"] = "crashed"
+            process_crashed = True
 
-    if sf and sf.get("state") not in ("finished", "interrupted", "crashed"):
+    if process_crashed:
+        # Process died — show CRASHED status with disc info, then clean up and
+        # fall through to show hardware state so the user knows what to do
+        mode_label = "Batch" if is_batch else "Next"
+        disc_nr = sf.get('disc_nr', '?')
+        idx_offset = sf.get('idx_offset')
+        index_str = ""
+        if idx_offset is not None:
+            try:
+                index_str = f", index {int(disc_nr) + int(idx_offset)}"
+            except (ValueError, TypeError):
+                pass
+
+        msg(f"CRASHED — {mode_label} process (pid {sf.get('pid', '?')}) died during '{sf.get('state', '?')}'")
+        msg(f"  Flavor:      {sf.get('flavor', '?')}")
+        msg(f"  Disc:        #{disc_nr}{index_str}")
+        if sf.get("target_dir"):
+            msg(f"  Target dir:  {sf['target_dir']}")
+        if sf.get("command"):
+            msg(f"  Command:     {sf['command']}")
+        if is_batch:
+            msg(f"  Accepted:    {sf.get('accepted', '?')}")
+            msg(f"  Rejected:    {sf.get('rejected', '?')}")
+        if is_batch and sf.get("last_disc"):
+            msg(f"  Last disc:   {sf['last_disc']}")
+        msg(f"\n  The disc may still be in the drive.")
+        msg(f"    my-nimbie eject    — eject disc to accept bin")
+        msg(f"    my-nimbie reject   — eject disc to reject bin")
+
+        # Clean up stale files
+        for stale_f in (STATUS_FILE, PROGRESS_FILE):
+            try:
+                os.unlink(stale_f)
+            except FileNotFoundError:
+                pass
+        msg("")
+        # Fall through to show hardware state below
+
+    if sf and sf.get("state") not in ("finished", "interrupted"):
         mode_label = "Batch" if is_batch else "Next"
         msg(f"{mode_label} in progress (from status file {STATUS_FILE}):")
         msg(f"  Flavor:      {sf.get('flavor', '?')}")
