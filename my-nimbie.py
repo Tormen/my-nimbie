@@ -435,6 +435,10 @@ on_validate =
 # Base output directories for each batch flavor.
 # Can be overridden per invocation with: my-nimbie batch --target-dir /path ripdvd
 # The per-disc subdirectory name is built from [naming] settings below.
+#
+# "default" is used when on_load_DEFAULT is set to a direct command.
+# When on_load_DEFAULT is a synonym (e.g. "ripdvd"), the synonym's
+# target_dir is used instead (e.g. rip_dvd).
 default =
 rip_dvd =
 rip_audiocd =
