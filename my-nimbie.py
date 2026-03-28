@@ -77,6 +77,112 @@ import signal
 import time
 
 # ---------------------------------------------------------------------------
+# Zsh completions: install/update on every run (fast no-op if unchanged)
+# ---------------------------------------------------------------------------
+def _install_zsh_completions():
+    """Write zsh completion file and patch .zshrc fpath if needed."""
+    completion_dir = os.path.expanduser("~/.zsh/completions")
+    completion_file = os.path.join(completion_dir, "_my-nimbie")
+
+    completion_content = r'''#compdef my-nimbie
+
+_my-nimbie() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+
+    local -a commands
+    commands=(
+        'load:Load next disc from hopper into drive'
+        'eject:Eject current disc to accept (done) bin'
+        'reject:Reject current disc to reject bin'
+        'status:Show Nimbie device state or batch progress'
+        'batch:Batch mode — load, process, accept/reject, repeat'
+    )
+
+    local -a global_opts
+    global_opts=(
+        '(-c --config)'{-c,--config}'[Config file path]:file:_files'
+        '--create-config[Create example config file]::path:_files'
+        '(-d --dry)'{-d,--dry}'[Dry run — print what would be done]'
+        '(-v --verbose)'{-v,--verbose}'[Verbose output]'
+        '(-D --debug)'{-D,--debug}'[Debug output; -DD for deep debug]'
+        '(-h --help)'{-h,--help}'[Show help message]'
+        '1:command:->cmd'
+        '*::arg:->args'
+    )
+
+    _arguments -s : $global_opts
+
+    case $state in
+        cmd)
+            _describe 'command' commands
+            ;;
+        args)
+            case $line[1] in
+                batch)
+                    local -a flavors
+                    flavors=(
+                        'ripdvd:Encode DVD titles to MKV'
+                        'ripaudio:Rip audio CD tracks to FLAC'
+                        'readdvd:Full DVD backup via dvdbackup'
+                    )
+                    _arguments -s : \
+                        '(-t --target-dir)'{-t,--target-dir}'[Base output directory]:dir:_directories' \
+                        '--prefix[Directory name prefix]:str:' \
+                        '--name[Directory name middle part]:str:' \
+                        '--postfix[Directory name postfix]:str:' \
+                        '--idx-offset[Offset for disc index]:n:' \
+                        '--idx-padding[Zero-padding width for index]:n:' \
+                        '1:flavor:->flavor'
+                    case $state in
+                        flavor)
+                            _describe 'flavor' flavors
+                            ;;
+                    esac
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_my-nimbie "$@"
+'''
+
+    os.makedirs(completion_dir, exist_ok=True)
+
+    # Only write if content changed
+    try:
+        with open(completion_file, 'r') as f:
+            if f.read() == completion_content:
+                return  # unchanged, nothing to do
+    except FileNotFoundError:
+        pass
+
+    with open(completion_file, 'w') as f:
+        f.write(completion_content)
+
+    # Patch .zshrc fpath if needed
+    zshrc = os.path.expanduser("~/.zshrc")
+    if os.path.islink(zshrc):
+        zshrc_real = os.path.realpath(zshrc)
+    elif os.path.isfile(zshrc):
+        zshrc_real = zshrc
+    else:
+        return  # no .zshrc to patch
+
+    try:
+        with open(zshrc_real, 'r') as f:
+            zshrc_content = f.read()
+    except Exception:
+        return
+
+    if '.zsh/completions' in zshrc_content:
+        return  # already configured (by my-plex or earlier run)
+
+
+_install_zsh_completions()
+
+# ---------------------------------------------------------------------------
 # USB constants for Nimbie NB21 (NT21 autoloader controller)
 # ---------------------------------------------------------------------------
 NIMBIE_VID = 0x1723
