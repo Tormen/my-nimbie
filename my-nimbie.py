@@ -798,9 +798,15 @@ class NimbieDevice:
         self.dev = usb.core.find(idVendor=self.vid, idProduct=self.pid)
         if self.dev is not None:
             ddbg(f"USB device found: {self.dev}")
-            ddbg(f"  manufacturer={self.dev.manufacturer}, product={self.dev.product}")
+            try:
+                ddbg(f"  manufacturer={self.dev.manufacturer}, product={self.dev.product}")
+            except (ValueError, usb.core.USBError) as e:
+                ddbg(f"  (cannot read device strings: {e})")
             ddbg(f"  bDeviceClass={self.dev.bDeviceClass}, bNumConfigurations={self.dev.bNumConfigurations}")
-            cfg = self.dev.get_active_configuration()
+            try:
+                cfg = self.dev.get_active_configuration()
+            except usb.core.USBError:
+                cfg = None
             if cfg:
                 for intf in cfg:
                     ddbg(f"  Interface {intf.bInterfaceNumber}: class={intf.bInterfaceClass}")
@@ -899,42 +905,65 @@ class NimbieDevice:
                 f"      System Settings → Privacy & Security → USB\n"
                 f"    - Try: unplug device, wait 5s, reconnect")
 
-    def _read_responses(self, timeout=3000, max_reads=20):
+    def _read_responses(self, timeout=3000, max_reads=20, wait_for_at=False):
         """Read all pending responses from interrupt IN endpoint.
 
         Returns a list of ASCII strings. Reads until timeout or all-zero idle packet.
+        If wait_for_at=True, keeps reading through empty packets until an AT+S/AT+E
+        status response arrives or max_reads is exhausted — used for mechanical
+        operations where AT+O (accepted) comes first, then AT+Sxx (result) later.
         """
         responses = []
         empty_count = 0
-        for _ in range(max_reads):
+        got_status = False  # True when AT+S* or AT+E* received
+        for i in range(max_reads):
             try:
                 data = self.dev.read(EP_IN, 64, timeout=timeout)
                 raw = bytes(data)
                 ddbg(f"  Raw read ({len(raw)} bytes): {raw.hex()}")
                 if len(raw) == 0 or raw == b"\x00" * len(raw):
                     empty_count += 1
-                    if empty_count >= 2:
-                        ddbg("  Two consecutive empty reads — done")
-                        break
+                    if not wait_for_at or got_status:
+                        if empty_count >= 2:
+                            ddbg("  Two consecutive empty reads — done")
+                            break
+                    else:
+                        ddbg(f"  Empty packet #{empty_count} (waiting for AT+S/AT+E status...)")
                     continue
                 empty_count = 0
                 text = raw.rstrip(b"\x00").decode("ascii", errors="replace")
                 if text:
                     responses.append(text)
                     dbg(f"  Received: \"{text}\"")
+                    if text.startswith("AT+S") or text.startswith("AT+E"):
+                        got_status = True
             except Exception as e:
                 dbg(f"  Read ended: {e}")
                 break
+        if wait_for_at and not got_status:
+            dbg(f"  WARNING: no AT+S/AT+E status received after {max_reads} reads "
+                f"(got: {responses})")
         return responses
 
-    def _send_and_read(self, cmd_tuple, description=""):
+    def _send_and_read(self, cmd_tuple, description="", timeout=3000,
+                       max_reads=20, wait_for_at=False):
         """Send command and collect all responses."""
         self._send_command(cmd_tuple, description)
         time.sleep(0.3)
-        return self._read_responses()
+        return self._read_responses(timeout=timeout, max_reads=max_reads,
+                                    wait_for_at=wait_for_at)
 
     def _find_at_response(self, responses):
-        """Find the AT+ response code in a list of responses."""
+        """Find the most relevant AT+ response in a list of responses.
+
+        Prefers AT+S/AT+E status codes over AT+O (generic OK).
+        AT+O means "command accepted" — the actual result comes as AT+Sxx or AT+Exx.
+        """
+        # First pass: look for status/error codes (AT+S*, AT+E*)
+        for r in responses:
+            if r.startswith("AT+S") or r.startswith("AT+E"):
+                return r
+        # Fallback: return AT+O if that's all we got
         for r in responses:
             if r.startswith("AT+"):
                 return r
@@ -1042,13 +1071,23 @@ class NimbieDevice:
 
         Returns True if there are more discs in the hopper, False if this was the last one.
         """
-        responses = self._send_and_read(CMD_PLACE_DISC, "PLACE_DISC")
+        # Mechanical operation: hopper picks up disc and drops it on tray.
+        # This can take 10-15 seconds, so use a generous read timeout and
+        # keep reading through idle packets until the AT+S status arrives.
+        responses = self._send_and_read(CMD_PLACE_DISC, "PLACE_DISC",
+                                        timeout=20000, max_reads=100,
+                                        wait_for_at=True)
         at = self._find_at_response(responses)
 
         if at == AT_HOPPER_EMPTY:
             return False
         elif at == AT_PLACED:
             # Wait for disc to settle in tray + dropper retract
+            time.sleep(0.8)
+            return True
+        elif at == AT_OK:
+            # AT+O without AT+S07 — disc likely placed successfully
+            dbg("place_disc: got AT+O without AT+S07, assuming success")
             time.sleep(0.8)
             return True
         elif at == AT_TRAY_WRONG:
@@ -1062,7 +1101,9 @@ class NimbieDevice:
 
     def lift_disc(self):
         """Lift disc from open tray with the gripper mechanism."""
-        responses = self._send_and_read(CMD_LIFT_DISC, "LIFT_DISC")
+        responses = self._send_and_read(CMD_LIFT_DISC, "LIFT_DISC",
+                                        timeout=15000, max_reads=100,
+                                        wait_for_at=True)
         at = self._find_at_response(responses)
 
         if at == AT_OK:
@@ -1078,7 +1119,9 @@ class NimbieDevice:
 
     def accept_disc(self):
         """Drop a lifted disc into the accept (done) pile."""
-        responses = self._send_and_read(CMD_ACCEPT, "ACCEPT_DISC")
+        responses = self._send_and_read(CMD_ACCEPT, "ACCEPT_DISC",
+                                        timeout=15000, max_reads=100,
+                                        wait_for_at=True)
         at = self._find_at_response(responses)
 
         if at == AT_OK:
@@ -1090,7 +1133,9 @@ class NimbieDevice:
 
     def reject_disc(self):
         """Drop a lifted disc into the reject pile."""
-        responses = self._send_and_read(CMD_REJECT, "REJECT_DISC")
+        responses = self._send_and_read(CMD_REJECT, "REJECT_DISC",
+                                        timeout=15000, max_reads=100,
+                                        wait_for_at=True)
         at = self._find_at_response(responses)
 
         if at == AT_OK:
@@ -1550,6 +1595,16 @@ def cmd_next(nimbie, config, args):
     msg(f"  Mount:      {mount_point}")
     msg(f"  Target dir: {target_dir}")
     msg(f"  Dir name:   {dir_name}")
+
+    # Check if there's already a disc in the drive
+    if not dry_run:
+        state = nimbie.get_state()
+        dbg(f"cmd_next: device state before load: {state}")
+        if state["disc_in_tray"]:
+            msg("\n  Disc already in drive — ejecting to accept bin first...")
+            unmount_disc(mount_point)
+            nimbie.eject_accept()
+            msg("  Previous disc accepted.")
 
     # Load
     msg("\n  Loading disc from hopper...")
