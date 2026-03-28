@@ -503,8 +503,14 @@ def cmd_create_config(args):
         err(f"Parent directory does not exist: {parent}")
 
     content = generate_example_config()
-    with open(path, "w") as f:
-        f.write(content)
+    try:
+        with open(path, "w") as f:
+            f.write(content)
+    except PermissionError:
+        err(f"Permission denied: {path}\n\n"
+            f"  Try one of:\n"
+            f"    sudo my-nimbie --create-config {path}\n"
+            f"    my-nimbie --create-config {DEFAULT_CONFIG_PATH}")
 
     msg(f"Example config written to: {path}")
     msg(f"  Edit it to match your setup, then run: my-nimbie batch")
