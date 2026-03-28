@@ -375,6 +375,7 @@ def load_config(config_path=None):
         config.read(config_path)
         vrb(f"  Config loaded from: {config_path}")
 
+    config.config_path = config_path  # store for status display
     return config
 
 
@@ -1184,7 +1185,11 @@ def cmd_reject(nimbie, config, _args):
     msg("  Disc rejected.")
 
 
-def cmd_status(nimbie, _config, _args):
+def cmd_status(nimbie, config, _args):
+    config_path = getattr(config, "config_path", None)
+    msg(f"  Config: {config_path or '(built-in defaults)'}")
+    msg("")
+
     # Check if a batch is running (status file exists with non-finished state)
     sf = BatchStatus.read_file()
     if sf and sf.get("state") not in ("finished", "interrupted"):
