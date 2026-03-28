@@ -433,6 +433,9 @@ on_validate =
 
 [target_dirs]
 # Base output directories for each batch flavor.
+# REQUIRED: either set here or pass --target-dir on the command line.
+# Without a target directory, batch will abort with an error.
+#
 # Can be overridden per invocation with: my-nimbie batch --target-dir /path ripdvd
 # The per-disc subdirectory name is built from [naming] settings below.
 #
@@ -1191,6 +1194,12 @@ def resolve_batch_flavor(config, flavor, cli_target_dir):
         target_dir = cli_target_dir
     else:
         target_dir = config.get("target_dirs", target_key, fallback="")
+
+    if not target_dir:
+        err(f"No target directory configured for flavor '{target_key}'.\n\n"
+            f"  Set it in one of:\n"
+            f"    config file: [target_dirs] {target_key} = /path/to/output\n"
+            f"    command line: my-nimbie batch --target-dir /path {flavor or ''}")
 
     return on_load, target_dir
 
