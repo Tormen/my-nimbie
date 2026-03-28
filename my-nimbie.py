@@ -132,8 +132,8 @@ _my-nimbie() {
                         '--prefix[Directory name prefix]:str:' \
                         '--name[Directory name middle part]:str:' \
                         '--postfix[Directory name postfix]:str:' \
-                        '--idx-offset[Offset for disc index]:n:' \
-                        '--idx-padding[Zero-padding width for index]:n:' \
+                        '--offset[Offset for disc index]:n:' \
+                        '--padding[Zero-padding width for index]:n:' \
                         '1:flavor:->flavor'
                     case $state in
                         flavor)
@@ -590,7 +590,7 @@ def generate_example_config():
     idx_padding = 3             # default: 3
 
     # Offset added to DISC_NR for {INDEX} (can be negative)
-    # Useful to continue numbering from a previous batch: --idx-offset 50
+    # Useful to continue numbering from a previous batch: --offset 50
     idx_offset = 0              # default: 0
 
 [batch]
@@ -1455,8 +1455,8 @@ def cmd_next(nimbie, config, args):
         "prefix":      args.prefix,
         "name":        args.name,
         "postfix":     args.postfix,
-        "idx_padding": args.idx_padding,
-        "idx_offset":  args.idx_offset,
+        "idx_padding": args.padding,
+        "idx_offset":  args.offset,
     }
 
     flavor_label = flavor or "default"
@@ -1557,8 +1557,8 @@ def cmd_batch(nimbie, config, args):
         "prefix":      args.prefix,
         "name":        args.name,
         "postfix":     args.postfix,
-        "idx_padding": args.idx_padding,
-        "idx_offset":  args.idx_offset,
+        "idx_padding": args.padding,
+        "idx_offset":  args.offset,
     }
 
     flavor_label = flavor or "default"
@@ -1728,7 +1728,7 @@ Examples:
   my-nimbie batch --target-dir /out ripdvd   Override output directory for this run
 
   my-nimbie batch --prefix "{{DVD_TITLE}}" --name "" ripdvd
-  my-nimbie batch --idx-offset 50 --idx-padding 3 ripaudio
+  my-nimbie batch --offset 50 --padding 3 ripaudio
   my-nimbie batch --name " - {{DVD_TITLE}} ({{MEDIA_TYPE}})" readdvd
 
   my-nimbie --dry batch ripdvd            Dry-run: show what would happen
@@ -1826,9 +1826,9 @@ Per-disc directory naming:
                              help="directory name middle part (default: \" - {MEDIA_TYPE}\", overrides [naming] name)")
     next_parser.add_argument("--postfix", metavar="STR",
                              help="directory name postfix (default: \"\", overrides [naming] name_postfix)")
-    next_parser.add_argument("--idx-offset", metavar="N", type=int,
+    next_parser.add_argument("--offset", metavar="N", type=int,
                              help="offset added to disc number for {INDEX} (default: 0, can be negative)")
-    next_parser.add_argument("--idx-padding", metavar="N", type=int,
+    next_parser.add_argument("--padding", metavar="N", type=int,
                              help="zero-padding width for {INDEX} (default: 3, e.g. 3 → \"001\")")
 
     # --- batch: process all discs in hopper ---
@@ -1869,9 +1869,9 @@ Progress is tracked in /tmp/my-nimbie.status and can be queried:
                               help="directory name middle part (default: \" - {MEDIA_TYPE}\", overrides [naming] name)")
     batch_parser.add_argument("--postfix", metavar="STR",
                               help="directory name postfix (default: \"\", overrides [naming] name_postfix)")
-    batch_parser.add_argument("--idx-offset", metavar="N", type=int,
+    batch_parser.add_argument("--offset", metavar="N", type=int,
                               help="offset added to disc number for {INDEX} (default: 0, can be negative)")
-    batch_parser.add_argument("--idx-padding", metavar="N", type=int,
+    batch_parser.add_argument("--padding", metavar="N", type=int,
                               help="zero-padding width for {INDEX} (default: 3, e.g. 3 → \"001\")")
 
     return parser
