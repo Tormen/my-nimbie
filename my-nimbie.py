@@ -144,7 +144,7 @@ DEFAULT_CONFIG = {
         "name_prefix": "{INDEX}",
         "name":        " - {MEDIA_TYPE}",
         "name_postfix": "",
-        "idx_padding":  "4",
+        "idx_padding":  "3",
         "idx_offset":   "0",
     },
     "batch": {
@@ -393,10 +393,10 @@ def generate_example_config():
 
 [nimbie]
 # USB device identifiers (use system_profiler SPUSBDataType to verify)
-vid = 0x1723
-pid = 0x0945
+vid = 0x1723                    # default: 0x1723 (Nimbie NB21)
+pid = 0x0945                    # default: 0x0945 (Nimbie NB21)
 
-# Where the optical disc mounts on macOS
+# MANDATORY: where the optical disc mounts on macOS
 mount_point = /Volumes/DVD_VIDEO_RECORDER
 
 [commands]
@@ -429,7 +429,7 @@ on_load_READ_DVD = dvdbackup -i "$MOUNT_POINT" -o "$DIR_NAME" -M
 # on_load_DEFAULT = /LINKS/bin/my-handbrake dvd "$MOUNT_POINT" --all encode tvDVD
 
 # Optional: validation command run AFTER on_load (exit 0 = accept disc, non-zero = reject).
-# If empty, the on_load exit code determines accept/reject.
+# If empty (default), the on_load exit code determines accept/reject.
 on_validate =
 
 [target_dirs]
@@ -462,42 +462,38 @@ read_dvd = /Volumes/ext-data/
 #   {DATE}        — current date as YYYY-MM-DD
 #
 # Examples:
-#   name_prefix = {INDEX}                 → "0001"
+#   name_prefix = {INDEX}                 → "001"
 #   name        =  - {MEDIA_TYPE}         → " - DVD"
 #   name_postfix =                        → ""
-#   Result: "0001 - DVD"
+#   Result: "001 - DVD"
 #
 #   name_prefix = {DVD_TITLE}             → "LOTR_DISC_1"
-#   name        =  ({INDEX})              → " (0001)"
-#   Result: "LOTR_DISC_1 (0001)"
+#   name        =  ({INDEX})              → " (001)"
+#   Result: "LOTR_DISC_1 (001)"
 #
 #   name_prefix = {DATE}_{INDEX}          → "2026-03-28_0005"
 #   name        =  - {DVD_TITLE}          → " - LOTR_DISC_1"
 #   Result: "2026-03-28_0005 - LOTR_DISC_1"
 
-name_prefix = {INDEX}
-name = " - {MEDIA_TYPE}"
-name_postfix =
+name_prefix = {INDEX}           # default: {INDEX}
+name = " - {MEDIA_TYPE}"        # default: " - {MEDIA_TYPE}"
+name_postfix =                  # default: (empty)
 
-# Zero-padding width for {INDEX} (e.g. 4 → "0001", 2 → "01")
-idx_padding = 4
+# Zero-padding width for {INDEX} (e.g. 3 → "001", 2 → "01")
+idx_padding = 3                 # default: 3
 
 # Offset added to DISC_NR for {INDEX} (can be negative)
 # Useful to continue numbering from a previous batch: --idx-offset 50
-idx_offset = 0
+idx_offset = 0                  # default: 0
 
 [batch]
-# Max discs to process (0 = unlimited, process until hopper is empty)
-max_discs = 0
+max_discs = 0                   # default: 0 (unlimited, process until hopper is empty)
 
-# Seconds to wait after loading before checking if disc mounted
-load_settle_time = 5
+load_settle_time = 5            # default: 5 — seconds to wait after loading before mount check
 
-# Seconds to wait for disc to mount before giving up and rejecting
-mount_timeout = 60
+mount_timeout = 60              # default: 60 — seconds to wait for disc to mount before rejecting
 
-# Seconds between mount-point polling checks
-poll_interval = 2
+poll_interval = 2               # default: 2 — seconds between mount-point polling checks
 """
 
 
@@ -590,7 +586,7 @@ def build_dir_name(config, disc_nr, mount_point, flavor, cli_naming):
     name_prefix  = cli_naming.get("prefix")  if cli_naming.get("prefix")  is not None else config.get("naming", "name_prefix",  fallback="{INDEX}")
     name         = cli_naming.get("name")    if cli_naming.get("name")    is not None else config.get("naming", "name",         fallback=" - {MEDIA_TYPE}")
     name_postfix = cli_naming.get("postfix") if cli_naming.get("postfix") is not None else config.get("naming", "name_postfix", fallback="")
-    idx_padding  = cli_naming.get("idx_padding") if cli_naming.get("idx_padding") is not None else config.getint("naming", "idx_padding", fallback=4)
+    idx_padding  = cli_naming.get("idx_padding") if cli_naming.get("idx_padding") is not None else config.getint("naming", "idx_padding", fallback=3)
     idx_offset   = cli_naming.get("idx_offset")  if cli_naming.get("idx_offset")  is not None else config.getint("naming", "idx_offset",  fallback=0)
 
     idx_padding = int(idx_padding)
@@ -1600,7 +1596,7 @@ Flavors select which command from the config file to run:
 Per-disc directory naming:
   DIR_NAME = TARGET_DIR / {{NAME_PREFIX}}{{NAME}}{{NAME_POSTFIX}}
   Defaults: --prefix "{{INDEX}}" --name " - {{MEDIA_TYPE}}" --postfix ""
-  Example result: "/out/0001 - DVD"
+  Example result: "/out/001 - DVD"
 
   Supported {{VARIABLE}} placeholders:
 {NAMING_VARS_HELP}
@@ -1622,7 +1618,7 @@ Progress is tracked in /tmp/my-nimbie.status and can be queried:
     batch_parser.add_argument("--idx-offset", metavar="N", type=int,
                               help="offset added to disc number for {INDEX} (default: 0, can be negative)")
     batch_parser.add_argument("--idx-padding", metavar="N", type=int,
-                              help="zero-padding width for {INDEX} (default: 4, e.g. 4 → \"0001\")")
+                              help="zero-padding width for {INDEX} (default: 3, e.g. 3 → \"001\")")
 
     return parser
 
