@@ -176,8 +176,17 @@ batch_status = None  # set to BatchStatus instance during batch runs
 
 def signal_handler(_signum, _frame):
     global interrupted
+    if interrupted:
+        # Second Ctrl+C — abort immediately
+        print("\n  Aborting.", file=sys.stderr)
+        sys.exit(130)
     interrupted = True
-    print("\n  Interrupted — finishing current operation...", file=sys.stderr)
+    if batch_status:
+        print("\n  Interrupted — finishing current disc, then stopping...", file=sys.stderr)
+    else:
+        # Not in batch mode — exit immediately
+        print("", file=sys.stderr)
+        sys.exit(130)
 
 
 def sigusr1_handler(_signum, _frame):
