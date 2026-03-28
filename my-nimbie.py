@@ -2390,24 +2390,49 @@ def cmd_status(nimbie, config, _args):
 
     if lifted:
         stage = "5/5  Disc grabbed by gripper — waiting for accept/reject drop"
+        advice = ("  Actions:\n"
+                  "    my-nimbie eject    — drop disc to accept (done) bin\n"
+                  "    my-nimbie reject   — drop disc to reject bin")
     elif in_tray and not tray_out:
         stage = "3/5  Disc in drive (tray closed) — ready for read/rip"
+        advice = ("  Actions:\n"
+                  "    my-nimbie next <flavor>   — process this disc\n"
+                  "    my-nimbie eject           — eject disc to accept bin\n"
+                  "    my-nimbie reject          — eject disc to reject bin")
     elif in_tray and tray_out:
         stage = "2/5  Disc on open tray — waiting for tray close"
+        advice = ("  Actions:\n"
+                  "    my-nimbie next <flavor>   — close tray and process this disc\n"
+                  "    my-nimbie eject           — lift disc and drop to accept bin\n"
+                  "    my-nimbie reject          — lift disc and drop to reject bin")
     elif tray_out and not in_tray:
-        stage = "1/5  Tray open — waiting for disc placement from hopper"
+        stage = "1/5  Tray open, empty — waiting for disc"
+        advice = ("  Actions:\n"
+                  "    my-nimbie load    — place disc from hopper onto tray\n"
+                  "    Place a disc manually on the tray, then run my-nimbie next <flavor>")
     elif not tray_out and not in_tray and not lifted and has_media:
         stage = "3/5  Disc in drive (tray closed, detected by optical drive)"
+        advice = ("  Actions:\n"
+                  "    my-nimbie eject    — open tray, lift disc, drop to accept bin\n"
+                  "    my-nimbie reject   — open tray, lift disc, drop to reject bin")
     elif not tray_out and not in_tray and not lifted:
         stage = "0/5  Idle — no disc in drive"
+        if avail:
+            advice = ("  Actions:\n"
+                      "    my-nimbie next <flavor>    — load and process one disc\n"
+                      "    my-nimbie batch <flavor>   — batch process all discs in hopper")
+        else:
+            advice = "  Load discs into the hopper to begin processing."
     else:
         stage = "?    Unknown state combination"
+        advice = "  Try: my-nimbie reset --diagnostics"
 
     msg(f"\n  Stage: {stage}")
     if avail:
         msg(f"         Hopper has discs available")
     else:
         msg(f"         Hopper is EMPTY")
+    msg(f"\n{advice}")
 
     # Show command progress if available (from next or batch)
     try:
