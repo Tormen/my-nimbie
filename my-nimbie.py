@@ -279,6 +279,7 @@ DEFAULT_CONFIG = {
         "load_settle_time": "5",
         "mount_timeout":   "60",
         "poll_interval":   "2",
+        "result_file":     "/tmp/my-nimbie.result",
     },
 }
 
@@ -293,7 +294,7 @@ DEFAULT_CONFIG_PATH = CONFIG_SEARCH_PATHS[0]  # ~/.my-nimbie.conf
 STATUS_FILE = "/tmp/my-nimbie.status"
 PROGRESS_FILE = "/tmp/my-nimbie.progress"
 COMMAND_FILE = "/tmp/my-nimbie.command"
-RESULT_FILE = "/tmp/my-nimbie.results"
+DEFAULT_RESULT_FILE = "/tmp/my-nimbie.result"
 
 # ---------------------------------------------------------------------------
 # Globals
@@ -333,12 +334,13 @@ def sigusr1_handler(_signum, _frame):
 class BatchStatus:
     """Tracks batch progress, writes status file, handles SIGUSR1."""
 
-    def __init__(self, flavor, mount_point, target_dir, idx_offset=None, mode="next"):
+    def __init__(self, flavor, mount_point, target_dir, idx_offset=None, mode="next", result_file=None):
         self.flavor = flavor or "default"
         self.mount_point = mount_point
         self.target_dir = target_dir
         self.idx_offset = idx_offset
         self.mode = mode  # "next" or "batch"
+        self.result_file = result_file or DEFAULT_RESULT_FILE
         self.cli = "my-nimbie " + " ".join(sys.argv[1:])
         self.disc_nr = 0
         self.accepted = 0
@@ -446,7 +448,7 @@ class BatchStatus:
                     f"total={total_str:>10}  "
                     f"{size_str:>8}  "
                     f"{entry['dir_name']}")
-            with open(RESULT_FILE, "a") as f:
+            with open(self.result_file, "a") as f:
                 f.write(line + "\n")
         except OSError as e:
             dbg(f"Failed to write result file: {e}")
@@ -471,8 +473,7 @@ class BatchStatus:
                     f"{cmd_str:>10}  {total_str:>10}  {size_str:>8}  "
                     f"{os.path.basename(e['dir_name'])}")
         msg(f"{'=' * 64}")
-        if self.disc_results:
-            msg(f"  Results saved to: {RESULT_FILE}")
+        msg(f"  Results saved to: {self.result_file}")
 
     def _write_file(self):
         """Write machine-readable status file."""
@@ -788,6 +789,9 @@ def generate_example_config():
 
     # Seconds between mount-point polling checks
     poll_interval = 2           # default: 2
+
+    # Result log file — each disc result is appended as one line
+    result_file = /tmp/my-nimbie.result
 """
 
 
@@ -1446,6 +1450,17 @@ def wait_for_mount(mount_point, timeout, poll_interval):
 
     dbg(f"wait_for_mount: timed out after {timeout}s")
     return False
+
+
+def _rotate_run_files(result_file):
+    """Move .status, .progress, .result to .OLD before starting a new run."""
+    for path in (STATUS_FILE, PROGRESS_FILE, result_file):
+        if os.path.exists(path):
+            try:
+                os.rename(path, path + ".OLD")
+                dbg(f"Rotated {path} → {path}.OLD")
+            except OSError as e:
+                dbg(f"Failed to rotate {path}: {e}")
 
 
 def unmount_disc(mount_point):
@@ -2587,7 +2602,9 @@ def cmd_next(nimbie, config, args):
     effective_offset = cli_naming.get("idx_offset")
     if effective_offset is None:
         effective_offset = config.getint("naming", "idx_offset", fallback=0)
-    status = BatchStatus(flavor, mount_point, target_dir, idx_offset=effective_offset, mode="next")
+    result_file = config.get("batch", "result_file", fallback=DEFAULT_RESULT_FILE)
+    _rotate_run_files(result_file)
+    status = BatchStatus(flavor, mount_point, target_dir, idx_offset=effective_offset, mode="next", result_file=result_file)
     status.update("starting", disc_nr=disc_nr)
 
     msg(f"Processing next disc (flavor: {flavor_label})")
@@ -2771,7 +2788,9 @@ def cmd_batch(nimbie, config, args):
     effective_offset = cli_naming.get("idx_offset")
     if effective_offset is None:
         effective_offset = config.getint("naming", "idx_offset", fallback=0)
-    status = BatchStatus(flavor, mount_point, target_dir, idx_offset=effective_offset, mode="batch")
+    result_file = config.get("batch", "result_file", fallback=DEFAULT_RESULT_FILE)
+    _rotate_run_files(result_file)
+    status = BatchStatus(flavor, mount_point, target_dir, idx_offset=effective_offset, mode="batch", result_file=result_file)
     batch_status = status
 
     # Install SIGUSR1 handler for live status queries
@@ -3066,22 +3085,24 @@ class TestBatchStatusRecordDisc(unittest.TestCase):
         self._tmpfile.close()
         globals()["STATUS_FILE"] = self._tmpfile.name
 
-        self._orig_result = RESULT_FILE
         self._tmpresult = tempfile.NamedTemporaryFile(suffix=".results", delete=False)
         self._tmpresult.close()
-        globals()["RESULT_FILE"] = self._tmpresult.name
+        self._result_file = self._tmpresult.name
 
     def tearDown(self):
         globals()["STATUS_FILE"] = self._orig_status
-        globals()["RESULT_FILE"] = self._orig_result
         for f in (self._tmpfile.name, self._tmpresult.name):
             try:
                 os.unlink(f)
             except OSError:
                 pass
 
+    def _make_status(self, **kwargs):
+        kwargs.setdefault("result_file", self._result_file)
+        return BatchStatus(**kwargs)
+
     def test_record_accept(self):
-        status = BatchStatus("readdvd", "/Volumes/DVD", "/out", idx_offset=209, mode="batch")
+        status = self._make_status(flavor="readdvd", mount_point="/Volumes/DVD", target_dir="/out", idx_offset=209, mode="batch")
         status.update("running", disc_nr=1)
         status.record_accept(index=210, dir_name="/out/210", source_size=1048576, elapsed=60.0, total_elapsed=75.0)
         self.assertEqual(status.accepted, 1)
@@ -3091,7 +3112,7 @@ class TestBatchStatusRecordDisc(unittest.TestCase):
         self.assertEqual(status.last_disc["result"], "successful")
 
     def test_record_reject(self):
-        status = BatchStatus("readdvd", "/Volumes/DVD", "/out", mode="next")
+        status = self._make_status(flavor="readdvd", mount_point="/Volumes/DVD", target_dir="/out", mode="next")
         status.update("running", disc_nr=1)
         status.record_reject(index=1, dir_name="/out/001", source_size=0, elapsed=5.0, rc=1, total_elapsed=10.0)
         self.assertEqual(status.rejected, 1)
@@ -3099,31 +3120,31 @@ class TestBatchStatusRecordDisc(unittest.TestCase):
         self.assertEqual(status.last_disc["total_elapsed"], 10.0)
 
     def test_total_elapsed_defaults_to_elapsed(self):
-        status = BatchStatus("readdvd", "/Volumes/DVD", "/out")
+        status = self._make_status(flavor="readdvd", mount_point="/Volumes/DVD", target_dir="/out")
         status.update("running", disc_nr=1)
         status.record_accept(index=1, dir_name="/out/001", source_size=0, elapsed=30.0)
         self.assertEqual(status.last_disc["total_elapsed"], 30.0)
 
     def test_status_file_has_mode_and_pid(self):
-        status = BatchStatus("readdvd", "/Volumes/DVD", "/out", mode="batch")
+        status = self._make_status(flavor="readdvd", mount_point="/Volumes/DVD", target_dir="/out", mode="batch")
         status.update("running", disc_nr=1)
         sf = BatchStatus.read_file()
         self.assertEqual(sf["mode"], "batch")
         self.assertIn("pid", sf)
 
     def test_status_file_has_cli(self):
-        status = BatchStatus("readdvd", "/Volumes/DVD", "/out")
+        status = self._make_status(flavor="readdvd", mount_point="/Volumes/DVD", target_dir="/out")
         status.update("running")
         sf = BatchStatus.read_file()
         self.assertIn("cli", sf)
         self.assertTrue(sf["cli"].startswith("my-nimbie"))
 
     def test_result_file_written(self):
-        status = BatchStatus("readdvd", "/Volumes/DVD", "/out")
+        status = self._make_status(flavor="readdvd", mount_point="/Volumes/DVD", target_dir="/out")
         status.update("running", disc_nr=1)
         status.record_accept(index=210, dir_name="/out/210", source_size=1073741824,
                              elapsed=120.0, total_elapsed=140.0)
-        with open(self._tmpresult.name) as f:
+        with open(self._result_file) as f:
             line = f.read()
         self.assertIn("#210", line)
         self.assertIn("successful", line)
