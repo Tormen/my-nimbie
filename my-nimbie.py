@@ -1202,6 +1202,15 @@ def resolve_batch_flavor(config, flavor, cli_target_dir):
             f"    config file: [target_dirs] {target_key} = /path/to/output\n"
             f"    command line: my-nimbie batch --target-dir /path {flavor or ''}")
 
+    if not os.path.isdir(target_dir):
+        err(f"Target directory does not exist: {target_dir}\n\n"
+            f"  Create it first:\n"
+            f"    mkdir -p {target_dir}")
+    if not os.access(target_dir, os.W_OK):
+        err(f"Target directory is not writable: {target_dir}\n\n"
+            f"  Check permissions:\n"
+            f"    ls -ld {target_dir}")
+
     return on_load, target_dir
 
 
@@ -1350,18 +1359,9 @@ def cmd_batch(nimbie, config, args):
 
     # -- Pre-flight checks --
     # Catch problems BEFORE the first disc loads, not halfway through a stack.
+    # (target_dir existence + writability is already checked in resolve_batch_flavor)
 
-    # 1. Target directory must exist and be writable
-    if not os.path.isdir(target_dir):
-        err(f"Target directory does not exist: {target_dir}\n\n"
-            f"  Create it first:\n"
-            f"    mkdir -p {target_dir}")
-    if not os.access(target_dir, os.W_OK):
-        err(f"Target directory is not writable: {target_dir}\n\n"
-            f"  Check permissions:\n"
-            f"    ls -ld {target_dir}")
-
-    # 2. Command binary must exist (check first word of the command)
+    # 1. Command binary must exist (check first word of the command)
     cmd_binary = on_load.split()[0] if on_load else ""
     # Expand ~ and env vars but skip if it contains $VAR (runtime variable)
     if cmd_binary and not cmd_binary.startswith("$"):
