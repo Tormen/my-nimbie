@@ -324,6 +324,7 @@ class BatchStatus:
         self.target_dir = target_dir
         self.idx_offset = idx_offset
         self.mode = mode  # "next" or "batch"
+        self.cli = "my-nimbie " + " ".join(sys.argv[1:])
         self.disc_nr = 0
         self.accepted = 0
         self.rejected = 0
@@ -465,6 +466,7 @@ class BatchStatus:
                 f"state={self.current}",
                 f"mode={self.mode}",
                 f"pid={os.getpid()}",
+                f"cli={self.cli}",
                 f"flavor={self.flavor}",
                 f"disc_nr={self.disc_nr}",
                 f"accepted={self.accepted}",
@@ -1850,8 +1852,10 @@ def cmd_status(nimbie, config, _args):
             except (ValueError, TypeError):
                 pass
 
-        msg(f"CRASHED — {mode_label} process (pid {sf.get('pid', '?')}) died during '{sf.get('state', '?')}'")
-        msg(f"  Flavor:      {sf.get('flavor', '?')}")
+        cli_str = sf.get('cli', '?')
+        msg(f"CRASHED — process died during '{sf.get('state', '?')}'")
+        msg(f"  CLI:         {cli_str}")
+        msg(f"  PID:         {sf.get('pid', '?')}")
         msg(f"  Disc:        #{disc_nr}{index_str}")
         if sf.get("target_dir"):
             msg(f"  Target dir:  {sf['target_dir']}")
