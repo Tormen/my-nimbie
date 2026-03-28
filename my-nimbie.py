@@ -1224,6 +1224,39 @@ def cmd_status(nimbie, _config, _args):
     msg(f"  Disc lifted:    {state['disc_lifted']}")
     msg(f"  Tray out:       {state['tray_out']}")
 
+    # Determine current stage
+    avail = state["disc_available"]
+    in_tray = state["disc_in_tray"]
+    lifted = state["disc_lifted"]
+    tray_out = state["tray_out"]
+
+    if lifted:
+        stage = "5/5  Disc grabbed by gripper — waiting for accept/reject drop"
+    elif in_tray and not tray_out:
+        stage = "3/5  Disc in drive (tray closed) — ready for read/rip"
+    elif in_tray and tray_out:
+        stage = "2/5  Disc on open tray — waiting for tray close"
+    elif tray_out and not in_tray:
+        stage = "1/5  Tray open — waiting for disc placement from hopper"
+    elif not tray_out and not in_tray and not lifted:
+        stage = "0/5  Idle — no disc in drive"
+    else:
+        stage = "?    Unknown state combination"
+
+    msg(f"\n  Stage: {stage}")
+    if avail:
+        msg(f"         Hopper has discs available")
+    else:
+        msg(f"         Hopper is EMPTY")
+
+    msg(f"""
+  Mechanism stages:
+    1. Open tray
+    2. Place disc from hopper onto tray
+    3. Close tray — drive reads/rips the disc
+    4. Open tray, lift disc (gripper picks it up)
+    5. Drop disc to accept (done) or reject bin""")
+
 
 def cmd_batch(nimbie, config, args):
     global batch_status
