@@ -127,10 +127,10 @@ DEFAULT_CONFIG = {
         "mount_point": "/Volumes/DVD_VIDEO_RECORDER",
     },
     "commands": {
-        "on_load_default":     '/LINKS/bin/my-handbrake dvd "$MOUNT_POINT" --all encode tvDVD',
-        "on_load_rip_dvd":     '/LINKS/bin/my-handbrake dvd "$MOUNT_POINT" --all encode tvDVD',
-        "on_load_rip_audiocd": 'mkdir -p "$DIR_NAME" && cd "$DIR_NAME" && cdparanoia -B -- -0 && flac --best *.wav && rm -f *.wav',
-        "on_load_read_dvd":    'dvdbackup -i "$MOUNT_POINT" -o "$DIR_NAME" -M',
+        "on_load_default":     '',
+        "on_load_rip_dvd":     '',
+        "on_load_rip_audiocd": '',
+        "on_load_read_dvd":    '',
         "on_validate": "",
     },
     "target_dirs": {
@@ -407,15 +407,13 @@ mount_point = /Volumes/DVD_VIDEO_RECORDER
 #   $DIR_NAME     — full output path: TARGET_DIR / <generated dir name from [naming]>
 #   $DISC_NR      — sequential disc number (1, 2, 3, ...)
 #
-# "batch" (no flavor)  → on_load_DEFAULT
-# "batch ripdvd"       → on_load_RIP_DVD
-# "batch ripaudio"     → on_load_RIP_AUDIOCD
-# "batch readdvd"      → on_load_READ_DVD
+# "batch <flavor>"    → runs the matching on_load_<FLAVOR> command
+# "batch" (no flavor) → runs on_load_DEFAULT (if set)
+#
+# If no flavor is given and on_load_DEFAULT is not set, my-nimbie lists
+# all available flavors and their commands.
 
-# DEFAULT: encode DVD titles to MKV via my-handbrake
-on_load_DEFAULT = /LINKS/bin/my-handbrake dvd "$MOUNT_POINT" --all encode tvDVD
-
-# RIPDVD: encode DVD titles to MKV via my-handbrake (same as default, customize as needed)
+# RIPDVD: encode DVD titles to MKV via my-handbrake
 on_load_RIP_DVD = /LINKS/bin/my-handbrake dvd "$MOUNT_POINT" --all encode tvDVD
 
 # RIPAUDIO: rip audio CD tracks to FLAC (max quality) via cdparanoia + flac
@@ -423,6 +421,10 @@ on_load_RIP_AUDIOCD = mkdir -p "$DIR_NAME" && cd "$DIR_NAME" && cdparanoia -B --
 
 # READDVD: full DVD backup (all content, mirror mode) via dvdbackup
 on_load_READ_DVD = dvdbackup -i "$MOUNT_POINT" -o "$DIR_NAME" -M
+
+# Optional: set a default command for "batch" without a flavor.
+# If not set, you must always specify a flavor: my-nimbie batch ripdvd
+# on_load_DEFAULT = /LINKS/bin/my-handbrake dvd "$MOUNT_POINT" --all encode tvDVD
 
 # Optional: validation command run AFTER on_load (exit 0 = accept disc, non-zero = reject).
 # If empty, the on_load exit code determines accept/reject.
@@ -1123,9 +1125,35 @@ def run_command(cmd_template, mount_point, disc_nr, target_dir, dir_name):
 # ---------------------------------------------------------------------------
 # Resolve batch flavor → on_load key + target_dir
 # ---------------------------------------------------------------------------
+def _format_flavor_list(config):
+    """Build a formatted list of available flavors and their commands."""
+    lines = []
+    # Check DEFAULT
+    default_cmd = config.get("commands", "on_load_default", fallback="")
+    if default_cmd:
+        lines.append(f"    (none)      on_load_DEFAULT      = {default_cmd}")
+    # Named flavors
+    for name, suffix in BATCH_FLAVORS.items():
+        cmd = config.get("commands", f"on_load_{suffix}".lower(), fallback="")
+        if cmd:
+            lines.append(f"    {name:10s}  on_load_{suffix:14s} = {cmd}")
+        else:
+            lines.append(f"    {name:10s}  on_load_{suffix:14s}   (not configured)")
+    return "\n".join(lines)
+
+
 def resolve_batch_flavor(config, flavor, cli_target_dir):
     """Resolve flavor to (on_load_command, target_dir). Exits on error."""
     if flavor is None:
+        # No flavor specified — check if on_load_DEFAULT is set
+        default_cmd = config.get("commands", "on_load_default", fallback="")
+        if not default_cmd:
+            err(f"No flavor specified and no on_load_DEFAULT configured.\n\n"
+                f"  Available flavors:\n"
+                f"{_format_flavor_list(config)}\n\n"
+                f"  Usage:\n"
+                f"    my-nimbie batch <flavor>\n"
+                f"    my-nimbie batch              (requires on_load_DEFAULT in config)")
         config_suffix = "DEFAULT"
         target_key = "default"
     else:
@@ -1133,8 +1161,7 @@ def resolve_batch_flavor(config, flavor, cli_target_dir):
         if config_suffix is None:
             err(f"Unknown batch flavor: '{flavor}'\n\n"
                 f"  Available flavors:\n"
-                f"    (none)     — uses on_load_DEFAULT\n" +
-                "".join(f"    {name:10s} — uses on_load_{BATCH_FLAVORS[name]}\n" for name in BATCH_FLAVORS))
+                f"{_format_flavor_list(config)}")
         target_key = config_suffix.lower()
 
     on_load_key = f"on_load_{config_suffix}".lower()
@@ -1142,6 +1169,8 @@ def resolve_batch_flavor(config, flavor, cli_target_dir):
 
     if not on_load:
         err(f"No command configured for [commands] on_load_{config_suffix}\n\n"
+            f"  Available flavors:\n"
+            f"{_format_flavor_list(config)}\n\n"
             f"  Set it in your config file or create one with:\n"
             f"    my-nimbie --create-config")
 
@@ -1425,7 +1454,7 @@ Examples:
   my-nimbie reject                        Eject disc to reject bin
   my-nimbie status                        Show device state or batch progress
 
-  my-nimbie batch                         Batch process using on_load_DEFAULT command
+  my-nimbie batch                         List available flavors (or run DEFAULT if set)
   my-nimbie batch ripdvd                  Batch process using on_load_RIP_DVD command
   my-nimbie batch ripaudio                Batch process using on_load_RIP_AUDIOCD command
   my-nimbie batch readdvd                 Batch process using on_load_READ_DVD command
@@ -1446,12 +1475,12 @@ Config file search order:
   3. /LINKS/default/my-nimbie
 
 Batch flavors and their config keys:
-  (none)      → [commands] on_load_DEFAULT      [target_dirs] default
   ripdvd      → [commands] on_load_RIP_DVD      [target_dirs] rip_dvd
   ripaudio    → [commands] on_load_RIP_AUDIOCD   [target_dirs] rip_audiocd
   readdvd     → [commands] on_load_READ_DVD     [target_dirs] read_dvd
 
   Each flavor runs a different command from the config file.
+  Optional: set on_load_DEFAULT to allow "batch" without a flavor.
   The target directory can be set per flavor in [target_dirs] or overridden
   with --target-dir on the CLI.
 
@@ -1502,10 +1531,10 @@ based on the command's exit code (0 = accept, non-zero = reject). Repeats
 until the hopper is empty or max_discs is reached.
 
 Flavors select which command from the config file to run:
-  (none)      run [commands] on_load_DEFAULT     (e.g. my-handbrake encode)
   ripdvd      run [commands] on_load_RIP_DVD     (e.g. my-handbrake encode)
   ripaudio    run [commands] on_load_RIP_AUDIOCD  (e.g. cdparanoia + flac)
   readdvd     run [commands] on_load_READ_DVD    (e.g. dvdbackup mirror)
+  (none)      run [commands] on_load_DEFAULT     (optional, allows "batch" without flavor)
 
 Per-disc directory naming:
   DIR_NAME = TARGET_DIR / {{NAME_PREFIX}}{{NAME}}{{NAME_POSTFIX}}
@@ -1520,7 +1549,7 @@ Progress is tracked in /tmp/my-nimbie.status and can be queried:
   kill -USR1 <pid>              prints live status to stderr of the batch""")
     batch_parser.add_argument("flavor", nargs="?", default=None,
                               choices=list(BATCH_FLAVORS.keys()),
-                              help="processing flavor (default: use on_load_DEFAULT)")
+                              help="processing flavor (omit to list available or use on_load_DEFAULT)")
     batch_parser.add_argument("--target-dir", "-t", metavar="DIR",
                               help="base output directory (overrides [target_dirs] from config)")
     batch_parser.add_argument("--prefix", metavar="STR",
