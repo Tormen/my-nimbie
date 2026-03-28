@@ -676,19 +676,11 @@ class NimbieDevice:
         except Exception as e:
             dbg(f"Kernel driver check: {e}")
 
-        # Reset device to ensure clean state — required on macOS for
-        # non-root users to get proper endpoint access via libusb
-        try:
-            self.dev.reset()
-            dbg("USB device reset OK")
-        except Exception as e:
-            dbg(f"USB reset: {e}")
-
         try:
             self.dev.set_configuration()
             dbg("set_configuration OK")
         except usb.core.USBError as e:
-            warn(f"set_configuration failed: {e} — trying to continue")
+            dbg(f"set_configuration: {e} — may already be configured")
 
         try:
             usb.util.claim_interface(self.dev, 0)
@@ -701,32 +693,20 @@ class NimbieDevice:
                 f"      Check: System Settings → Privacy & Security → USB\n"
                 f"    - Try unplugging and reconnecting the device")
 
-        # Drain any stale data from the IN endpoint
+        # Drain any stale data from the IN endpoint (max 10 reads)
         ddbg("Draining stale IN endpoint data...")
         drain_count = 0
-        try:
-            while True:
-                data = self.dev.read(EP_IN, 64, timeout=200)
+        for _ in range(10):
+            try:
+                data = self.dev.read(EP_IN, 64, timeout=100)
+                raw = bytes(data)
+                if raw == b"\x00" * len(raw):
+                    break  # all-zero = idle interrupt packet, nothing to drain
                 drain_count += 1
-                ddbg(f"  Drained: {bytes(data).hex()}")
-        except Exception:
-            pass
+                ddbg(f"  Drained: {raw.hex()}")
+            except Exception:
+                break
         ddbg(f"  Drained {drain_count} stale packet(s)")
-
-        # Wake-up handshake: send a GET_STATE and discard the response.
-        # After a USB reset, the first command often gets no reply.
-        ddbg("Wake-up handshake: sending throwaway GET_STATE...")
-        try:
-            pkt = bytearray(8)
-            pkt[2] = CMD_GET_STATE[0]
-            self.dev.write(EP_OUT, pkt, timeout=5000)
-            ddbg(f"  Handshake write OK: {pkt.hex()}")
-            time.sleep(0.5)
-            while True:
-                data = self.dev.read(EP_IN, 64, timeout=1000)
-                ddbg(f"  Handshake read: {bytes(data).hex()}")
-        except Exception as e:
-            ddbg(f"  Handshake read ended: {e}")
 
         vrb(f"  Nimbie connected (VID={self.vid:#06x}, PID={self.pid:#06x})")
 
@@ -774,16 +754,23 @@ class NimbieDevice:
     def _read_responses(self, timeout=3000, max_reads=20):
         """Read all pending responses from interrupt IN endpoint.
 
-        Returns a list of ASCII strings. Reads until an empty response or timeout.
+        Returns a list of ASCII strings. Reads until timeout or all-zero idle packet.
         """
         responses = []
+        empty_count = 0
         for _ in range(max_reads):
             try:
                 data = self.dev.read(EP_IN, 64, timeout=timeout)
-                ddbg(f"  Raw read ({len(data)} bytes): {bytes(data).hex()}")
-                if len(data) == 0:
-                    break
-                text = bytes(data).rstrip(b"\x00").decode("ascii", errors="replace")
+                raw = bytes(data)
+                ddbg(f"  Raw read ({len(raw)} bytes): {raw.hex()}")
+                if len(raw) == 0 or raw == b"\x00" * len(raw):
+                    empty_count += 1
+                    if empty_count >= 2:
+                        ddbg("  Two consecutive empty reads — done")
+                        break
+                    continue
+                empty_count = 0
+                text = raw.rstrip(b"\x00").decode("ascii", errors="replace")
                 if text:
                     responses.append(text)
                     dbg(f"  Received: \"{text}\"")
