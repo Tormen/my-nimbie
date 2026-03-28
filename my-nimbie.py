@@ -74,6 +74,7 @@ import datetime
 import re
 import shutil
 import signal
+import threading
 import time
 
 # ---------------------------------------------------------------------------
@@ -94,10 +95,13 @@ _my-nimbie() {
     commands=(
         'load:Load next disc from hopper into drive'
         'eject:Eject current disc to accept (done) bin'
-        'reject:Reject current disc to reject bin'
+        'reject:Reject current disc to reject bin (or tell paused process to reject)'
         'status:Show Nimbie device state or batch progress'
         'next:Process exactly one disc (same setup as batch, for testing)'
         'batch:Batch mode — load, process, accept/reject, repeat'
+        'accept:Tell paused batch/next to accept the disc'
+        'retry:Tell paused batch/next to retry the command'
+        'stop:Tell paused batch/next to reject and stop'
     )
 
     local -a global_opts
@@ -273,6 +277,8 @@ DEFAULT_CONFIG_PATH = CONFIG_SEARCH_PATHS[0]  # ~/.my-nimbie.conf
 
 STATUS_FILE = "/tmp/my-nimbie.status"
 PROGRESS_FILE = "/tmp/my-nimbie.progress"
+COMMAND_FILE = "/tmp/my-nimbie.command"
+RESULT_FILE = "/tmp/my-nimbie.results"
 
 # ---------------------------------------------------------------------------
 # Globals
@@ -312,35 +318,79 @@ def sigusr1_handler(_signum, _frame):
 class BatchStatus:
     """Tracks batch progress, writes status file, handles SIGUSR1."""
 
-    def __init__(self, flavor, mount_point, target_dir):
+    def __init__(self, flavor, mount_point, target_dir, idx_offset=None, mode="next"):
         self.flavor = flavor or "default"
         self.mount_point = mount_point
         self.target_dir = target_dir
+        self.idx_offset = idx_offset
+        self.mode = mode  # "next" or "batch"
         self.disc_nr = 0
         self.accepted = 0
         self.rejected = 0
+        self.command = ""
         self.current = "starting"
         self.started = datetime.datetime.now()
         self.last_update = self.started
+        self.disc_load_start = None  # when current disc loading began (for total time)
+        self.disc_results = []  # list of dicts: {index, dir_name, size, elapsed, total_elapsed, rc, result}
+        self.last_disc = None   # last completed disc result dict
 
-    def update(self, current, disc_nr=None):
+    def update(self, current, disc_nr=None, command=None):
         """Update state and rewrite status file."""
         self.current = current
         if disc_nr is not None:
             self.disc_nr = disc_nr
+        if command is not None:
+            self.command = command
         self.last_update = datetime.datetime.now()
         self._write_file()
 
-    def record_accept(self):
-        self.accepted += 1
-        self.update("accepting")
+    def start_disc_timer(self):
+        """Mark the start of disc processing (including load time)."""
+        self.disc_load_start = time.time()
 
-    def record_reject(self):
+    def get_disc_total_elapsed(self):
+        """Get total elapsed time since disc loading started."""
+        if self.disc_load_start is None:
+            return 0.0
+        return time.time() - self.disc_load_start
+
+    def record_disc(self, index, dir_name, source_size, elapsed, rc, result, total_elapsed=None):
+        """Record a completed disc result.
+
+        elapsed:       command runtime only (seconds)
+        total_elapsed: total processing time including loading (seconds), defaults to elapsed
+        """
+        entry = {
+            "index": index,
+            "dir_name": dir_name,
+            "size": source_size,
+            "elapsed": elapsed,
+            "total_elapsed": total_elapsed if total_elapsed is not None else elapsed,
+            "rc": rc,
+            "result": result,
+            "timestamp": self._ts(datetime.datetime.now()),
+        }
+        self.disc_results.append(entry)
+        self.last_disc = entry
+        self._append_result_file(entry)
+        self._write_file()
+
+    def record_accept(self, index=None, dir_name=None, source_size=0, elapsed=0.0, total_elapsed=None):
+        self.accepted += 1
+        if index is not None:
+            self.record_disc(index, dir_name, source_size, elapsed, 0, "accepted", total_elapsed=total_elapsed)
+        self.update("accepted")
+
+    def record_reject(self, index=None, dir_name=None, source_size=0, elapsed=0.0, rc=1, total_elapsed=None):
         self.rejected += 1
-        self.update("rejecting")
+        if index is not None:
+            self.record_disc(index, dir_name, source_size, elapsed, rc, "rejected", total_elapsed=total_elapsed)
+        self.update("rejected")
 
     def finish(self, final_state="finished"):
         self.update(final_state)
+        self._write_summary()
 
     def _format_elapsed(self, now=None):
         if now is None:
@@ -356,11 +406,64 @@ class BatchStatus:
     def _ts(self, dt):
         return dt.strftime("%Y-%m-%d %H:%M:%S")
 
+    @staticmethod
+    def _fmt_elapsed(secs):
+        """Format seconds as human-readable elapsed time."""
+        secs = int(secs)
+        hours, remainder = divmod(secs, 3600)
+        mins, s = divmod(remainder, 60)
+        if hours > 0:
+            return f"{hours}h {mins:02d}m {s:02d}s"
+        return f"{mins}m {s:02d}s"
+
+    def _append_result_file(self, entry):
+        """Append a disc result line to the result file."""
+        try:
+            size_str = _format_size(entry["size"]) if entry["size"] else "?"
+            cmd_str = self._fmt_elapsed(entry["elapsed"])
+            total_str = self._fmt_elapsed(entry["total_elapsed"])
+            line = (f"{entry['timestamp']}  "
+                    f"#{entry['index']:>3}  "
+                    f"{entry['result']:<8}  "
+                    f"rc={entry['rc']}  "
+                    f"cmd={cmd_str:>10}  "
+                    f"total={total_str:>10}  "
+                    f"{size_str:>8}  "
+                    f"{entry['dir_name']}")
+            with open(RESULT_FILE, "a") as f:
+                f.write(line + "\n")
+        except OSError as e:
+            dbg(f"Failed to write result file: {e}")
+
+    def _write_summary(self):
+        """Print detailed summary at end of batch/next."""
+        total_elapsed = (datetime.datetime.now() - self.started).total_seconds()
+        msg(f"\n{'=' * 64}")
+        msg(f"  Summary: {self.flavor}")
+        msg(f"  Total time:  {self._fmt_elapsed(total_elapsed)}")
+        msg(f"  Accepted:    {self.accepted}")
+        msg(f"  Rejected:    {self.rejected}")
+        msg(f"  Total discs: {self.accepted + self.rejected}")
+        if self.disc_results:
+            msg(f"\n  {'#':>3}  {'Result':<8}  {'RC':>3}  {'Command':>10}  {'Total':>10}  {'Size':>8}  Dir")
+            msg(f"  {'-' * 72}")
+            for e in self.disc_results:
+                size_str = _format_size(e["size"]) if e["size"] else "?"
+                cmd_str = self._fmt_elapsed(e["elapsed"])
+                total_str = self._fmt_elapsed(e["total_elapsed"])
+                msg(f"  {e['index']:>3}  {e['result']:<8}  {e['rc']:>3}  "
+                    f"{cmd_str:>10}  {total_str:>10}  {size_str:>8}  "
+                    f"{os.path.basename(e['dir_name'])}")
+        msg(f"{'=' * 64}")
+        if self.disc_results:
+            msg(f"  Results saved to: {RESULT_FILE}")
+
     def _write_file(self):
         """Write machine-readable status file."""
         try:
             lines = [
                 f"state={self.current}",
+                f"mode={self.mode}",
                 f"flavor={self.flavor}",
                 f"disc_nr={self.disc_nr}",
                 f"accepted={self.accepted}",
@@ -372,6 +475,17 @@ class BatchStatus:
             ]
             if self.target_dir:
                 lines.append(f"target_dir={self.target_dir}")
+            if self.idx_offset is not None:
+                lines.append(f"idx_offset={self.idx_offset}")
+            if self.command:
+                lines.append(f"command={self.command}")
+            if self.last_disc:
+                d = self.last_disc
+                size_str = _format_size(d["size"]) if d["size"] else "?"
+                cmd_str = self._fmt_elapsed(d["elapsed"])
+                total_str = self._fmt_elapsed(d["total_elapsed"])
+                lines.append(f"last_disc=#{d['index']} {d['result']} rc={d['rc']} "
+                             f"cmd={cmd_str} total={total_str} {size_str}")
 
             with open(STATUS_FILE, "w") as f:
                 f.write("\n".join(lines) + "\n")
@@ -422,6 +536,40 @@ class BatchStatus:
             return None
         except OSError:
             return None
+
+
+# ---------------------------------------------------------------------------
+# Pause command helpers (for --pause-on-err)
+# ---------------------------------------------------------------------------
+def _send_pause_command(cmd):
+    """Write a command to COMMAND_FILE for a paused process to pick up."""
+    with open(COMMAND_FILE, "w") as f:
+        f.write(cmd + "\n")
+    msg(f"  Sent '{cmd}' to paused process via {COMMAND_FILE}")
+
+
+def _wait_for_pause_command(status):
+    """Sleep-loop until a command appears in COMMAND_FILE. Returns the command string."""
+    # Clear any stale command file
+    try:
+        os.unlink(COMMAND_FILE)
+    except FileNotFoundError:
+        pass
+
+    status.update("PAUSED — command failed, waiting for: accept / reject / retry")
+    while True:
+        time.sleep(0.5)
+        try:
+            with open(COMMAND_FILE) as f:
+                cmd = f.read().strip().lower()
+            if cmd:
+                os.unlink(COMMAND_FILE)
+                dbg(f"_wait_for_pause_command: received '{cmd}'")
+                return cmd
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +672,12 @@ def generate_example_config():
     #
     # If no flavor is given and on_load_DEFAULT is not set, my-nimbie lists
     # all available flavors and their commands.
+    #
+    # Special value "pause": loads the disc but runs no command. The disc stays
+    # mounted and my-nimbie waits for a command from another terminal:
+    #   my-nimbie accept / reject / retry / stop
+    # Useful for testing or manually tweaking commands while the disc is loaded.
+    # Example:  on_load_TEST = pause
 
     # RIPDVD: encode DVD titles to MKV via my-handbrake
     on_load_RIP_DVD = /LINKS/bin/my-handbrake dvd "$MOUNT_POINT" --all encode tvDVD
@@ -532,10 +686,11 @@ def generate_example_config():
     on_load_RIP_AUDIOCD = mkdir -p "$DIR_NAME" && cd "$DIR_NAME" && cdparanoia -B -- -0 && flac --best *.wav && rm -f *.wav
 
     # READDVD: full DVD backup (all content, mirror mode) via dvdbackup
-    # -M = mirror entire disc, -p = show progress, -v = verbose
-    # $DEVICE = raw device path (e.g. /dev/disk4), resolved from mount_point
+    # -M = mirror entire disc, -v = verbose
+    # my-nimbie auto-adds: -n <volume_name> (required for DVDs with empty title)
+    # my-nimbie auto-removes: -p (causes incomplete copies on macOS)
     # mkdir -p ensures the output directory exists before dvdbackup runs
-    on_load_READ_DVD = mkdir -p "$DIR_NAME" && dvdbackup -i "$DEVICE" -o "$DIR_NAME" -M -p -v
+    on_load_READ_DVD = mkdir -p "$DIR_NAME" && dvdbackup -i "$MOUNT_POINT" -o "$DIR_NAME" -M -v
 
     # Optional: set a default for "batch" without a flavor.
     # Can be a full command or a flavor name (synonym):
@@ -596,8 +751,8 @@ def generate_example_config():
     # Zero-padding width for {INDEX} (e.g. 3 → "001", 2 → "01")
     idx_padding = 3             # default: 3
 
-    # Offset added to DISC_NR for {INDEX}
-    # {INDEX} = DISC_NR + idx_offset, where DISC_NR starts at 1.
+    # Offset added to disc number for {INDEX}.
+    # {INDEX} = DISC_NR + offset, where DISC_NR starts at 1.
     # With the default (0), numbering starts at 1: 001, 002, 003, ...
     # To continue from a previous batch of 50 discs: idx_offset = 50
     #   → first disc gets {INDEX} = 051, then 052, 053, ...
@@ -722,8 +877,9 @@ def build_dir_name(config, disc_nr, mount_point, flavor, cli_naming):
     index_val = disc_nr + idx_offset
     index_str = str(index_val).zfill(idx_padding)
 
-    dbg(f"build_dir_name: disc_nr={disc_nr}, idx_offset={idx_offset}, "
-        f"idx_padding={idx_padding} → index_val={index_val}, index_str='{index_str}'")
+    dbg(f"build_dir_name: disc_nr={disc_nr}, idx_offset={idx_offset} "
+        f"(INDEX = disc_nr + offset = {disc_nr}+{idx_offset} = {index_val}), "
+        f"idx_padding={idx_padding} → index_str='{index_str}'")
     ddbg(f"build_dir_name: name_prefix='{name_prefix}', name='{name}', name_postfix='{name_postfix}'")
     ddbg(f"build_dir_name: sources — prefix:{'CLI' if cli_naming.get('prefix') is not None else 'config'}, "
          f"name:{'CLI' if cli_naming.get('name') is not None else 'config'}, "
@@ -1335,52 +1491,176 @@ def expand_command(cmd_template, mount_point, disc_nr, target_dir, dir_name):
     return cmd
 
 
-def _ensure_dvdbackup_flags(cmd):
-    """Transparently add -p (progress) to dvdbackup if not already present."""
-    # Only modify if the command starts with or contains dvdbackup
+def _ensure_dvdbackup_flags(cmd, mount_point):
+    """Transparently fix dvdbackup command for reliable operation.
+
+    Adds -n <volume_name> if not present (required when DVD title is empty).
+    """
     parts = cmd.split("&&")
     modified = []
     for part in parts:
         stripped = part.strip()
         if stripped.startswith("dvdbackup ") or stripped.startswith("dvdbackup\t"):
-            if " -p" not in stripped and " --progress" not in stripped:
-                stripped = stripped.replace("dvdbackup ", "dvdbackup -p ", 1)
-                dbg(f"run_command: auto-added -p (progress) to dvdbackup")
+            if " -n " not in stripped and " --name " not in stripped:
+                vol_name = os.path.basename(mount_point)
+                stripped = stripped.replace("dvdbackup ", f'dvdbackup -n "{vol_name}" ', 1)
+                dbg(f"_ensure_dvdbackup_flags: auto-added -n \"{vol_name}\"")
             modified.append(stripped)
         else:
             modified.append(part)
     return " && ".join(modified)
 
 
-def _write_progress(line):
-    """Write latest progress line to progress file for status queries."""
+def _get_dir_size(path):
+    """Get total size of a directory tree in bytes."""
+    total = 0
     try:
-        with open(PROGRESS_FILE, "w") as f:
-            f.write(line + "\n")
+        for dirpath, _dirnames, filenames in os.walk(path):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                try:
+                    total += os.path.getsize(fp)
+                except OSError:
+                    pass
     except OSError:
         pass
+    return total
 
 
-def run_command(cmd_template, mount_point, disc_nr, target_dir, dir_name):
-    """Run a shell command with variable expansion. Returns exit code.
+def _get_mount_size(mount_point):
+    """Get total used size of a mounted disc in bytes.
+
+    Works for DVDs (mounted filesystem) and audio CDs (via diskutil).
+    """
+    # Try filesystem stats first (works for mounted DVDs)
+    try:
+        st = os.statvfs(mount_point)
+        used = (st.f_blocks - st.f_bfree) * st.f_frsize
+        if used > 0:
+            return used
+    except OSError:
+        pass
+    # Fallback: walk the directory (works for any mounted disc)
+    size = _get_dir_size(mount_point)
+    if size > 0:
+        return size
+    # Last resort: try diskutil for unmounted/audio discs
+    try:
+        import plistlib
+        result = subprocess.run(
+            ["diskutil", "info", "-plist", mount_point],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            plist = plistlib.loads(result.stdout.encode())
+            return plist.get("TotalSize", 0) or plist.get("Size", 0)
+    except Exception:
+        pass
+    return 0
+
+
+def _format_size(size_bytes):
+    """Format bytes as human-readable string."""
+    if size_bytes >= 1073741824:
+        return f"{size_bytes / 1073741824:.1f} GB"
+    if size_bytes >= 1048576:
+        return f"{size_bytes / 1048576:.1f} MB"
+    if size_bytes >= 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    return f"{size_bytes} B"
+
+
+class _ProgressMonitor:
+    """Background thread that monitors copy progress by comparing dir sizes."""
+
+    def __init__(self, source_size, target_dir, interval=0.5):
+        self.source_size = source_size
+        self.target_dir = target_dir
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = None
+        self._last_progress = ""
+        self._start_time = time.time()
+
+    def start(self):
+        if self.source_size <= 0:
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        dbg(f"_ProgressMonitor: started (source={_format_size(self.source_size)}, "
+            f"target={self.target_dir}, interval={self.interval}s)")
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        # Write final progress (don't delete — status may still read it)
+        if self.source_size > 0:
+            copied = _get_dir_size(self.target_dir)
+            pct = min(100.0, (copied / self.source_size) * 100)
+            elapsed = time.time() - self._start_time
+            elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60):02d}s"
+            final = f"{pct:5.1f}%  {_format_size(copied)} / {_format_size(self.source_size)}  [{elapsed_str}] done"
+            self._last_progress = final
+            try:
+                with open(PROGRESS_FILE, "w") as f:
+                    f.write(final + "\n")
+            except OSError:
+                pass
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._stop.wait(self.interval)
+            if self._stop.is_set():
+                break
+            copied = _get_dir_size(self.target_dir)
+            pct = min(100.0, (copied / self.source_size) * 100) if self.source_size > 0 else 0
+            elapsed = time.time() - self._start_time
+            elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60):02d}s"
+            progress = (f"{pct:5.1f}%  {_format_size(copied)} / {_format_size(self.source_size)}"
+                        f"  [{elapsed_str}]")
+            self._last_progress = progress
+            # Write to progress file for 'my-nimbie status'
+            try:
+                with open(PROGRESS_FILE, "w") as f:
+                    f.write(progress + "\n")
+            except OSError:
+                pass
+            # Print progress on CLI (overwrite line)
+            print(f"\r  Progress: {progress}  ", end="", flush=True)
+
+    @property
+    def last_progress(self):
+        return self._last_progress
+
+
+def run_command(cmd_template, mount_point, disc_nr, target_dir, dir_name, status=None):
+    """Run a shell command with variable expansion. Returns (exit_code, elapsed_secs).
 
     Streams output to the user in real time. For dvdbackup, transparently
-    adds -p (progress) and captures progress to PROGRESS_FILE for status queries.
+    adds -n (name) for reliable operation on macOS.
+    Monitors copy progress by comparing source disc size vs target dir size.
     """
     cmd = expand_command(cmd_template, mount_point, disc_nr, target_dir, dir_name)
-    cmd = _ensure_dvdbackup_flags(cmd)
+    cmd = _ensure_dvdbackup_flags(cmd, mount_point)
 
     msg(f"\n  Running: {cmd}")
+    if status is not None:
+        status.update("running command", command=cmd)
     dbg(f"run_command: template='{cmd_template}'")
     dbg(f"run_command: expanded='{cmd}'")
 
     if dry_run:
         msg("  [DRY-RUN] Would execute above command")
-        return 0
+        return 0, 0.0
 
-    # Clear progress file
-    _write_progress("")
+    # Start progress monitor (measures source disc size, polls target dir)
+    source_size = _get_mount_size(mount_point)
+    dbg(f"run_command: source disc size = {_format_size(source_size)}")
+    monitor = _ProgressMonitor(source_size, dir_name)
+    monitor.start()
 
+    start_time = time.time()
     try:
         dbg("run_command: executing via shell (streaming output)...")
         proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
@@ -1388,21 +1668,21 @@ def run_command(cmd_template, mount_point, disc_nr, target_dir, dir_name):
                                 bufsize=1)
         for line in proc.stdout:
             line = line.rstrip("\n")
-            print(f"    {line}")
-            # Capture progress-like lines (dvdbackup progress, percentages, etc.)
-            _write_progress(line)
+            # Clear progress line, print command output, then let monitor redraw
+            print(f"\r    {line:<80}")
         proc.wait()
-        dbg(f"run_command: exit code {proc.returncode}")
-        vrb(f"  Command exited with code: {proc.returncode}")
-        # Clear progress on completion
-        try:
-            os.unlink(PROGRESS_FILE)
-        except OSError:
-            pass
-        return proc.returncode
+        elapsed = time.time() - start_time
+        monitor.stop()
+        # Print final newline after progress line
+        print()
+        dbg(f"run_command: exit code {proc.returncode}, elapsed {elapsed:.1f}s")
+        vrb(f"  Command exited with code {proc.returncode} in {int(elapsed // 60)}m {int(elapsed % 60):02d}s")
+        return proc.returncode, elapsed
     except KeyboardInterrupt:
+        monitor.stop()
+        elapsed = time.time() - start_time
         warn("Command interrupted")
-        return 130
+        return 130, elapsed
 
 
 # ---------------------------------------------------------------------------
@@ -1534,18 +1814,28 @@ def cmd_reject(nimbie, config, _args):
 
 def cmd_status(nimbie, config, _args):
     config_path = getattr(config, "config_path", None)
-    msg(f"  Config: {config_path or '(built-in defaults)'}")
-    msg("")
+    if verbose:
+        msg(f"Config: {config_path or '(built-in defaults)'}")
+        msg("")
 
     # Check if a batch is running (status file exists with non-finished state)
     sf = BatchStatus.read_file()
+    is_batch = sf.get("mode") == "batch" if sf else False
     if sf and sf.get("state") not in ("finished", "interrupted"):
-        msg(f"Batch in progress (from status file {STATUS_FILE}):")
+        mode_label = "Batch" if is_batch else "Next"
+        msg(f"{mode_label} in progress (from status file {STATUS_FILE}):")
         msg(f"  Flavor:      {sf.get('flavor', '?')}")
-        msg(f"  Running:     disc #{sf.get('disc_nr', '?')} ({sf.get('current', '?')})")
-        msg(f"  Accepted:    {sf.get('accepted', '?')}")
-        msg(f"  Rejected:    {sf.get('rejected', '?')}")
-        msg(f"  Started:     {sf.get('started', '?')}")
+
+        # Build "Running:" line with disc number, index, state, and elapsed
+        disc_nr = sf.get('disc_nr', '?')
+        idx_offset = sf.get('idx_offset')
+        running_parts = [f"disc #{disc_nr}"]
+        if idx_offset is not None:
+            try:
+                index_val = int(disc_nr) + int(idx_offset)
+                running_parts[0] = f"disc #{disc_nr}, index {index_val}"
+            except (ValueError, TypeError):
+                pass
         started_str = sf.get("started")
         if started_str:
             try:
@@ -1558,13 +1848,24 @@ def cmd_status(nimbie, config, _args):
                     elapsed_str = f"{hours}h {mins:02d}m {secs:02d}s"
                 else:
                     elapsed_str = f"{mins}m {secs:02d}s"
-                msg(f"  Elapsed:     {elapsed_str}")
+                running_parts.append(elapsed_str)
             except ValueError:
                 pass
-        msg(f"  Last update: {sf.get('last_update', '?')}")
+        current = sf.get('current', '?')
+        msg(f"  Running:     {', '.join(running_parts)} — {current}")
+
+        msg(f"  Accepted:    {sf.get('accepted', '?')}")
+        msg(f"  Rejected:    {sf.get('rejected', '?')}")
+        if verbose:
+            if sf.get("started"):
+                msg(f"  Started:     {sf['started']}")
+            if sf.get("last_update"):
+                msg(f"  Last update: {sf['last_update']}")
         if sf.get("target_dir"):
             msg(f"  Target dir:  {sf['target_dir']}")
-        # Show command progress if available
+        if sf.get("command"):
+            msg(f"  Command:     {sf['command']}")
+        # Show copy progress if available
         try:
             with open(PROGRESS_FILE) as f:
                 progress = f.read().strip()
@@ -1572,9 +1873,18 @@ def cmd_status(nimbie, config, _args):
                 msg(f"  Progress:    {progress}")
         except (FileNotFoundError, OSError):
             pass
-        msg(f"\n  Tip: send SIGUSR1 to the batch process for a live status dump:")
-        msg(f"    kill -USR1 <pid>")
+        # Show last completed disc (batch only)
+        if is_batch and sf.get("last_disc"):
+            msg(f"  Last disc:   {sf['last_disc']}")
         return
+
+    # Show last batch result if available (even after finished) — batch only
+    if sf and sf.get("state") in ("finished", "interrupted") and is_batch:
+        msg(f"Last batch: {sf.get('flavor', '?')} — {sf.get('state')}")
+        msg(f"  Accepted: {sf.get('accepted', '?')}, Rejected: {sf.get('rejected', '?')}")
+        if sf.get("last_disc"):
+            msg(f"  Last disc: {sf['last_disc']}")
+        msg("")
 
     # No batch running — query USB device directly
     msg("Querying Nimbie status...")
@@ -1695,7 +2005,11 @@ def cmd_next(nimbie, config, args):
     dir_name = os.path.join(target_dir, dir_name_part) if target_dir else dir_name_part
 
     # Track status for 'my-nimbie status' queries
-    status = BatchStatus(flavor, mount_point, target_dir)
+    # Resolve effective idx_offset for status display
+    effective_offset = cli_naming.get("idx_offset")
+    if effective_offset is None:
+        effective_offset = config.getint("naming", "idx_offset", fallback=0)
+    status = BatchStatus(flavor, mount_point, target_dir, idx_offset=effective_offset, mode="next")
     status.update("starting", disc_nr=disc_nr)
 
     msg(f"Processing next disc (flavor: {flavor_label})")
@@ -1715,6 +2029,7 @@ def cmd_next(nimbie, config, args):
             msg("  Previous disc accepted.")
 
     # Load
+    status.start_disc_timer()
     status.update("loading")
     msg("\n  Loading disc from hopper...")
     dbg("cmd_next: calling nimbie.load_disc()")
@@ -1742,52 +2057,75 @@ def cmd_next(nimbie, config, args):
     dir_name = os.path.join(target_dir, dir_name_part) if target_dir else dir_name_part
     msg(f"  Dir name:   {dir_name}")
 
-    # Run command
-    status.update("running command")
-    dbg(f"cmd_next: running on_load command")
-    rc = run_command(on_load, mount_point, disc_nr, target_dir, dir_name)
-    dbg(f"cmd_next: on_load returned rc={rc}")
+    # Get source size before running command (for result tracking)
+    source_size = _get_mount_size(mount_point)
 
-    # Validate
-    if on_validate:
-        dbg(f"cmd_next: running on_validate command")
-        rc = run_command(on_validate, mount_point, disc_nr, target_dir, dir_name)
-        dbg(f"cmd_next: on_validate returned rc={rc}")
+    # Check if command is "pause" — skip command, go straight to pause loop
+    if on_load.strip().lower() == "pause":
+        msg(f"\n  PAUSED — command is 'pause', disc loaded and mounted")
+        msg(f"  Disc is mounted at: {mount_point}")
+        msg(f"  Output directory: {dir_name}")
+        rc = 1  # trigger pause loop
+        elapsed = 0.0
     else:
-        dbg("cmd_next: no on_validate configured, skipping")
+        # Run command
+        dbg(f"cmd_next: running on_load command")
+        rc, elapsed = run_command(on_load, mount_point, disc_nr, target_dir, dir_name, status=status)
+        dbg(f"cmd_next: on_load returned rc={rc}, elapsed={elapsed:.1f}s")
 
-    # Accept or reject
-    if rc != 0 and getattr(args, "pause_on_err", False):
+        # Validate
+        if on_validate:
+            dbg(f"cmd_next: running on_validate command")
+            rc, _ = run_command(on_validate, mount_point, disc_nr, target_dir, dir_name)
+            dbg(f"cmd_next: on_validate returned rc={rc}")
+        else:
+            dbg("cmd_next: no on_validate configured, skipping")
+
+    # Pause-on-error (or "pause" command): keep disc in drive, wait for command
+    is_pause_cmd = on_load.strip().lower() == "pause"
+    while rc != 0 and (getattr(args, "pause_on_err", False) or is_pause_cmd):
         msg(f"\n  COMMAND FAILED (exit code {rc}) — disc kept in drive (--pause-on-err)")
         msg(f"  Disc is still mounted at: {mount_point}")
         msg(f"  Output directory: {dir_name}")
-        msg(f"\n  You can now:")
-        msg(f"    - Inspect the disc and output manually")
-        msg(f"    - Re-run the command in another terminal")
-        msg(f"    - Press ENTER to reject the disc, or type 'accept' to accept it")
-        try:
-            answer = input("\n  [ENTER=reject / 'accept'=accept] > ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            answer = ""
+        msg(f"\n  Waiting for command from another terminal:")
+        msg(f"    my-nimbie retry    — re-run the command")
+        msg(f"    my-nimbie accept   — accept the disc anyway")
+        msg(f"    my-nimbie reject   — reject the disc")
+        answer = _wait_for_pause_command(status)
         if answer == "accept":
-            msg("  User chose ACCEPT")
-            rc = 0  # override to accept
+            msg("  Received ACCEPT")
+            rc = 0
+        elif answer == "retry":
+            msg("  Received RETRY — re-running command...")
+            rc, elapsed = run_command(on_load, mount_point, disc_nr, target_dir, dir_name, status=status)
+            dbg(f"cmd_next: retry on_load returned rc={rc}, elapsed={elapsed:.1f}s")
+        elif answer == "reject":
+            msg("  Received REJECT")
+            break
         else:
-            msg("  User chose REJECT")
+            warn(f"Unknown pause command: '{answer}' (expected: accept/reject/retry)")
+            continue
 
     dbg(f"cmd_next: unmounting disc before eject")
     unmount_disc(mount_point)
 
+    index_val = disc_nr + (effective_offset or 0)
+    total_elapsed = status.get_disc_total_elapsed()
     if rc == 0:
-        msg("  ACCEPTING (command succeeded)")
-        dbg("cmd_next: ejecting to accept bin")
+        cmd_time = f"{int(elapsed // 60)}m {int(elapsed % 60):02d}s"
+        total_time = f"{int(total_elapsed // 60)}m {int(total_elapsed % 60):02d}s"
+        msg(f"  ACCEPTING disc #{index_val} (command succeeded, {_format_size(source_size)}, "
+            f"cmd={cmd_time}, total={total_time})")
+        status.update("ejecting — accepting")
         nimbie.eject_accept()
-        status.record_accept()
+        status.record_accept(index=index_val, dir_name=dir_name, source_size=source_size,
+                             elapsed=elapsed, total_elapsed=total_elapsed)
     else:
-        msg(f"  REJECTING (command failed with exit code {rc})")
-        dbg("cmd_next: ejecting to reject bin")
+        msg(f"  REJECTING disc #{index_val} (command failed with exit code {rc})")
+        status.update("ejecting — rejecting")
         nimbie.eject_reject()
-        status.record_reject()
+        status.record_reject(index=index_val, dir_name=dir_name, source_size=source_size,
+                             elapsed=elapsed, rc=rc, total_elapsed=total_elapsed)
 
     if has_more:
         msg("  Hopper has more discs available.")
@@ -1795,6 +2133,10 @@ def cmd_next(nimbie, config, args):
         msg("  Hopper is empty — that was the last disc.")
 
     status.finish()
+    try:
+        os.unlink(PROGRESS_FILE)
+    except OSError:
+        pass
     dbg("cmd_next: done")
 
 
@@ -1854,7 +2196,10 @@ def cmd_batch(nimbie, config, args):
             f"  Check your config: [nimbie] mount_point")
 
     # Initialize status tracking
-    status = BatchStatus(flavor, mount_point, target_dir)
+    effective_offset = cli_naming.get("idx_offset")
+    if effective_offset is None:
+        effective_offset = config.getint("naming", "idx_offset", fallback=0)
+    status = BatchStatus(flavor, mount_point, target_dir, idx_offset=effective_offset, mode="batch")
     batch_status = status
 
     # Install SIGUSR1 handler for live status queries
@@ -1889,6 +2234,7 @@ def cmd_batch(nimbie, config, args):
             msg(f"{'=' * 60}")
 
             # Load
+            status.start_disc_timer()
             status.update("loading", status.disc_nr)
             msg("  Loading disc from hopper...")
             has_more = nimbie.load_disc()
@@ -1917,49 +2263,76 @@ def cmd_batch(nimbie, config, args):
                 dir_name = dir_name_part
             msg(f"  Dir name:   {dir_name}")
 
-            # Run command
-            status.update("processing")
-            rc = run_command(on_load, mount_point, status.disc_nr, target_dir, dir_name)
+            # Get source size + index for result tracking
+            source_size = _get_mount_size(mount_point)
+            index_val = status.disc_nr + (effective_offset or 0)
 
-            # Validate
-            if on_validate:
-                rc = run_command(on_validate, mount_point, status.disc_nr, target_dir, dir_name)
+            # Check if command is "pause"
+            is_pause_cmd = on_load.strip().lower() == "pause"
+            if is_pause_cmd:
+                msg(f"\n  PAUSED — command is 'pause', disc loaded and mounted")
+                rc = 1
+                elapsed = 0.0
+            else:
+                # Run command
+                rc, elapsed = run_command(on_load, mount_point, status.disc_nr, target_dir, dir_name, status=status)
 
-            # Accept or reject
-            if rc != 0 and args.pause_on_err:
-                status.update("paused-on-error")
+                # Validate
+                if on_validate:
+                    rc, _ = run_command(on_validate, mount_point, status.disc_nr, target_dir, dir_name)
+
+            # Pause-on-error (or "pause" command): keep disc in drive, wait for command
+            stop_batch = False
+            while rc != 0 and (args.pause_on_err or is_pause_cmd):
                 msg(f"\n  COMMAND FAILED (exit code {rc}) — disc kept in drive (--pause-on-err)")
                 msg(f"  Disc #{status.disc_nr} is still mounted at: {mount_point}")
                 msg(f"  Output directory: {dir_name}")
-                msg(f"\n  You can now:")
-                msg(f"    - Inspect the disc and output manually")
-                msg(f"    - Re-run the command in another terminal")
-                msg(f"    - Press ENTER to reject the disc, or type 'accept' to accept it")
-                msg(f"    - Type 'stop' to reject and stop the batch")
-                try:
-                    answer = input("\n  [ENTER=reject / 'accept' / 'stop'] > ").strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    answer = "stop"
+                msg(f"\n  Waiting for command from another terminal:")
+                msg(f"    my-nimbie retry    — re-run the command")
+                msg(f"    my-nimbie accept   — accept the disc anyway")
+                msg(f"    my-nimbie reject   — reject the disc and continue batch")
+                msg(f"    my-nimbie stop     — reject the disc and stop the batch")
+                answer = _wait_for_pause_command(status)
                 if answer == "accept":
-                    msg("  User chose ACCEPT")
+                    msg("  Received ACCEPT")
                     rc = 0
+                elif answer == "retry":
+                    msg("  Received RETRY — re-running command...")
+                    rc, elapsed = run_command(on_load, mount_point, status.disc_nr, target_dir, dir_name, status=status)
                 elif answer == "stop":
-                    msg("  User chose STOP")
+                    msg("  Received STOP")
                     unmount_disc(mount_point)
                     nimbie.eject_reject()
-                    status.record_reject()
+                    total_elapsed = status.get_disc_total_elapsed()
+                    status.record_reject(index=index_val, dir_name=dir_name, source_size=source_size,
+                                         elapsed=elapsed, rc=rc, total_elapsed=total_elapsed)
+                    stop_batch = True
                     break
+                elif answer == "reject":
+                    msg("  Received REJECT")
+                    break
+                else:
+                    warn(f"Unknown pause command: '{answer}' (expected: accept/reject/retry/stop)")
+                    continue
+            if stop_batch:
+                break
 
             unmount_disc(mount_point)
 
+            total_elapsed = status.get_disc_total_elapsed()
             if rc == 0:
-                msg(f"  Disc #{status.disc_nr}: ACCEPTING (command succeeded)")
+                cmd_time = BatchStatus._fmt_elapsed(elapsed)
+                total_time = BatchStatus._fmt_elapsed(total_elapsed)
+                msg(f"  Disc #{status.disc_nr}: ACCEPTING (command succeeded, "
+                    f"{_format_size(source_size)}, cmd={cmd_time}, total={total_time})")
                 nimbie.eject_accept()
-                status.record_accept()
+                status.record_accept(index=index_val, dir_name=dir_name, source_size=source_size,
+                                     elapsed=elapsed, total_elapsed=total_elapsed)
             else:
                 msg(f"  Disc #{status.disc_nr}: REJECTING (command failed with exit code {rc})")
                 nimbie.eject_reject()
-                status.record_reject()
+                status.record_reject(index=index_val, dir_name=dir_name, source_size=source_size,
+                                     elapsed=elapsed, rc=rc, total_elapsed=total_elapsed)
 
             if not has_more:
                 msg("  Hopper empty. Stopping.")
@@ -2001,7 +2374,7 @@ class _HelpfulParser(argparse.ArgumentParser):
         "--offset":  "  --offset requires a number, e.g.: --offset 50\n"
                      "  {INDEX} = DISC_NR + offset, where DISC_NR starts at 1.\n"
                      "  With --offset 50, numbering starts at 051, 052, 053, ...\n"
-                     "  To start at 200, use --offset 199 (first disc: 1 + 199 = 200).",
+                     "  With --offset 209, numbering starts at 210, 211, 212, ...",
         "--padding": "  --padding requires a number, e.g.: --padding 3\n"
                      "  Controls zero-padding width for {INDEX}: 3 → 001, 4 → 0001",
     }
@@ -2093,8 +2466,11 @@ Monitoring a running batch:
     sub = parser.add_subparsers(dest="command", parser_class=_HelpfulParser)
     sub.add_parser("load",   help="Load next disc from hopper into drive")
     sub.add_parser("eject",  help="Eject current disc to accept (done) bin")
-    sub.add_parser("reject", help="Reject current disc to reject bin")
+    sub.add_parser("reject", help="Reject current disc to reject bin (or: tell paused batch to reject)")
     sub.add_parser("status", help="Show Nimbie device state (or batch progress if running)")
+    sub.add_parser("accept", help="Tell a paused batch/next to accept the disc")
+    sub.add_parser("retry",  help="Tell a paused batch/next to retry the command")
+    sub.add_parser("stop",   help="Tell a paused batch/next to reject and stop")
 
     # --- next: process exactly one disc (same setup as batch, for testing) ---
     next_parser = sub.add_parser("next", help="Process exactly one disc (same setup as batch, for testing)",
@@ -2136,7 +2512,8 @@ Per-disc directory naming:
                              help="directory name postfix (default: \"\", overrides [naming] name_postfix)")
     next_parser.add_argument("--offset", metavar="N", type=int,
                              help="offset added to disc number for {INDEX} (default: 0). "
-                             "E.g. --offset 50 → first disc is 051, then 052, ...")
+                             "INDEX = DISC_NR + offset, DISC_NR starts at 1. "
+                             "E.g. --offset 209 → first disc is 210, then 211, ...")
     next_parser.add_argument("--padding", metavar="N", type=int,
                              help="zero-padding width for {INDEX} (default: 3, e.g. 3 → \"001\")")
     next_parser.add_argument("--pause-on-err", action="store_true",
@@ -2181,8 +2558,9 @@ Progress is tracked in /tmp/my-nimbie.status and can be queried:
     batch_parser.add_argument("--postfix", metavar="STR",
                               help="directory name postfix (default: \"\", overrides [naming] name_postfix)")
     batch_parser.add_argument("--offset", metavar="N", type=int,
-                              help="offset added to disc number for {INDEX} (default: 0). "
-                              "E.g. --offset 50 → first disc is 051, then 052, ...")
+                              help="starting index for {INDEX} (default: 1). "
+                              "--offset N means the first disc IS N. "
+                              "E.g. --offset 50 → 050, 051, 052, ...")
     batch_parser.add_argument("--padding", metavar="N", type=int,
                               help="zero-padding width for {INDEX} (default: 3, e.g. 3 → \"001\")")
     batch_parser.add_argument("--pause-on-err", action="store_true",
@@ -2196,8 +2574,32 @@ def main():
 
     signal.signal(signal.SIGINT, signal_handler)
 
+    # Pre-process argv: expand -DD → -D -D and hoist global flags before subcommand
+    argv = sys.argv[1:]
+    expanded = []
+    for arg in argv:
+        if re.match(r'^-D{2,}$', arg):
+            expanded.extend(["-D"] * len(arg[1:]))
+        else:
+            expanded.append(arg)
+    # Hoist global flags (-D, -v, -d, --debug, --verbose, --dry) before the subcommand
+    subcommands = {"load", "eject", "reject", "status", "next", "batch"}
+    global_flags = {"-D", "-v", "-d", "--debug", "--verbose", "--dry"}
+    hoisted = []
+    rest = []
+    found_subcmd = False
+    for arg in expanded:
+        if not found_subcmd and arg in subcommands:
+            found_subcmd = True
+            rest.append(arg)
+        elif found_subcmd and arg in global_flags:
+            hoisted.append(arg)
+        else:
+            rest.append(arg)
+    final_argv = hoisted + rest
+
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(final_argv)
 
     debug = args.debug >= 1
     deepdebug = args.debug >= 2
@@ -2218,6 +2620,24 @@ def main():
 
     config_path = find_config_file(args.config)
     config = load_config(config_path)
+
+    # Pause control commands: send command to paused batch/next process, no USB needed
+    if args.command in ("accept", "retry", "stop"):
+        sf = BatchStatus.read_file()
+        if sf and "PAUSED" in sf.get("state", ""):
+            _send_pause_command(args.command)
+        else:
+            err(f"No paused batch/next process found.\n\n"
+                f"  '{args.command}' only works when a batch or next process is paused (--pause-on-err).\n"
+                f"  Current state: {sf.get('state', 'no status file') if sf else 'no status file'}")
+        return
+
+    # 'reject' doubles as pause command when a process is paused
+    if args.command == "reject":
+        sf = BatchStatus.read_file()
+        if sf and "PAUSED" in sf.get("state", ""):
+            _send_pause_command("reject")
+            return
 
     # Status command: try reading status file first, only connect if no batch running
     if args.command == "status":
