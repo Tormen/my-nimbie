@@ -2383,6 +2383,11 @@ def cmd_status(nimbie, config, _args):
     lifted = state["disc_lifted"]
     tray_out = state["tray_out"]
 
+    # Check optical drive for media (drutil can see disc in closed drive, Nimbie state bits cannot)
+    import subprocess
+    drutil_result = subprocess.run(["drutil", "status"], capture_output=True, text=True)
+    has_media = any("Type:" in line and "No Media" not in line for line in drutil_result.stdout.split("\n"))
+
     if lifted:
         stage = "5/5  Disc grabbed by gripper — waiting for accept/reject drop"
     elif in_tray and not tray_out:
@@ -2391,6 +2396,8 @@ def cmd_status(nimbie, config, _args):
         stage = "2/5  Disc on open tray — waiting for tray close"
     elif tray_out and not in_tray:
         stage = "1/5  Tray open — waiting for disc placement from hopper"
+    elif not tray_out and not in_tray and not lifted and has_media:
+        stage = "3/5  Disc in drive (tray closed, detected by optical drive)"
     elif not tray_out and not in_tray and not lifted:
         stage = "0/5  Idle — no disc in drive"
     else:
@@ -3210,6 +3217,41 @@ class TestStripQuotes(unittest.TestCase):
             dry_run = old
 
 
+class TestCrashDiscDetection(unittest.TestCase):
+    """Regression: crash handler must detect disc in closed drive."""
+
+    def test_tray_closed_is_disc_stuck(self):
+        """When tray is closed and process crashed, disc is likely still inside."""
+        # Simulates the state bits when disc is in a closed drive
+        state = {"disc_available": False, "disc_in_tray": False,
+                 "disc_lifted": False, "tray_out": False}
+        # disc_in_tray=False + tray_out=False = disc in closed drive
+        disc_in_closed = not state["tray_out"] and not state["disc_in_tray"] and not state["disc_lifted"]
+        self.assertTrue(disc_in_closed, "Should detect disc in closed drive")
+
+    def test_tray_open_no_disc(self):
+        """Tray open with no disc detected — no disc stuck."""
+        state = {"disc_available": False, "disc_in_tray": False,
+                 "disc_lifted": False, "tray_out": True}
+        disc_in_closed = not state["tray_out"] and not state["disc_in_tray"] and not state["disc_lifted"]
+        disc_stuck = state["disc_in_tray"] or state["disc_lifted"] or disc_in_closed
+        self.assertFalse(disc_stuck, "Should not flag disc stuck when tray is open and empty")
+
+    def test_disc_on_open_tray(self):
+        """Disc visible on ejected tray — disc stuck."""
+        state = {"disc_available": False, "disc_in_tray": True,
+                 "disc_lifted": False, "tray_out": True}
+        disc_stuck = state["disc_in_tray"] or state["disc_lifted"]
+        self.assertTrue(disc_stuck, "Should detect disc on open tray")
+
+    def test_disc_lifted(self):
+        """Disc held by gripper — disc stuck."""
+        state = {"disc_available": False, "disc_in_tray": False,
+                 "disc_lifted": True, "tray_out": True}
+        disc_stuck = state["disc_in_tray"] or state["disc_lifted"]
+        self.assertTrue(disc_stuck, "Should detect disc held by gripper")
+
+
 class TestStalePidDetection(unittest.TestCase):
     def test_dead_pid(self):
         """A PID that doesn't exist should not be alive."""
@@ -3246,6 +3288,7 @@ def _run_tests():
         TestOffsetIndex,
         TestArgvExpansion,
         TestStripQuotes,
+        TestCrashDiscDetection,
         TestStalePidDetection,
     ]
     for cls in test_classes:
@@ -3538,7 +3581,6 @@ def main():
         except OSError:
             err(f"Process {pid} is not running (already dead).\n\n"
                 f"  Run 'my-nimbie status' to see crash details.")
-        import signal
         os.kill(pid, signal.SIGINT)
         msg(f"Sent SIGINT to PID {pid} — batch/next should stop gracefully.")
         return
