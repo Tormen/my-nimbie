@@ -2696,9 +2696,20 @@ def main():
     if args.command == "status":
         sf = BatchStatus.read_file()
         if sf and sf.get("state") not in ("finished", "interrupted"):
-            # Batch/next is running — show status from file, don't grab USB
-            cmd_status(None, config, args)
-            return
+            # Check if process is still alive
+            pid_str = sf.get("pid")
+            process_alive = False
+            if pid_str:
+                try:
+                    os.kill(int(pid_str), 0)
+                    process_alive = True
+                except (OSError, ValueError):
+                    pass
+            if process_alive:
+                # Batch/next is running — show status from file, don't grab USB
+                cmd_status(None, config, args)
+                return
+            # Process crashed — fall through to connect USB and show full status
 
     # Create device
     if dry_run:
