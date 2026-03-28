@@ -1878,11 +1878,12 @@ def cmd_status(nimbie, config, _args):
             msg(f"  Last disc:   {sf['last_disc']}")
         return
 
-    # Show last batch result if available (even after finished) — batch only
-    if sf and sf.get("state") in ("finished", "interrupted") and is_batch:
-        msg(f"Last batch: {sf.get('flavor', '?')} — {sf.get('state')}")
+    # Show last run result if available (even after finished)
+    if sf and sf.get("state") in ("finished", "interrupted"):
+        mode_label = "batch" if is_batch else "next"
+        msg(f"Last {mode_label}: {sf.get('flavor', '?')} — {sf.get('state')}")
         msg(f"  Accepted: {sf.get('accepted', '?')}, Rejected: {sf.get('rejected', '?')}")
-        if sf.get("last_disc"):
+        if is_batch and sf.get("last_disc"):
             msg(f"  Last disc: {sf['last_disc']}")
         msg("")
 
