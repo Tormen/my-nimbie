@@ -1713,8 +1713,30 @@ NAMING_VARS_HELP = """\
   {DATE}        — current date as YYYY-MM-DD"""
 
 
+class _HelpfulParser(argparse.ArgumentParser):
+    """ArgumentParser that adds guidance hints to common errors."""
+
+    HINTS = {
+        "--offset":  "  --offset requires a number, e.g.: --offset 50\n"
+                     "  {INDEX} = DISC_NR + offset, where DISC_NR starts at 1.\n"
+                     "  With --offset 50, numbering starts at 051, 052, 053, ...\n"
+                     "  To start at 200, use --offset 199 (first disc: 1 + 199 = 200).",
+        "--padding": "  --padding requires a number, e.g.: --padding 3\n"
+                     "  Controls zero-padding width for {INDEX}: 3 → 001, 4 → 0001",
+    }
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        hint = ""
+        for flag, text in self.HINTS.items():
+            if flag in message:
+                hint = f"\n{text}\n"
+                break
+        self.exit(2, f"\n  ERROR: {self.prog}: {message}\n{hint}")
+
+
 def build_parser():
-    parser = argparse.ArgumentParser(
+    parser = _HelpfulParser(
         prog="my-nimbie",
         description="CLI controller for Nimbie USB Plus NB21 disc autoloader.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1786,7 +1808,7 @@ Monitoring a running batch:
     parser.add_argument("--debug", "-D", action="count", default=0,
                         help="debug output; -DD for deep debug (implies --verbose)")
 
-    sub = parser.add_subparsers(dest="command")
+    sub = parser.add_subparsers(dest="command", parser_class=_HelpfulParser)
     sub.add_parser("load",   help="Load next disc from hopper into drive")
     sub.add_parser("eject",  help="Eject current disc to accept (done) bin")
     sub.add_parser("reject", help="Reject current disc to reject bin")
