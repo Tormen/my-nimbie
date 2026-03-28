@@ -57,11 +57,12 @@ def _bootstrap_venv():
 
 # If we're not already running inside our venv, bootstrap it.
 # Check sys.prefix — inside a venv it points to the venv dir, outside it points to the system python.
-if os.path.realpath(sys.prefix) != os.path.realpath(VENV_DIR):
-    if not _venv_has_deps():
-        _bootstrap_venv()
-    # Venv exists and has deps — re-exec inside it
-    os.execv(VENV_PYTHON, [VENV_PYTHON] + sys.argv)
+if "--create-config" not in sys.argv:
+    if os.path.realpath(sys.prefix) != os.path.realpath(VENV_DIR):
+        if not _venv_has_deps():
+            _bootstrap_venv()
+        # Venv exists and has deps — re-exec inside it
+        os.execv(VENV_PYTHON, [VENV_PYTHON] + sys.argv)
 
 # ---------------------------------------------------------------------------
 # From here on we are guaranteed to run inside the venv with pyusb available
