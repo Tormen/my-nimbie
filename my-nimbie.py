@@ -1341,9 +1341,7 @@ class NimbieDevice:
 
         vrb("  Lifting disc...")
         if not self.lift_disc():
-            warn("Cannot eject — no disc to lift")
-            vrb("  Closing tray...")
-            self.close_tray()
+            warn("Cannot lift disc — opening tray so you can remove it manually")
             return
 
         vrb("  Closing tray...")
@@ -1359,9 +1357,7 @@ class NimbieDevice:
 
         vrb("  Lifting disc...")
         if not self.lift_disc():
-            warn("Cannot reject — no disc to lift")
-            vrb("  Closing tray...")
-            self.close_tray()
+            warn("Cannot lift disc — opening tray so you can remove it manually")
             return
 
         vrb("  Closing tray...")
@@ -1816,18 +1812,15 @@ def cmd_load(nimbie, config, _args):
 
 def cmd_eject(nimbie, config, _args):
     mount_point = config.get("nimbie", "mount_point")
-    msg("Accepting disc (eject to done bin)...")
     unmount_disc(mount_point)
+    msg("Accepting disc (eject to done bin)...")
     nimbie.eject_accept()
-    msg("  Disc accepted.")
-
 
 def cmd_reject(nimbie, config, _args):
     mount_point = config.get("nimbie", "mount_point")
-    msg("Rejecting disc (eject to reject bin)...")
     unmount_disc(mount_point)
+    msg("Rejecting disc (eject to reject bin)...")
     nimbie.eject_reject()
-    msg("  Disc rejected.")
 
 
 def cmd_status(nimbie, config, _args):
@@ -1884,14 +1877,13 @@ def cmd_status(nimbie, config, _args):
         # Query hardware to check if disc is stuck
         msg("")
         state = nimbie.get_state()
-        disc_stuck = state["disc_in_tray"] or state["disc_lifted"] or state["tray_out"]
+        disc_stuck = state["disc_in_tray"] or state["disc_lifted"]
         if disc_stuck:
-            msg(f"  WARNING: Disc may still be in the drive!")
-            msg(f"    Disc in tray: {state['disc_in_tray']}, Lifted: {state['disc_lifted']}, Tray out: {state['tray_out']}")
+            msg(f"  Disc in drive! (in_tray={state['disc_in_tray']}, lifted={state['disc_lifted']})")
             msg(f"    my-nimbie eject    — eject disc to accept bin")
             msg(f"    my-nimbie reject   — eject disc to reject bin")
         else:
-            msg(f"  Hardware: no disc in drive, nothing stuck.")
+            msg(f"  No disc in drive.")
             # Safe to clean up stale status file
             try:
                 os.unlink(STATUS_FILE)
