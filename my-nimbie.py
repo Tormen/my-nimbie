@@ -487,13 +487,17 @@ idx_padding = 3                 # default: 3
 idx_offset = 0                  # default: 0
 
 [batch]
-max_discs = 0                   # default: 0 (unlimited, process until hopper is empty)
+# Max discs to process (0 = unlimited, process until hopper is empty)
+max_discs = 0                   # default: 0
 
-load_settle_time = 5            # default: 5 — seconds to wait after loading before mount check
+# Seconds to wait after loading before checking if disc mounted
+load_settle_time = 5            # default: 5
 
-mount_timeout = 60              # default: 60 — seconds to wait for disc to mount before rejecting
+# Seconds to wait for disc to mount before giving up and rejecting
+mount_timeout = 60              # default: 60
 
-poll_interval = 2               # default: 2 — seconds between mount-point polling checks
+# Seconds between mount-point polling checks
+poll_interval = 2               # default: 2
 """
 
 
