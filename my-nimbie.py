@@ -647,16 +647,30 @@ class NimbieDevice:
         except Exception as e:
             dbg(f"Kernel driver check: {e}")
 
+        # Reset device to ensure clean state — required on macOS for
+        # non-root users to get proper endpoint access via libusb
         try:
-            self.dev.set_configuration()
+            self.dev.reset()
+            dbg("USB device reset OK")
         except Exception as e:
-            dbg(f"set_configuration: {e} (may already be configured)")
+            dbg(f"USB reset: {e}")
 
         try:
-            import usb.util
+            self.dev.set_configuration()
+            dbg("set_configuration OK")
+        except usb.core.USBError as e:
+            warn(f"set_configuration failed: {e} — trying to continue")
+
+        try:
             usb.util.claim_interface(self.dev, 0)
-        except Exception as e:
-            dbg(f"claim_interface: {e}")
+            dbg("claim_interface OK")
+        except usb.core.USBError as e:
+            err(f"Cannot claim Nimbie USB interface: {e}\n\n"
+                f"  Possible reasons:\n"
+                f"    - Another program is using the device\n"
+                f"    - macOS security is blocking USB access\n"
+                f"      Check: System Settings → Privacy & Security → USB\n"
+                f"    - Try unplugging and reconnecting the device")
 
         vrb(f"  Nimbie connected (VID={self.vid:#06x}, PID={self.pid:#06x})")
 
@@ -690,12 +704,15 @@ class NimbieDevice:
         dbg(f"Sending {description}: {pkt.hex()}")
 
         try:
-            self.dev.write(EP_OUT, pkt)
+            self.dev.write(EP_OUT, pkt, timeout=5000)
         except Exception as e:
             err(f"USB write failed ({description}): {e}\n\n"
                 f"  Possible reasons:\n"
-                f"    - Device disconnected\n"
-                f"    - USB communication error")
+                f"    - Device disconnected or not powered on\n"
+                f"    - USB interface not properly claimed\n"
+                f"    - macOS blocking USB access — check:\n"
+                f"      System Settings → Privacy & Security → USB\n"
+                f"    - Try: unplug device, wait 5s, reconnect")
 
     def _read_responses(self, timeout=3000, max_reads=20):
         """Read all pending responses from interrupt IN endpoint.
