@@ -96,6 +96,7 @@ _my-nimbie() {
         'eject:Eject current disc to accept (done) bin'
         'reject:Reject current disc to reject bin'
         'status:Show Nimbie device state or batch progress'
+        'next:Process exactly one disc (same setup as batch, for testing)'
         'batch:Batch mode — load, process, accept/reject, repeat'
     )
 
@@ -119,7 +120,7 @@ _my-nimbie() {
             ;;
         args)
             case $line[1] in
-                batch)
+                next|batch)
                     local -a flavors
                     flavors=(
                         'ripdvd:Encode DVD titles to MKV'
@@ -1438,6 +1439,105 @@ def cmd_status(nimbie, config, _args):
     5. Drop disc to accept (done) or reject bin""")
 
 
+def cmd_next(nimbie, config, args):
+    """Process exactly one disc: load → run command → accept/reject."""
+    mount_point = config.get("nimbie", "mount_point")
+    on_validate = config.get("commands", "on_validate")
+    mount_timeout = config.getfloat("batch", "mount_timeout")
+    poll_interval = config.getfloat("batch", "poll_interval")
+    settle_time = config.getfloat("batch", "load_settle_time")
+
+    flavor = args.flavor
+    cli_target_dir = args.target_dir
+    on_load, target_dir = resolve_batch_flavor(config, flavor, cli_target_dir)
+
+    cli_naming = {
+        "prefix":      args.prefix,
+        "name":        args.name,
+        "postfix":     args.postfix,
+        "idx_padding": args.idx_padding,
+        "idx_offset":  args.idx_offset,
+    }
+
+    flavor_label = flavor or "default"
+
+    # Pre-flight checks (same as batch)
+    cmd_binary = on_load.split()[0] if on_load else ""
+    if cmd_binary and not cmd_binary.startswith("$"):
+        cmd_binary_expanded = os.path.expanduser(os.path.expandvars(cmd_binary))
+        if not shutil.which(cmd_binary_expanded):
+            err(f"Command not found: {cmd_binary}\n\n"
+                f"  The on_load command's binary does not exist or is not executable.\n"
+                f"  Check your config: [commands] on_load_{BATCH_FLAVORS.get(flavor, 'DEFAULT')}")
+
+    if on_validate:
+        val_binary = on_validate.split()[0]
+        if val_binary and not val_binary.startswith("$"):
+            val_binary_expanded = os.path.expanduser(os.path.expandvars(val_binary))
+            if not shutil.which(val_binary_expanded):
+                err(f"Validation command not found: {val_binary}\n\n"
+                    f"  Check your config: [commands] on_validate")
+
+    mount_parent = os.path.dirname(mount_point)
+    if not os.path.isdir(mount_parent):
+        err(f"Mount point parent directory does not exist: {mount_parent}\n\n"
+            f"  The mount_point is set to: {mount_point}\n"
+            f"  Check your config: [nimbie] mount_point")
+
+    disc_nr = 1
+    dir_name_part = build_dir_name(config, disc_nr, mount_point, flavor, cli_naming)
+    dir_name = os.path.join(target_dir, dir_name_part) if target_dir else dir_name_part
+
+    msg(f"Processing next disc (flavor: {flavor_label})")
+    msg(f"  Command:    {on_load}")
+    msg(f"  Mount:      {mount_point}")
+    msg(f"  Target dir: {target_dir}")
+    msg(f"  Dir name:   {dir_name}")
+
+    # Load
+    msg("\n  Loading disc from hopper...")
+    has_more = nimbie.load_disc()
+
+    if not dry_run:
+        vrb(f"  Waiting {settle_time}s for disc to settle...")
+        time.sleep(settle_time)
+
+        if not wait_for_mount(mount_point, mount_timeout, poll_interval):
+            warn(f"Disc did not mount within {mount_timeout}s — rejecting")
+            nimbie.eject_reject()
+            return
+
+    # Clear DVD title cache for new disc
+    _dvd_title_cache.clear()
+
+    # Rebuild dir_name now that disc is mounted (DVD_TITLE may be available)
+    dir_name_part = build_dir_name(config, disc_nr, mount_point, flavor, cli_naming)
+    dir_name = os.path.join(target_dir, dir_name_part) if target_dir else dir_name_part
+    msg(f"  Dir name:   {dir_name}")
+
+    # Run command
+    rc = run_command(on_load, mount_point, disc_nr, target_dir, dir_name)
+
+    # Validate
+    if on_validate:
+        rc = run_command(on_validate, mount_point, disc_nr, target_dir, dir_name)
+
+    # Accept or reject
+    unmount_disc(mount_point)
+
+    if rc == 0:
+        msg("  ACCEPTING (command succeeded)")
+        nimbie.eject_accept()
+    else:
+        msg(f"  REJECTING (command failed with exit code {rc})")
+        nimbie.eject_reject()
+
+    if has_more:
+        msg("  Hopper has more discs available.")
+    else:
+        msg("  Hopper is empty — that was the last disc.")
+
+
 def cmd_batch(nimbie, config, args):
     global batch_status
 
@@ -1688,6 +1788,50 @@ Monitoring a running batch:
     sub.add_parser("reject", help="Reject current disc to reject bin")
     sub.add_parser("status", help="Show Nimbie device state (or batch progress if running)")
 
+    # --- next: process exactly one disc (same setup as batch, for testing) ---
+    next_parser = sub.add_parser("next", help="Process exactly one disc (same setup as batch, for testing)",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 description=f"""\
+Process exactly one disc from the Nimbie hopper.
+
+Uses the same pre-flight checks, flavors, and naming as "batch", but stops
+after a single disc. This is useful for testing your batch setup before
+committing to a full run.
+
+Loads a disc, runs the configured command, accepts or rejects the disc
+based on the command's exit code (0 = accept, non-zero = reject), and
+reports whether the hopper has more discs.
+
+Flavors select which command from the config file to run:
+  ripdvd      run [commands] on_load_RIP_DVD     (e.g. my-handbrake encode)
+  ripaudio    run [commands] on_load_RIP_AUDIOCD  (e.g. cdparanoia + flac)
+  readdvd     run [commands] on_load_READ_DVD    (e.g. dvdbackup mirror)
+  (none)      run [commands] on_load_DEFAULT     (optional, allows "next" without flavor)
+
+Per-disc directory naming:
+  DIR_NAME = TARGET_DIR / {{NAME_PREFIX}}{{NAME}}{{NAME_POSTFIX}}
+  Defaults: --prefix "{{INDEX}}" --name " - {{MEDIA_TYPE}}" --postfix ""
+  Example result: "/out/001 - DVD"
+
+  Supported {{VARIABLE}} placeholders:
+{NAMING_VARS_HELP}""")
+    next_parser.add_argument("flavor", nargs="?", default=None,
+                             choices=list(BATCH_FLAVORS.keys()),
+                             help="processing flavor (omit to list available or use on_load_DEFAULT)")
+    next_parser.add_argument("--target-dir", "-t", metavar="DIR",
+                             help="base output directory (overrides [target_dirs] from config)")
+    next_parser.add_argument("--prefix", metavar="STR",
+                             help="directory name prefix (default: \"{INDEX}\", overrides [naming] name_prefix)")
+    next_parser.add_argument("--name", metavar="STR",
+                             help="directory name middle part (default: \" - {MEDIA_TYPE}\", overrides [naming] name)")
+    next_parser.add_argument("--postfix", metavar="STR",
+                             help="directory name postfix (default: \"\", overrides [naming] name_postfix)")
+    next_parser.add_argument("--idx-offset", metavar="N", type=int,
+                             help="offset added to disc number for {INDEX} (default: 0, can be negative)")
+    next_parser.add_argument("--idx-padding", metavar="N", type=int,
+                             help="zero-padding width for {INDEX} (default: 3, e.g. 3 → \"001\")")
+
+    # --- batch: process all discs in hopper ---
     batch_parser = sub.add_parser("batch", help="Batch mode: load → process → accept/reject → repeat",
                                   formatter_class=argparse.RawDescriptionHelpFormatter,
                                   description=f"""\
@@ -1778,6 +1922,7 @@ def main():
             "eject":  cmd_eject,
             "reject": cmd_reject,
             "status": cmd_status,
+            "next":   cmd_next,
             "batch":  cmd_batch,
         }
         commands[args.command](nimbie, config, args)
