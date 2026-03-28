@@ -363,7 +363,7 @@ def find_config_file(explicit_path=None):
     err(f"No config file found.\n\n"
         f"  Searched:\n{search_list}\n\n"
         f"  Create one with:\n"
-        f"    my-nimbie --create-config\n"
+        f"    my-nimbie --create-config                  → {DEFAULT_CONFIG_PATH}\n"
         f"    my-nimbie --create-config /custom/path")
 
 
