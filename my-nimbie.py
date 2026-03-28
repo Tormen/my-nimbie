@@ -464,6 +464,7 @@ class BatchStatus:
             lines = [
                 f"state={self.current}",
                 f"mode={self.mode}",
+                f"pid={os.getpid()}",
                 f"flavor={self.flavor}",
                 f"disc_nr={self.disc_nr}",
                 f"accepted={self.accepted}",
@@ -1821,7 +1822,29 @@ def cmd_status(nimbie, config, _args):
     # Check if a batch is running (status file exists with non-finished state)
     sf = BatchStatus.read_file()
     is_batch = sf.get("mode") == "batch" if sf else False
+
+    # Detect stale status file: process died without cleaning up
     if sf and sf.get("state") not in ("finished", "interrupted"):
+        pid_str = sf.get("pid")
+        process_alive = False
+        if pid_str:
+            try:
+                os.kill(int(pid_str), 0)  # signal 0 = check if alive
+                process_alive = True
+            except (OSError, ValueError):
+                pass
+        if not process_alive:
+            # Process is dead — mark status as crashed
+            msg(f"WARNING: Previous process (pid {pid_str or '?'}) is no longer running.")
+            msg(f"  Status file shows state '{sf.get('state')}' but process has died.")
+            msg(f"  Cleaning up stale status file.\n")
+            try:
+                os.unlink(STATUS_FILE)
+            except OSError:
+                pass
+            sf["state"] = "crashed"
+
+    if sf and sf.get("state") not in ("finished", "interrupted", "crashed"):
         mode_label = "Batch" if is_batch else "Next"
         msg(f"{mode_label} in progress (from status file {STATUS_FILE}):")
         msg(f"  Flavor:      {sf.get('flavor', '?')}")
