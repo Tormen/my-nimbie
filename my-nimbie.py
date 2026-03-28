@@ -422,8 +422,9 @@ on_load_RIP_AUDIOCD = mkdir -p "$DIR_NAME" && cd "$DIR_NAME" && cdparanoia -B --
 # READDVD: full DVD backup (all content, mirror mode) via dvdbackup
 on_load_READ_DVD = dvdbackup -i "$MOUNT_POINT" -o "$DIR_NAME" -M
 
-# Optional: set a default command for "batch" without a flavor.
-# If not set, you must always specify a flavor: my-nimbie batch ripdvd
+# Optional: set a default for "batch" without a flavor.
+# Can be a full command or a flavor name (synonym):
+# on_load_DEFAULT = ripdvd
 # on_load_DEFAULT = /LINKS/bin/my-handbrake dvd "$MOUNT_POINT" --all encode tvDVD
 
 # Optional: validation command run AFTER on_load (exit 0 = accept disc, non-zero = reject).
@@ -1129,9 +1130,12 @@ def _format_flavor_list(config):
     """Build a formatted list of available flavors and their commands."""
     lines = []
     # Check DEFAULT
-    default_cmd = config.get("commands", "on_load_default", fallback="")
-    if default_cmd:
-        lines.append(f"    (none)      on_load_DEFAULT      = {default_cmd}")
+    default_val = config.get("commands", "on_load_default", fallback="")
+    if default_val:
+        if default_val in BATCH_FLAVORS:
+            lines.append(f"    (none)      on_load_DEFAULT      → synonym for '{default_val}'")
+        else:
+            lines.append(f"    (none)      on_load_DEFAULT      = {default_val}")
     # Named flavors
     for name, suffix in BATCH_FLAVORS.items():
         cmd = config.get("commands", f"on_load_{suffix}".lower(), fallback="")
@@ -1146,14 +1150,18 @@ def resolve_batch_flavor(config, flavor, cli_target_dir):
     """Resolve flavor to (on_load_command, target_dir). Exits on error."""
     if flavor is None:
         # No flavor specified — check if on_load_DEFAULT is set
-        default_cmd = config.get("commands", "on_load_default", fallback="")
-        if not default_cmd:
+        default_val = config.get("commands", "on_load_default", fallback="")
+        if not default_val:
             err(f"No flavor specified and no on_load_DEFAULT configured.\n\n"
                 f"  Available flavors:\n"
                 f"{_format_flavor_list(config)}\n\n"
                 f"  Usage:\n"
                 f"    my-nimbie batch <flavor>\n"
                 f"    my-nimbie batch              (requires on_load_DEFAULT in config)")
+        # Check if DEFAULT is a synonym for an existing flavor
+        if default_val in BATCH_FLAVORS:
+            dbg(f"on_load_DEFAULT is synonym for flavor '{default_val}'")
+            return resolve_batch_flavor(config, default_val, cli_target_dir)
         config_suffix = "DEFAULT"
         target_key = "default"
     else:
