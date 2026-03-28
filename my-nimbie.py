@@ -169,6 +169,7 @@ STATUS_FILE = "/tmp/my-nimbie.status"
 # ---------------------------------------------------------------------------
 verbose = False
 debug = False
+deepdebug = False
 dry_run = False
 interrupted = False
 batch_status = None  # set to BatchStatus instance during batch runs
@@ -326,6 +327,10 @@ def vrb(text):
 def dbg(text):
     if debug:
         print(f"  DBG: {text}", file=sys.stderr)
+
+def ddbg(text):
+    if deepdebug:
+        print(f"  DDBG: {text}", file=sys.stderr)
 
 def err(text, code=1):
     print(f"\n  ERROR: {text}\n", file=sys.stderr)
@@ -639,6 +644,17 @@ class NimbieDevice:
                 "  Also ensure libusb is available: brew install libusb")
 
         self.dev = usb.core.find(idVendor=self.vid, idProduct=self.pid)
+        if self.dev is not None:
+            ddbg(f"USB device found: {self.dev}")
+            ddbg(f"  manufacturer={self.dev.manufacturer}, product={self.dev.product}")
+            ddbg(f"  bDeviceClass={self.dev.bDeviceClass}, bNumConfigurations={self.dev.bNumConfigurations}")
+            cfg = self.dev.get_active_configuration()
+            if cfg:
+                for intf in cfg:
+                    ddbg(f"  Interface {intf.bInterfaceNumber}: class={intf.bInterfaceClass}")
+                    for ep in intf:
+                        ddbg(f"    EP {ep.bEndpointAddress:#04x}: type={usb.util.endpoint_type(ep.bmAttributes)}"
+                             f" maxPacket={ep.wMaxPacketSize}")
         if self.dev is None:
             err(f"Nimbie device not found (VID={self.vid:#06x}, PID={self.pid:#06x}).\n\n"
                 f"  Possible reasons:\n"
@@ -682,23 +698,31 @@ class NimbieDevice:
                 f"    - Try unplugging and reconnecting the device")
 
         # Drain any stale data from the IN endpoint
+        ddbg("Draining stale IN endpoint data...")
+        drain_count = 0
         try:
             while True:
-                self.dev.read(EP_IN, 64, timeout=200)
+                data = self.dev.read(EP_IN, 64, timeout=200)
+                drain_count += 1
+                ddbg(f"  Drained: {bytes(data).hex()}")
         except Exception:
             pass
+        ddbg(f"  Drained {drain_count} stale packet(s)")
 
         # Wake-up handshake: send a GET_STATE and discard the response.
         # After a USB reset, the first command often gets no reply.
+        ddbg("Wake-up handshake: sending throwaway GET_STATE...")
         try:
             pkt = bytearray(8)
             pkt[2] = CMD_GET_STATE[0]
             self.dev.write(EP_OUT, pkt, timeout=5000)
+            ddbg(f"  Handshake write OK: {pkt.hex()}")
             time.sleep(0.5)
             while True:
-                self.dev.read(EP_IN, 64, timeout=1000)
-        except Exception:
-            pass
+                data = self.dev.read(EP_IN, 64, timeout=1000)
+                ddbg(f"  Handshake read: {bytes(data).hex()}")
+        except Exception as e:
+            ddbg(f"  Handshake read ended: {e}")
 
         vrb(f"  Nimbie connected (VID={self.vid:#06x}, PID={self.pid:#06x})")
 
@@ -732,7 +756,8 @@ class NimbieDevice:
         dbg(f"Sending {description}: {pkt.hex()}")
 
         try:
-            self.dev.write(EP_OUT, pkt, timeout=5000)
+            written = self.dev.write(EP_OUT, pkt, timeout=5000)
+            ddbg(f"  Write OK: {written} bytes to EP {EP_OUT:#04x}")
         except Exception as e:
             err(f"USB write failed ({description}): {e}\n\n"
                 f"  Possible reasons:\n"
@@ -751,6 +776,7 @@ class NimbieDevice:
         for _ in range(max_reads):
             try:
                 data = self.dev.read(EP_IN, 64, timeout=timeout)
+                ddbg(f"  Raw read ({len(data)} bytes): {bytes(data).hex()}")
                 if len(data) == 0:
                     break
                 text = bytes(data).rstrip(b"\x00").decode("ascii", errors="replace")
@@ -1420,8 +1446,8 @@ Monitoring a running batch:
                         help="dry run — print what would be done without executing")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="verbose output")
-    parser.add_argument("--debug", "-D", action="store_true",
-                        help="debug output (implies --verbose)")
+    parser.add_argument("--debug", "-D", action="count", default=0,
+                        help="debug output; -DD for deep debug (implies --verbose)")
 
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("load",   help="Load next disc from hopper into drive")
@@ -1475,15 +1501,16 @@ Progress is tracked in /tmp/my-nimbie.status and can be queried:
 
 
 def main():
-    global verbose, debug, dry_run
+    global verbose, debug, deepdebug, dry_run
 
     signal.signal(signal.SIGINT, signal_handler)
 
     parser = build_parser()
     args = parser.parse_args()
 
-    verbose = args.verbose or args.debug
-    debug = args.debug
+    debug = args.debug >= 1
+    deepdebug = args.debug >= 2
+    verbose = args.verbose or debug
     dry_run = args.dry
 
     # --create-config: special action, no device needed
