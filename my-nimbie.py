@@ -393,7 +393,7 @@ class BatchStatus:
     def record_accept(self, index=None, dir_name=None, source_size=0, elapsed=0.0, total_elapsed=None):
         self.accepted += 1
         if index is not None:
-            self.record_disc(index, dir_name, source_size, elapsed, 0, "accepted", total_elapsed=total_elapsed)
+            self.record_disc(index, dir_name, source_size, elapsed, 0, "successful", total_elapsed=total_elapsed)
         self.update("accepted")
 
     def record_reject(self, index=None, dir_name=None, source_size=0, elapsed=0.0, rc=1, total_elapsed=None):
@@ -500,8 +500,8 @@ class BatchStatus:
                 size_str = _format_size(d["size"]) if d["size"] else "?"
                 cmd_str = self._fmt_elapsed(d["elapsed"])
                 total_str = self._fmt_elapsed(d["total_elapsed"])
-                lines.append(f"last_disc=#{d['index']} {d['result']} rc={d['rc']} "
-                             f"cmd={cmd_str} total={total_str} {size_str}")
+                lines.append(f"last_disc=#{d['index']} {d['result']}, rc={d['rc']}, "
+                             f"cmd={cmd_str}, total={total_str}, size={size_str}")
 
             with open(STATUS_FILE, "w") as f:
                 f.write("\n".join(lines) + "\n")
@@ -3021,7 +3021,7 @@ class TestBatchStatusRecordDisc(unittest.TestCase):
         self.assertEqual(status.last_disc["index"], 210)
         self.assertEqual(status.last_disc["elapsed"], 60.0)
         self.assertEqual(status.last_disc["total_elapsed"], 75.0)
-        self.assertEqual(status.last_disc["result"], "accepted")
+        self.assertEqual(status.last_disc["result"], "successful")
 
     def test_record_reject(self):
         status = BatchStatus("readdvd", "/Volumes/DVD", "/out", mode="next")
@@ -3059,7 +3059,7 @@ class TestBatchStatusRecordDisc(unittest.TestCase):
         with open(self._tmpresult.name) as f:
             line = f.read()
         self.assertIn("#210", line)
-        self.assertIn("accepted", line)
+        self.assertIn("successful", line)
         self.assertIn("cmd=", line)
         self.assertIn("total=", line)
 
