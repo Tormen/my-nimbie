@@ -392,112 +392,112 @@ def generate_example_config():
 # Or specify explicitly: my-nimbie --config /path/to/config <command>
 
 [nimbie]
-  # USB device identifiers (use system_profiler SPUSBDataType to verify)
-  vid = 0x1723                  # default: 0x1723 (Nimbie NB21)
-  pid = 0x0945                  # default: 0x0945 (Nimbie NB21)
+    # USB device identifiers (use system_profiler SPUSBDataType to verify)
+    vid = 0x1723                # default: 0x1723 (Nimbie NB21)
+    pid = 0x0945                # default: 0x0945 (Nimbie NB21)
 
-  # MANDATORY: where the optical disc mounts on macOS
-  mount_point = /Volumes/DVD_VIDEO_RECORDER
+    # MANDATORY: where the optical disc mounts on macOS
+    mount_point = /Volumes/DVD_VIDEO_RECORDER
 
 [commands]
-  # Commands executed by "batch" for each disc flavor.
-  #
-  # Available variables (use $VAR or ${VAR} syntax):
-  #   $MOUNT_POINT  — where the disc is mounted (from [nimbie] mount_point)
-  #   $TARGET_DIR   — base output directory (from [target_dirs] or --target-dir)
-  #   $DIR_NAME     — full output path: TARGET_DIR / <generated dir name from [naming]>
-  #   $DISC_NR      — sequential disc number (1, 2, 3, ...)
-  #
-  # "batch <flavor>"    → runs the matching on_load_<FLAVOR> command
-  # "batch" (no flavor) → runs on_load_DEFAULT (if set)
-  #
-  # If no flavor is given and on_load_DEFAULT is not set, my-nimbie lists
-  # all available flavors and their commands.
+    # Commands executed by "batch" for each disc flavor.
+    #
+    # Available variables (use $VAR or ${VAR} syntax):
+    #   $MOUNT_POINT  — where the disc is mounted (from [nimbie] mount_point)
+    #   $TARGET_DIR   — base output directory (from [target_dirs] or --target-dir)
+    #   $DIR_NAME     — full output path: TARGET_DIR / <generated dir name from [naming]>
+    #   $DISC_NR      — sequential disc number (1, 2, 3, ...)
+    #
+    # "batch <flavor>"    → runs the matching on_load_<FLAVOR> command
+    # "batch" (no flavor) → runs on_load_DEFAULT (if set)
+    #
+    # If no flavor is given and on_load_DEFAULT is not set, my-nimbie lists
+    # all available flavors and their commands.
 
-  # RIPDVD: encode DVD titles to MKV via my-handbrake
-  on_load_RIP_DVD = /LINKS/bin/my-handbrake dvd "$MOUNT_POINT" --all encode tvDVD
+    # RIPDVD: encode DVD titles to MKV via my-handbrake
+    on_load_RIP_DVD = /LINKS/bin/my-handbrake dvd "$MOUNT_POINT" --all encode tvDVD
 
-  # RIPAUDIO: rip audio CD tracks to FLAC (max quality) via cdparanoia + flac
-  on_load_RIP_AUDIOCD = mkdir -p "$DIR_NAME" && cd "$DIR_NAME" && cdparanoia -B -- -0 && flac --best *.wav && rm -f *.wav
+    # RIPAUDIO: rip audio CD tracks to FLAC (max quality) via cdparanoia + flac
+    on_load_RIP_AUDIOCD = mkdir -p "$DIR_NAME" && cd "$DIR_NAME" && cdparanoia -B -- -0 && flac --best *.wav && rm -f *.wav
 
-  # READDVD: full DVD backup (all content, mirror mode) via dvdbackup
-  on_load_READ_DVD = dvdbackup -i "$MOUNT_POINT" -o "$DIR_NAME" -M
+    # READDVD: full DVD backup (all content, mirror mode) via dvdbackup
+    on_load_READ_DVD = dvdbackup -i "$MOUNT_POINT" -o "$DIR_NAME" -M
 
-  # Optional: set a default for "batch" without a flavor.
-  # Can be a full command or a flavor name (synonym):
-  # on_load_DEFAULT = ripdvd
-  # on_load_DEFAULT = /LINKS/bin/my-handbrake dvd "$MOUNT_POINT" --all encode tvDVD
+    # Optional: set a default for "batch" without a flavor.
+    # Can be a full command or a flavor name (synonym):
+    # on_load_DEFAULT = ripdvd
+    # on_load_DEFAULT = /LINKS/bin/my-handbrake dvd "$MOUNT_POINT" --all encode tvDVD
 
-  # Optional: validation command run AFTER on_load (exit 0 = accept disc, non-zero = reject).
-  # If empty (default), the on_load exit code determines accept/reject.
-  on_validate =
+    # Optional: validation command run AFTER on_load (exit 0 = accept disc, non-zero = reject).
+    # If empty (default), the on_load exit code determines accept/reject.
+    on_validate =
 
 [target_dirs]
-  # Base output directories for each batch flavor.
-  # REQUIRED: either set here or pass --target-dir on the command line.
-  # Without a target directory, batch will abort with an error.
-  #
-  # Can be overridden per invocation with: my-nimbie batch --target-dir /path ripdvd
-  # The per-disc subdirectory name is built from [naming] settings below.
-  #
-  # "default" is used when on_load_DEFAULT is set to a direct command.
-  # When on_load_DEFAULT is a synonym (e.g. "ripdvd"), the synonym's
-  # target_dir is used instead (e.g. rip_dvd).
-  # default =
-  rip_dvd = /Volumes/ext-data/
-  rip_audiocd = /Volumes/ext-data/
-  read_dvd = /Volumes/ext-data/
+    # Base output directories for each batch flavor.
+    # REQUIRED: either set here or pass --target-dir on the command line.
+    # Without a target directory, batch will abort with an error.
+    #
+    # Can be overridden per invocation with: my-nimbie batch --target-dir /path ripdvd
+    # The per-disc subdirectory name is built from [naming] settings below.
+    #
+    # "default" is used when on_load_DEFAULT is set to a direct command.
+    # When on_load_DEFAULT is a synonym (e.g. "ripdvd"), the synonym's
+    # target_dir is used instead (e.g. rip_dvd).
+    # default =
+    rip_dvd = /Volumes/ext-data/
+    rip_audiocd = /Volumes/ext-data/
+    read_dvd = /Volumes/ext-data/
 
 [naming]
-  # Per-disc subdirectory naming within TARGET_DIR.
-  #
-  # The directory name is assembled as:  {NAME_PREFIX}{NAME}{NAME_POSTFIX}
-  #
-  # Supported {VARIABLE} placeholders (case-insensitive):
-  #   {INDEX}       — disc index: DISC_NR + idx_offset, zero-padded to idx_padding digits
-  #   {DISC_NR}     — raw disc number (1, 2, 3, ...) without padding or offset
-  #   {MEDIA_TYPE}  — "DVD" or "CD" (auto-detected from disc content)
-  #   {DVD_TITLE}   — volume name of the disc (read only when needed, e.g. "LOTR_DISC_1")
-  #   {FLAVOR}      — batch flavor name ("default", "ripdvd", "ripaudio", "readdvd")
-  #   {DATE}        — current date as YYYY-MM-DD
-  #
-  # Examples:
-  #   name_prefix = {INDEX}                 → "001"
-  #   name        =  - {MEDIA_TYPE}         → " - DVD"
-  #   name_postfix =                        → ""
-  #   Result: "001 - DVD"
-  #
-  #   name_prefix = {DVD_TITLE}             → "LOTR_DISC_1"
-  #   name        =  ({INDEX})              → " (001)"
-  #   Result: "LOTR_DISC_1 (001)"
-  #
-  #   name_prefix = {DATE}_{INDEX}          → "2026-03-28_0005"
-  #   name        =  - {DVD_TITLE}          → " - LOTR_DISC_1"
-  #   Result: "2026-03-28_0005 - LOTR_DISC_1"
+    # Per-disc subdirectory naming within TARGET_DIR.
+    #
+    # The directory name is assembled as:  {NAME_PREFIX}{NAME}{NAME_POSTFIX}
+    #
+    # Supported {VARIABLE} placeholders (case-insensitive):
+    #   {INDEX}       — disc index: DISC_NR + idx_offset, zero-padded to idx_padding digits
+    #   {DISC_NR}     — raw disc number (1, 2, 3, ...) without padding or offset
+    #   {MEDIA_TYPE}  — "DVD" or "CD" (auto-detected from disc content)
+    #   {DVD_TITLE}   — volume name of the disc (read only when needed, e.g. "LOTR_DISC_1")
+    #   {FLAVOR}      — batch flavor name ("default", "ripdvd", "ripaudio", "readdvd")
+    #   {DATE}        — current date as YYYY-MM-DD
+    #
+    # Examples:
+    #   name_prefix = {INDEX}                 → "001"
+    #   name        =  - {MEDIA_TYPE}         → " - DVD"
+    #   name_postfix =                        → ""
+    #   Result: "001 - DVD"
+    #
+    #   name_prefix = {DVD_TITLE}             → "LOTR_DISC_1"
+    #   name        =  ({INDEX})              → " (001)"
+    #   Result: "LOTR_DISC_1 (001)"
+    #
+    #   name_prefix = {DATE}_{INDEX}          → "2026-03-28_0005"
+    #   name        =  - {DVD_TITLE}          → " - LOTR_DISC_1"
+    #   Result: "2026-03-28_0005 - LOTR_DISC_1"
 
-  name_prefix = {INDEX}         # default: {INDEX}
-  name = " - {MEDIA_TYPE}"      # default: " - {MEDIA_TYPE}"
-  name_postfix =                # default: (empty)
+    name_prefix = {INDEX}       # default: {INDEX}
+    name = " - {MEDIA_TYPE}"    # default: " - {MEDIA_TYPE}"
+    name_postfix =              # default: (empty)
 
-  # Zero-padding width for {INDEX} (e.g. 3 → "001", 2 → "01")
-  idx_padding = 3               # default: 3
+    # Zero-padding width for {INDEX} (e.g. 3 → "001", 2 → "01")
+    idx_padding = 3             # default: 3
 
-  # Offset added to DISC_NR for {INDEX} (can be negative)
-  # Useful to continue numbering from a previous batch: --idx-offset 50
-  idx_offset = 0                # default: 0
+    # Offset added to DISC_NR for {INDEX} (can be negative)
+    # Useful to continue numbering from a previous batch: --idx-offset 50
+    idx_offset = 0              # default: 0
 
 [batch]
-  # Max discs to process (0 = unlimited, process until hopper is empty)
-  max_discs = 0                 # default: 0
+    # Max discs to process (0 = unlimited, process until hopper is empty)
+    max_discs = 0               # default: 0
 
-  # Seconds to wait after loading before checking if disc mounted
-  load_settle_time = 5          # default: 5
+    # Seconds to wait after loading before checking if disc mounted
+    load_settle_time = 5        # default: 5
 
-  # Seconds to wait for disc to mount before giving up and rejecting
-  mount_timeout = 60            # default: 60
+    # Seconds to wait for disc to mount before giving up and rejecting
+    mount_timeout = 60          # default: 60
 
-  # Seconds between mount-point polling checks
-  poll_interval = 2             # default: 2
+    # Seconds between mount-point polling checks
+    poll_interval = 2           # default: 2
 """
 
 
