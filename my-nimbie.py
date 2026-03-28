@@ -2225,7 +2225,7 @@ def cmd_status(nimbie, config, _args):
 
         cli_str = sf.get('cli', '?')
         msg(f"CRASHED — process died during '{sf.get('state', '?')}'")
-        msg(f"  CLI:         {cli_str}")
+        msg(f"  Command:     {cli_str}")
         msg(f"  PID:         {sf.get('pid', '?')}")
         msg(f"  Disc:        #{disc_nr}{index_str}")
         if sf.get("target_dir"):
@@ -2265,7 +2265,7 @@ def cmd_status(nimbie, config, _args):
         msg(f"'{mode_label}' in progress:")
         cli_str = sf.get('cli')
         if cli_str:
-            msg(f"  CLI:         {cli_str}")
+            msg(f"  Command:     {cli_str}")
         msg(f"  Flavor:      {sf.get('flavor', '?')}")
 
         # Build "Running:" line with disc number, index, state, and elapsed
@@ -2354,7 +2354,7 @@ def cmd_status(nimbie, config, _args):
         mode_label = "my-nimbie batch" if is_batch else "my-nimbie next"
         msg(f"Last '{mode_label}': {sf.get('flavor', '?')} — {sf.get('state')}")
         if sf.get("cli"):
-            msg(f"  CLI:         {sf['cli']}")
+            msg(f"  Command:     {sf['cli']}")
         if sf.get("last_disc"):
             msg(f"  Last disc:   {sf['last_disc']}")
         msg(f"  Accepted: {sf.get('accepted', '?')}, Rejected: {sf.get('rejected', '?')}")
