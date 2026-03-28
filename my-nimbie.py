@@ -1869,7 +1869,7 @@ def cmd_status(nimbie, config, _args):
         msg("")
         # Fall through to show hardware state below
 
-    if sf and sf.get("state") not in ("finished", "interrupted"):
+    if not process_crashed and sf and sf.get("state") not in ("finished", "interrupted"):
         mode_label = "Batch" if is_batch else "Next"
         msg(f"{mode_label} in progress (from status file {STATUS_FILE}):")
         msg(f"  Flavor:      {sf.get('flavor', '?')}")
