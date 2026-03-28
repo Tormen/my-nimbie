@@ -110,8 +110,9 @@ _my-nimbie() {
         '(-c --config)'{-c,--config}'[Config file path]:file:_files'
         '--create-config[Create example config file]::path:_files'
         '(-d --dry)'{-d,--dry}'[Dry run — print what would be done]'
-        '(-v --verbose)'{-v,--verbose}'[Verbose output]'
+        '(-v -V --verbose)'{-v,-V,--verbose}'[Verbose output]'
         '(-D --debug)'{-D,--debug}'[Debug output; -DD for deep debug]'
+        '--deepdbg[Deep debug (same as -DD)]'
         '(-h --help)'{-h,--help}'[Show help message]'
         '1:command:->cmd'
         '*::arg:->args'
@@ -140,6 +141,7 @@ _my-nimbie() {
                         '--offset[Offset for disc index]:n:' \
                         '--padding[Zero-padding width for index]:n:' \
                         '--pause-on-err[Pause on command error, keep disc in drive]' \
+                        '--max[Max discs to process]:n:' \
                         '1:flavor:->flavor'
                     case $state in
                         flavor)
@@ -2191,11 +2193,6 @@ def cmd_reset(_nimbie, _config, args):
 
 
 def cmd_status(nimbie, config, _args):
-    config_path = getattr(config, "config_path", None)
-    if verbose:
-        msg(f"Config: {config_path or '(built-in defaults)'}")
-        msg("")
-
     # Check if a batch is running (status file exists with non-finished state)
     sf = BatchStatus.read_file()
     is_batch = sf.get("mode") == "batch" if sf else False
@@ -2216,7 +2213,7 @@ def cmd_status(nimbie, config, _args):
 
     if process_crashed:
         # Process died — show crash info, query hardware, and clean up if safe
-        mode_label = "Batch" if is_batch else "Next"
+        mode_label = "my-nimbie batch" if is_batch else "my-nimbie next"
         disc_nr = sf.get('disc_nr', '?')
         idx_offset = sf.get('idx_offset')
         index_str = ""
@@ -2264,8 +2261,11 @@ def cmd_status(nimbie, config, _args):
         # Don't fall through — we already queried hardware above
 
     if not process_crashed and sf and sf.get("state") not in ("finished", "interrupted"):
-        mode_label = "Batch" if is_batch else "Next"
-        msg(f"{mode_label} in progress (from status file {STATUS_FILE}):")
+        mode_label = "my-nimbie batch" if is_batch else "my-nimbie next"
+        msg(f"'{mode_label}' in progress:")
+        cli_str = sf.get('cli')
+        if cli_str:
+            msg(f"  CLI:         {cli_str}")
         msg(f"  Flavor:      {sf.get('flavor', '?')}")
 
         # Build "Running:" line with disc number, index, state, and elapsed
@@ -2318,12 +2318,41 @@ def cmd_status(nimbie, config, _args):
         # Show last completed disc (batch only)
         if is_batch and sf.get("last_disc"):
             msg(f"  Last disc:   {sf['last_disc']}")
+
+        # Verbose: show hardware diagnostics even during active job
+        if verbose:
+            msg("")
+            msg("  Hardware diagnostics (CMD 0x49):")
+            diag_resps = nimbie._send_and_read((0x49,), "DIAGNOSTICS", timeout=3000)
+            if diag_resps:
+                pairs = [r for r in diag_resps if r not in ("OK", "AT+O")]
+                for i in range(0, len(pairs) - 1, 2):
+                    name = pairs[i]
+                    value = pairs[i + 1] if i + 1 < len(pairs) else "?"
+                    try:
+                        msg(f"    {name:12s} = {int(value):,d}")
+                    except ValueError:
+                        msg(f"    {name:12s} = {value}")
+
+            msg("")
+            state = nimbie.get_state()
+            msg(f"  Disc available: {state['disc_available']}")
+            msg(f"  Disc in tray:   {state['disc_in_tray']}")
+            msg(f"  Disc lifted:    {state['disc_lifted']}")
+            msg(f"  Tray out:       {state['tray_out']}")
+
+            msg("")
+            import subprocess
+            msg("  Optical drive:")
+            result = subprocess.run(["drutil", "status"], capture_output=True, text=True)
+            for line in result.stdout.strip().split("\n"):
+                msg(f"    {line.strip()}")
         return
 
     # Show last run result if available (even after finished)
     if sf and sf.get("state") in ("finished", "interrupted"):
-        mode_label = "batch" if is_batch else "next"
-        msg(f"Last {mode_label}: {sf.get('flavor', '?')} — {sf.get('state')}")
+        mode_label = "my-nimbie batch" if is_batch else "my-nimbie next"
+        msg(f"Last '{mode_label}': {sf.get('flavor', '?')} — {sf.get('state')}")
         msg(f"  Accepted: {sf.get('accepted', '?')}, Rejected: {sf.get('rejected', '?')}")
         if is_batch and sf.get("last_disc"):
             msg(f"  Last disc: {sf['last_disc']}")
@@ -2621,7 +2650,7 @@ def cmd_batch(nimbie, config, args):
 
     mount_point = config.get("nimbie", "mount_point")
     on_validate = config.get("commands", "on_validate")
-    max_discs = config.getint("batch", "max_discs")
+    max_discs = args.max if args.max is not None else config.getint("batch", "max_discs")
     mount_timeout = config.getfloat("batch", "mount_timeout")
     poll_interval = config.getfloat("batch", "poll_interval")
     settle_time = config.getfloat("batch", "load_settle_time")
@@ -3106,7 +3135,7 @@ class TestArgvExpansion(unittest.TestCase):
             else:
                 expanded.append(arg)
         subcommands = {"load", "eject", "reject", "status", "next", "batch", "reset"}
-        global_flags = {"-D", "-v", "-d", "--debug", "--verbose", "--dry"}
+        global_flags = {"-D", "-v", "-V", "-d", "--debug", "--verbose", "--dry", "--deepdbg"}
         hoisted = []
         rest = []
         found_subcmd = False
@@ -3286,10 +3315,12 @@ Monitoring a running batch:
                         help="run unit tests (no hardware needed)")
     parser.add_argument("--dry", "-d", action="store_true",
                         help="dry run — print what would be done without executing")
-    parser.add_argument("--verbose", "-v", action="store_true",
+    parser.add_argument("--verbose", "-v", "-V", action="store_true",
                         help="verbose output")
     parser.add_argument("--debug", "-D", action="count", default=0,
-                        help="debug output; -DD for deep debug (implies --verbose)")
+                        help="debug output; -DD/--deepdbg for deep debug (implies --verbose)")
+    parser.add_argument("--deepdbg", action="store_true",
+                        help="deep debug (same as -DD)")
 
     sub = parser.add_subparsers(dest="command", parser_class=_HelpfulParser)
     sub.add_parser("load",   help="Load next disc from hopper into drive")
@@ -3416,6 +3447,8 @@ Progress is tracked in /tmp/my-nimbie.status and can be queried:
                               help="zero-padding width for {INDEX} (default: 3, e.g. 3 → \"001\")")
     batch_parser.add_argument("--pause-on-err", action="store_true",
                               help="pause batch on command error (keep disc in drive, wait for user)")
+    batch_parser.add_argument("--max", metavar="N", type=int,
+                              help="max discs to process (overrides config max_discs, 0 = unlimited)")
 
     return parser
 
@@ -3435,7 +3468,7 @@ def main():
             expanded.append(arg)
     # Hoist global flags (-D, -v, -d, --debug, --verbose, --dry) before the subcommand
     subcommands = {"load", "eject", "reject", "status", "next", "batch", "reset"}
-    global_flags = {"-D", "-v", "-d", "--debug", "--verbose", "--dry"}
+    global_flags = {"-D", "-v", "-V", "-d", "--debug", "--verbose", "--dry", "--deepdbg"}
     hoisted = []
     rest = []
     found_subcmd = False
@@ -3452,6 +3485,8 @@ def main():
     parser = build_parser()
     args = parser.parse_args(final_argv)
 
+    if args.deepdbg:
+        args.debug = max(args.debug, 2)
     debug = args.debug >= 1
     deepdebug = args.debug >= 2
     verbose = args.verbose or debug
