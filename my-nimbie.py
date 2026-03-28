@@ -672,6 +672,25 @@ class NimbieDevice:
                 f"      Check: System Settings → Privacy & Security → USB\n"
                 f"    - Try unplugging and reconnecting the device")
 
+        # Drain any stale data from the IN endpoint
+        try:
+            while True:
+                self.dev.read(EP_IN, 64, timeout=200)
+        except Exception:
+            pass
+
+        # Wake-up handshake: send a GET_STATE and discard the response.
+        # After a USB reset, the first command often gets no reply.
+        try:
+            pkt = bytearray(8)
+            pkt[2] = CMD_GET_STATE[0]
+            self.dev.write(EP_OUT, pkt, timeout=5000)
+            time.sleep(0.5)
+            while True:
+                self.dev.read(EP_IN, 64, timeout=1000)
+        except Exception:
+            pass
+
         vrb(f"  Nimbie connected (VID={self.vid:#06x}, PID={self.pid:#06x})")
 
     def disconnect(self):
@@ -729,7 +748,8 @@ class NimbieDevice:
                 if text:
                     responses.append(text)
                     dbg(f"  Received: \"{text}\"")
-            except Exception:
+            except Exception as e:
+                dbg(f"  Read ended: {e}")
                 break
         return responses
 
