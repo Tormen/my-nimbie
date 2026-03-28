@@ -561,7 +561,7 @@ def generate_example_config():
     # The directory name is assembled as:  {NAME_PREFIX}{NAME}{NAME_POSTFIX}
     #
     # Supported {VARIABLE} placeholders (case-insensitive):
-    #   {INDEX}       — disc index: DISC_NR + idx_offset, zero-padded to idx_padding digits
+    #   {INDEX}       — disc index (see idx_offset below), zero-padded to idx_padding digits
     #   {DISC_NR}     — raw disc number (1, 2, 3, ...) without padding or offset
     #   {MEDIA_TYPE}  — "DVD" or "CD" (auto-detected from disc content)
     #   {DVD_TITLE}   — volume name of the disc (read only when needed, e.g. "LOTR_DISC_1")
@@ -589,8 +589,11 @@ def generate_example_config():
     # Zero-padding width for {INDEX} (e.g. 3 → "001", 2 → "01")
     idx_padding = 3             # default: 3
 
-    # Offset added to DISC_NR for {INDEX} (can be negative)
-    # Useful to continue numbering from a previous batch: --offset 50
+    # Offset added to DISC_NR for {INDEX}
+    # {INDEX} = DISC_NR + idx_offset, where DISC_NR starts at 1.
+    # With the default (0), numbering starts at 1: 001, 002, 003, ...
+    # To continue from a previous batch of 50 discs: idx_offset = 50
+    #   → first disc gets {INDEX} = 051, then 052, 053, ...
     idx_offset = 0              # default: 0
 
 [batch]
@@ -1701,7 +1704,8 @@ def cmd_batch(nimbie, config, args):
 # CLI
 # ---------------------------------------------------------------------------
 NAMING_VARS_HELP = """\
-  {INDEX}       — disc index (DISC_NR + idx_offset), zero-padded to idx_padding digits
+  {INDEX}       — disc index: DISC_NR + idx_offset (default offset 0 → starts at 1)
+                  E.g. --offset 50 → first disc is 051, then 052, ...
   {DISC_NR}     — raw disc number (1, 2, 3, ...) without padding or offset
   {MEDIA_TYPE}  — "DVD" or "CD" (auto-detected from disc content)
   {DVD_TITLE}   — volume name of the disc (lazy: only read when referenced)
@@ -1728,7 +1732,7 @@ Examples:
   my-nimbie batch --target-dir /out ripdvd   Override output directory for this run
 
   my-nimbie batch --prefix "{{DVD_TITLE}}" --name "" ripdvd
-  my-nimbie batch --offset 50 --padding 3 ripaudio
+  my-nimbie batch --offset 50 ripaudio     Continue numbering from 51 (after 50 previous discs)
   my-nimbie batch --name " - {{DVD_TITLE}} ({{MEDIA_TYPE}})" readdvd
 
   my-nimbie --dry batch ripdvd            Dry-run: show what would happen
@@ -1827,7 +1831,8 @@ Per-disc directory naming:
     next_parser.add_argument("--postfix", metavar="STR",
                              help="directory name postfix (default: \"\", overrides [naming] name_postfix)")
     next_parser.add_argument("--offset", metavar="N", type=int,
-                             help="offset added to disc number for {INDEX} (default: 0, can be negative)")
+                             help="offset added to disc number for {INDEX} (default: 0). "
+                             "E.g. --offset 50 → first disc is 051, then 052, ...")
     next_parser.add_argument("--padding", metavar="N", type=int,
                              help="zero-padding width for {INDEX} (default: 3, e.g. 3 → \"001\")")
 
@@ -1870,7 +1875,8 @@ Progress is tracked in /tmp/my-nimbie.status and can be queried:
     batch_parser.add_argument("--postfix", metavar="STR",
                               help="directory name postfix (default: \"\", overrides [naming] name_postfix)")
     batch_parser.add_argument("--offset", metavar="N", type=int,
-                              help="offset added to disc number for {INDEX} (default: 0, can be negative)")
+                              help="offset added to disc number for {INDEX} (default: 0). "
+                              "E.g. --offset 50 → first disc is 051, then 052, ...")
     batch_parser.add_argument("--padding", metavar="N", type=int,
                               help="zero-padding width for {INDEX} (default: 3, e.g. 3 → \"001\")")
 
