@@ -5,39 +5,107 @@ Controls the Nimbie loader/unloader mechanism via USB HID and orchestrates
 batch disc processing with configurable commands (e.g. my-handbrake).
 """
 
+# ---------------------------------------------------------------------------
+# Venv bootstrap: ensure we run inside a venv with pyusb installed.
+# If not, create the venv, install deps, and re-exec ourselves in it.
+# ---------------------------------------------------------------------------
+import os
+import subprocess
+import sys
+
+VENV_DIR = os.path.expanduser("~/.python.venv/my-nimbie")
+VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python3")
+VENV_DEPS = ["pyusb"]
+
+
+def _venv_has_deps():
+    """Check if venv exists and has required packages."""
+    if not os.path.isfile(VENV_PYTHON):
+        return False
+    site_packages = os.path.join(VENV_DIR, "lib")
+    if not os.path.isdir(site_packages):
+        return False
+    # Check for usb module (pyusb installs as 'usb')
+    for d in os.listdir(site_packages):
+        pkg_dir = os.path.join(site_packages, d, "site-packages", "usb")
+        if os.path.isdir(pkg_dir):
+            return True
+    return False
+
+
+def _bootstrap_venv():
+    """Create venv, install deps, and re-exec."""
+    print(f"\n >>> Creating python virtualenv '{VENV_DIR}'...\n", file=sys.stderr)
+
+    rc = subprocess.call([sys.executable, "-m", "venv", VENV_DIR])
+    if rc != 0:
+        print(f"\n  ERROR: Failed to create venv at {VENV_DIR}\n", file=sys.stderr)
+        sys.exit(1)
+
+    pip = os.path.join(VENV_DIR, "bin", "pip")
+    rc = subprocess.call([pip, "install"] + VENV_DEPS)
+    if rc != 0:
+        print(f"\n  ERROR: Failed to install dependencies: {', '.join(VENV_DEPS)}\n", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"\n >>> DONE creating python virtualenv '{VENV_DIR}'.", file=sys.stderr)
+    print("=" * 64, file=sys.stderr)
+
+    # Re-exec with venv python, preserving all arguments
+    os.execv(VENV_PYTHON, [VENV_PYTHON] + sys.argv)
+
+
+# If we're not already running inside our venv, bootstrap it.
+# Check sys.prefix — inside a venv it points to the venv dir, outside it points to the system python.
+if os.path.realpath(sys.prefix) != os.path.realpath(VENV_DIR):
+    if not _venv_has_deps():
+        _bootstrap_venv()
+    # Venv exists and has deps — re-exec inside it
+    os.execv(VENV_PYTHON, [VENV_PYTHON] + sys.argv)
+
+# ---------------------------------------------------------------------------
+# From here on we are guaranteed to run inside the venv with pyusb available
+# ---------------------------------------------------------------------------
+
 import argparse
 import configparser
 import datetime
-import os
 import re
 import signal
-import subprocess
-import sys
 import time
 
 # ---------------------------------------------------------------------------
-# USB HID constants for Nimbie NB21
+# USB constants for Nimbie NB21 (NT21 autoloader controller)
 # ---------------------------------------------------------------------------
 NIMBIE_VID = 0x1723
 NIMBIE_PID = 0x0945
 
-# USB control transfer parameters (bmRequestType, bRequest, wValue, wIndex, data_or_wLength)
-USB_REQUEST_TYPE = 0x21   # host-to-device, class, interface
-USB_REQUEST      = 0x09   # SET_REPORT
-USB_VALUE        = 0x0301 # report type 3 (feature), report id 1
-USB_INDEX        = 0x0000
+# Interrupt endpoints
+EP_OUT = 0x02  # 8-byte max packet, interrupt OUT
+EP_IN  = 0x81  # 64-byte max packet, interrupt IN
 
-# Nimbie HID commands (8-byte payloads)
-CMD_OPEN_TRAY    = bytes([0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
-CMD_CLOSE_TRAY   = bytes([0x03, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
-CMD_PLACE_DISC   = bytes([0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
-CMD_LIFT_DISC    = bytes([0x03, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
-CMD_GET_STATE    = bytes([0x03, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+# Commands: sent as 8-byte packets with command in byte[2], param in byte[3]
+CMD_GET_STATE  = (0x43,)        # query hardware state → "{xxxxxxxxx}"
+CMD_PLACE_DISC = (0x52, 0x01)   # drop disc from hopper onto open tray
+CMD_ACCEPT     = (0x52, 0x02)   # drop lifted disc into accept pile
+CMD_REJECT     = (0x52, 0x03)   # drop lifted disc into reject pile
+CMD_LIFT_DISC  = (0x47, 0x01)   # lift disc from open tray with gripper
 
-# State byte meanings (byte index 1 of response)
-STATE_IDLE       = 0x00
-STATE_BUSY       = 0x01
-STATE_HOPPER_EMPTY = 0x02
+# AT+ response codes
+AT_OK          = "AT+O"         # operation success
+AT_PLACED      = "AT+S07"       # disc placed on tray
+AT_NO_DISC     = "AT+S00"       # no disc in tray
+AT_DROPPER_ERR = "AT+S03"       # mechanism stuck or disc already lifted
+AT_TRAY_WRONG  = "AT+S10"       # tray in wrong state
+AT_TRAY_HAS    = "AT+S12"       # tray already has a disc
+AT_HOPPER_EMPTY = "AT+S14"      # no disc in input queue
+AT_HW_ERROR    = "AT+E09"       # hardware error
+
+# State bit string positions (0-indexed within braces of "{xxxxxxxxx}")
+STATE_BIT_DISC_AVAILABLE   = 1  # discs in input hopper
+STATE_BIT_DISC_IN_TRAY     = 3  # disc sitting in ejected tray
+STATE_BIT_DISC_LIFTED      = 4  # disc held by gripper
+STATE_BIT_TRAY_OUT         = 5  # drive tray is ejected/open
 
 # ---------------------------------------------------------------------------
 # Batch flavors: maps CLI name → config key suffix
@@ -88,6 +156,7 @@ DEFAULT_CONFIG = {
 CONFIG_SEARCH_PATHS = [
     os.path.expanduser("~/.my-nimbie.conf"),
     "/etc/my-nimbie.conf",
+    "/LINKS/global/etc/my-nimbie",
     "/LINKS/default/my-nimbie",
 ]
 
@@ -296,7 +365,7 @@ def generate_example_config():
     return """\
 # my-nimbie configuration
 #
-# Search order: ~/.my-nimbie.conf, /etc/my-nimbie.conf, /LINKS/default/my-nimbie
+# Search order: ~/.my-nimbie.conf, /etc/my-nimbie.conf, /LINKS/global/etc/my-nimbie, /LINKS/default/my-nimbie
 # Or specify explicitly: my-nimbie --config /path/to/config <command>
 
 [nimbie]
@@ -534,13 +603,22 @@ def build_dir_name(config, disc_nr, mount_point, flavor, cli_naming):
 # USB HID communication
 # ---------------------------------------------------------------------------
 class NimbieDevice:
-    """Direct USB HID interface to Nimbie NB21."""
+    """Direct USB interface to Nimbie NB21 (NT21 autoloader controller).
+
+    Communication uses interrupt endpoints (not control transfers):
+      EP 0x02 OUT (8 bytes) — send commands
+      EP 0x81 IN (64 bytes) — read ASCII responses
+
+    Command format: 8-byte packet, command in byte[2], param in byte[3].
+    Responses: null-terminated ASCII strings ("OK", "{state}", "AT+code").
+    """
 
     def __init__(self, vid=NIMBIE_VID, pid=NIMBIE_PID):
         self.vid = vid
         self.pid = pid
         self.dev = None
         self._kernel_detached = False
+        self._drutil_drive_nr = None  # cached drutil drive number
 
     def connect(self):
         """Find and claim the Nimbie USB device."""
@@ -558,8 +636,7 @@ class NimbieDevice:
                 f"    - Device not connected via USB\n"
                 f"    - Device not powered on\n"
                 f"    - Wrong VID/PID in config (check with: system_profiler SPUSBDataType)\n"
-                f"    - libusb not installed (brew install libusb)\n"
-                f"    - Permission issue (try running with sudo)")
+                f"    - libusb not installed (brew install libusb)")
 
         # Detach kernel driver if active
         try:
@@ -596,92 +673,220 @@ class NimbieDevice:
             dbg(f"disconnect: {e}")
         self.dev = None
 
-    def _send_command(self, cmd, description=""):
-        """Send an 8-byte HID command to the Nimbie."""
+    # -- Low-level USB I/O --
+
+    def _send_command(self, cmd_tuple, description=""):
+        """Send a command via interrupt OUT endpoint.
+
+        cmd_tuple: tuple of command bytes, placed at byte[2] onward in an 8-byte packet.
+        """
         if self.dev is None:
             err("Not connected to Nimbie device")
 
-        dbg(f"Sending: {description} [{cmd.hex()}]")
+        pkt = bytearray(8)
+        for i, b in enumerate(cmd_tuple):
+            pkt[2 + i] = b
+
+        dbg(f"Sending {description}: {pkt.hex()}")
 
         try:
-            self.dev.ctrl_transfer(
-                USB_REQUEST_TYPE,
-                USB_REQUEST,
-                USB_VALUE,
-                USB_INDEX,
-                cmd,
-            )
+            self.dev.write(EP_OUT, pkt)
         except Exception as e:
-            err(f"USB command failed ({description}): {e}\n\n"
+            err(f"USB write failed ({description}): {e}\n\n"
                 f"  Possible reasons:\n"
                 f"    - Device disconnected\n"
-                f"    - USB communication error\n"
-                f"    - Permission denied (try sudo)")
+                f"    - USB communication error")
 
-    def _read_state(self):
-        """Read state from the Nimbie (8 bytes)."""
-        if self.dev is None:
-            err("Not connected to Nimbie device")
+    def _read_responses(self, timeout=3000, max_reads=20):
+        """Read all pending responses from interrupt IN endpoint.
 
-        try:
-            data = self.dev.ctrl_transfer(
-                0xA1,   # device-to-host, class, interface
-                0x01,   # GET_REPORT
-                USB_VALUE,
-                USB_INDEX,
-                8,      # 8 bytes
-            )
-            return bytes(data)
-        except Exception as e:
-            err(f"Failed to read Nimbie state: {e}")
+        Returns a list of ASCII strings. Reads until an empty response or timeout.
+        """
+        responses = []
+        for _ in range(max_reads):
+            try:
+                data = self.dev.read(EP_IN, 64, timeout=timeout)
+                if len(data) == 0:
+                    break
+                text = bytes(data).rstrip(b"\x00").decode("ascii", errors="replace")
+                if text:
+                    responses.append(text)
+                    dbg(f"  Received: \"{text}\"")
+            except Exception:
+                break
+        return responses
+
+    def _send_and_read(self, cmd_tuple, description=""):
+        """Send command and collect all responses."""
+        self._send_command(cmd_tuple, description)
+        time.sleep(0.3)
+        return self._read_responses()
+
+    def _find_at_response(self, responses):
+        """Find the AT+ response code in a list of responses."""
+        for r in responses:
+            if r.startswith("AT+"):
+                return r
+        return None
+
+    def _find_state_string(self, responses):
+        """Find the {xxxxxxxxx} state string in responses."""
+        for r in responses:
+            if r.startswith("{") and r.endswith("}"):
+                return r[1:-1]  # strip braces
+        return None
+
+    # -- State query --
 
     def get_state(self):
-        """Query and return device state dict."""
-        self._send_command(CMD_GET_STATE, "GET_STATE")
-        time.sleep(0.3)
-        data = self._read_state()
-        dbg(f"State response: [{data.hex()}]")
+        """Query and return device state as a dict."""
+        responses = self._send_and_read(CMD_GET_STATE, "GET_STATE")
+        bits = self._find_state_string(responses)
+
+        if bits is None:
+            err(f"No state response from Nimbie device.\n"
+                f"  Responses received: {responses}\n\n"
+                f"  Possible reasons:\n"
+                f"    - Device not responding\n"
+                f"    - USB communication error")
+
+        dbg(f"State bits: {bits}")
+
+        def bit(pos):
+            return pos < len(bits) and bits[pos] == "1"
 
         return {
-            "raw": data,
-            "busy": data[1] == STATE_BUSY,
-            "hopper_empty": data[1] == STATE_HOPPER_EMPTY,
+            "raw":            bits,
+            "disc_available":  bit(STATE_BIT_DISC_AVAILABLE),
+            "disc_in_tray":    bit(STATE_BIT_DISC_IN_TRAY),
+            "disc_lifted":     bit(STATE_BIT_DISC_LIFTED),
+            "tray_out":        bit(STATE_BIT_TRAY_OUT),
         }
 
-    def _wait_not_busy(self, timeout=30):
-        """Poll until the device is no longer busy."""
+    def _poll_state(self, condition_fn, description, timeout=30, interval=0.5):
+        """Poll get_state() until condition_fn(state) returns True."""
         start = time.time()
         while True:
             if time.time() - start > timeout:
-                err(f"Nimbie still busy after {timeout}s timeout")
+                err(f"Timeout waiting for: {description} (after {timeout}s)")
             state = self.get_state()
-            if not state["busy"]:
+            if condition_fn(state):
                 return state
-            dbg("Device busy, waiting...")
-            time.sleep(0.5)
+            time.sleep(interval)
+
+    # -- Tray control via drutil (macOS) --
+
+    def _find_drutil_drive(self):
+        """Find the drutil drive number for the Nimbie's optical drive."""
+        if self._drutil_drive_nr is not None:
+            return self._drutil_drive_nr
+
+        try:
+            result = subprocess.run(["drutil", "list"], capture_output=True, text=True, timeout=10)
+            # drutil list output: lines like "  1  VENDOR  MODEL  FW"
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if parts and parts[0].isdigit():
+                    # Take the first (or only) optical drive
+                    self._drutil_drive_nr = parts[0]
+                    dbg(f"drutil drive: {self._drutil_drive_nr}")
+                    return self._drutil_drive_nr
+        except Exception as e:
+            dbg(f"drutil list failed: {e}")
+
+        # Fallback to drive 1
+        self._drutil_drive_nr = "1"
+        return self._drutil_drive_nr
 
     def open_tray(self):
-        self._send_command(CMD_OPEN_TRAY, "OPEN_TRAY")
-        time.sleep(1)
-        self._wait_not_busy()
+        """Open the optical drive tray via drutil."""
+        drive = self._find_drutil_drive()
+        vrb(f"  Opening tray (drutil drive {drive})...")
+        try:
+            subprocess.run(["drutil", "-drive", drive, "tray", "eject"],
+                           capture_output=True, timeout=15)
+        except Exception as e:
+            warn(f"drutil tray eject failed: {e}")
+
+        # Poll until tray is actually out
+        self._poll_state(lambda s: s["tray_out"], "tray to open", timeout=15)
 
     def close_tray(self):
-        self._send_command(CMD_CLOSE_TRAY, "CLOSE_TRAY")
-        time.sleep(1)
-        self._wait_not_busy()
+        """Close the optical drive tray via drutil."""
+        drive = self._find_drutil_drive()
+        vrb(f"  Closing tray (drutil drive {drive})...")
+        try:
+            subprocess.run(["drutil", "-drive", drive, "tray", "close"],
+                           capture_output=True, timeout=15)
+        except Exception as e:
+            warn(f"drutil tray close failed: {e}")
+
+        # Poll until tray is closed
+        self._poll_state(lambda s: not s["tray_out"], "tray to close", timeout=15)
+
+    # -- Autoloader mechanism commands --
 
     def place_disc(self):
-        """Place a disc from the hopper onto the open tray."""
-        self._send_command(CMD_PLACE_DISC, "PLACE_DISC")
-        time.sleep(2)
-        state = self._wait_not_busy()
-        return not state["hopper_empty"]
+        """Place a disc from the hopper onto the open tray.
+
+        Returns True if there are more discs in the hopper, False if this was the last one.
+        """
+        responses = self._send_and_read(CMD_PLACE_DISC, "PLACE_DISC")
+        at = self._find_at_response(responses)
+
+        if at == AT_HOPPER_EMPTY:
+            return False
+        elif at == AT_PLACED:
+            # Wait for disc to settle in tray + dropper retract
+            time.sleep(0.8)
+            return True
+        elif at == AT_TRAY_WRONG:
+            err("Cannot place disc: tray is not open.\n"
+                "  Open the tray first with: my-nimbie load")
+        elif at == AT_TRAY_HAS:
+            err("Cannot place disc: tray already has a disc.")
+        else:
+            err(f"Unexpected response from PLACE_DISC: {at}\n"
+                f"  All responses: {responses}")
 
     def lift_disc(self):
-        """Lift disc from tray to the accept bin."""
-        self._send_command(CMD_LIFT_DISC, "LIFT_DISC")
-        time.sleep(2)
-        self._wait_not_busy()
+        """Lift disc from open tray with the gripper mechanism."""
+        responses = self._send_and_read(CMD_LIFT_DISC, "LIFT_DISC")
+        at = self._find_at_response(responses)
+
+        if at == AT_OK:
+            # Poll until disc is lifted
+            self._poll_state(lambda s: s["disc_lifted"], "disc to be lifted", timeout=10)
+        elif at == AT_NO_DISC:
+            warn("No disc in tray to lift")
+        elif at == AT_DROPPER_ERR:
+            err("Lift mechanism error (disc may already be lifted or mechanism stuck)")
+        else:
+            err(f"Unexpected response from LIFT_DISC: {at}\n"
+                f"  All responses: {responses}")
+
+    def accept_disc(self):
+        """Drop a lifted disc into the accept (done) pile."""
+        responses = self._send_and_read(CMD_ACCEPT, "ACCEPT_DISC")
+        at = self._find_at_response(responses)
+
+        if at == AT_OK:
+            # Poll until disc is no longer lifted
+            self._poll_state(lambda s: not s["disc_lifted"], "disc to drop to accept", timeout=10)
+        else:
+            err(f"Unexpected response from ACCEPT_DISC: {at}\n"
+                f"  All responses: {responses}")
+
+    def reject_disc(self):
+        """Drop a lifted disc into the reject pile."""
+        responses = self._send_and_read(CMD_REJECT, "REJECT_DISC")
+        at = self._find_at_response(responses)
+
+        if at == AT_OK:
+            self._poll_state(lambda s: not s["disc_lifted"], "disc to drop to reject", timeout=10)
+        else:
+            err(f"Unexpected response from REJECT_DISC: {at}\n"
+                f"  All responses: {responses}")
 
     # -- High-level operations --
 
@@ -700,28 +905,33 @@ class NimbieDevice:
             warn("Hopper is empty — this was the last disc")
         return has_more
 
-    def accept_disc(self):
+    def eject_accept(self):
         """Eject current disc to the accept (done) bin."""
         vrb("  Opening tray...")
         self.open_tray()
 
-        vrb("  Lifting disc to accept bin...")
+        vrb("  Lifting disc...")
         self.lift_disc()
 
         vrb("  Closing tray...")
         self.close_tray()
 
-    def reject_disc(self):
-        """Eject current disc to the reject bin (just open+close, disc falls through)."""
+        vrb("  Dropping to accept bin...")
+        self.accept_disc()
+
+    def eject_reject(self):
+        """Eject current disc to the reject bin."""
         vrb("  Opening tray...")
         self.open_tray()
 
-        # No lift — disc drops to reject bin
-        vrb("  Disc dropping to reject bin...")
-        time.sleep(1)
+        vrb("  Lifting disc...")
+        self.lift_disc()
 
         vrb("  Closing tray...")
         self.close_tray()
+
+        vrb("  Dropping to reject bin...")
+        self.reject_disc()
 
 
 # ---------------------------------------------------------------------------
@@ -743,7 +953,12 @@ class NimbieDeviceDryRun:
     def get_state(self):
         msg("  [DRY-RUN] Would query device state")
         empty = self._load_count >= self._max_demo_discs
-        return {"raw": b"\x00" * 8, "busy": False, "hopper_empty": empty}
+        return {
+            "disc_available": not empty,
+            "disc_in_tray": self._load_count > 0,
+            "disc_lifted": False,
+            "tray_out": False,
+        }
 
     def load_disc(self):
         self._load_count += 1
@@ -751,11 +966,11 @@ class NimbieDeviceDryRun:
         msg(f"  [DRY-RUN] Would load next disc from hopper (demo disc {self._load_count}/{self._max_demo_discs})")
         return has_more
 
-    def accept_disc(self):
-        msg("  [DRY-RUN] Would accept disc (eject to done bin)")
+    def eject_accept(self):
+        msg("  [DRY-RUN] Would eject disc to accept (done) bin")
 
-    def reject_disc(self):
-        msg("  [DRY-RUN] Would reject disc (eject to reject bin)")
+    def eject_reject(self):
+        msg("  [DRY-RUN] Would eject disc to reject bin")
 
 
 # ---------------------------------------------------------------------------
@@ -894,7 +1109,7 @@ def cmd_eject(nimbie, config, _args):
     mount_point = config.get("nimbie", "mount_point")
     msg("Accepting disc (eject to done bin)...")
     unmount_disc(mount_point)
-    nimbie.accept_disc()
+    nimbie.eject_accept()
     msg("  Disc accepted.")
 
 
@@ -902,7 +1117,7 @@ def cmd_reject(nimbie, config, _args):
     mount_point = config.get("nimbie", "mount_point")
     msg("Rejecting disc (eject to reject bin)...")
     unmount_disc(mount_point)
-    nimbie.reject_disc()
+    nimbie.eject_reject()
     msg("  Disc rejected.")
 
 
@@ -941,9 +1156,10 @@ def cmd_status(nimbie, _config, _args):
     # No batch running — query USB device directly
     msg("Querying Nimbie status...")
     state = nimbie.get_state()
-    msg(f"  Busy:         {state['busy']}")
-    msg(f"  Hopper empty: {state['hopper_empty']}")
-    msg(f"  Raw:          {state['raw'].hex()}")
+    msg(f"  Disc available: {state['disc_available']}")
+    msg(f"  Disc in tray:   {state['disc_in_tray']}")
+    msg(f"  Disc lifted:    {state['disc_lifted']}")
+    msg(f"  Tray out:       {state['tray_out']}")
 
 
 def cmd_batch(nimbie, config, args):
@@ -1017,7 +1233,7 @@ def cmd_batch(nimbie, config, args):
 
                 if not wait_for_mount(mount_point, mount_timeout, poll_interval):
                     warn(f"Disc did not mount within {mount_timeout}s — rejecting")
-                    nimbie.reject_disc()
+                    nimbie.eject_reject()
                     status.record_reject()
                     if not has_more:
                         msg("  Hopper empty. Stopping.")
@@ -1048,11 +1264,11 @@ def cmd_batch(nimbie, config, args):
 
             if rc == 0:
                 msg(f"  Disc #{status.disc_nr}: ACCEPTING (command succeeded)")
-                nimbie.accept_disc()
+                nimbie.eject_accept()
                 status.record_accept()
             else:
                 msg(f"  Disc #{status.disc_nr}: REJECTING (command failed with exit code {rc})")
-                nimbie.reject_disc()
+                nimbie.eject_reject()
                 status.record_reject()
 
             if not has_more:
@@ -1117,7 +1333,8 @@ Examples:
 Config file search order:
   1. ~/.my-nimbie.conf
   2. /etc/my-nimbie.conf
-  3. /LINKS/default/my-nimbie
+  3. /LINKS/global/etc/my-nimbie
+  4. /LINKS/default/my-nimbie
 
 Batch flavors and their config keys:
   (none)      → [commands] on_load_DEFAULT      [target_dirs] default
