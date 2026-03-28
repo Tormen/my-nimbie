@@ -359,21 +359,24 @@ def find_config_file(explicit_path=None):
             dbg(f"Using config: {path}")
             return path
 
-    dbg("No config file found, using built-in defaults")
-    return None
+    search_list = "\n".join(f"    - {p}" for p in CONFIG_SEARCH_PATHS)
+    err(f"No config file found.\n\n"
+        f"  Searched:\n{search_list}\n\n"
+        f"  Create one with:\n"
+        f"    my-nimbie --create-config\n"
+        f"    my-nimbie --create-config /custom/path")
 
 
-def load_config(config_path=None):
-    """Load config from file, falling back to defaults."""
+def load_config(config_path):
+    """Load config from file, with built-in defaults for missing values."""
     config = configparser.ConfigParser()
 
-    # Set defaults
+    # Set defaults for any values not specified in the file
     for section, values in DEFAULT_CONFIG.items():
         config[section] = values
 
-    if config_path:
-        config.read(config_path)
-        vrb(f"  Config loaded from: {config_path}")
+    config.read(config_path)
+    vrb(f"  Config loaded from: {config_path}")
 
     config.config_path = config_path  # store for status display
     return config
