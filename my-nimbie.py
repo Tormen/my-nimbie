@@ -324,13 +324,17 @@ def vrb(text):
     if verbose:
         print(text)
 
+def _ts():
+    now = datetime.datetime.now()
+    return now.strftime("%Y-%m-%d_%H%M.") + f"{now.microsecond // 1000:03d}"
+
 def dbg(text):
     if debug:
-        print(f"  DBG: {text}", file=sys.stderr)
+        print(f"{_ts()}|  DBG: {text}", file=sys.stderr)
 
 def ddbg(text):
     if deepdebug:
-        print(f"  DDBG: {text}", file=sys.stderr)
+        print(f"{_ts()}| DDBG: {text}", file=sys.stderr)
 
 def err(text, code=1):
     print(f"\n  ERROR: {text}\n", file=sys.stderr)
