@@ -443,10 +443,10 @@ on_validate =
 # "default" is used when on_load_DEFAULT is set to a direct command.
 # When on_load_DEFAULT is a synonym (e.g. "ripdvd"), the synonym's
 # target_dir is used instead (e.g. rip_dvd).
-default =
-rip_dvd =
-rip_audiocd =
-read_dvd =
+# default =
+rip_dvd = /Volumes/ext-data/
+rip_audiocd = /Volumes/ext-data/
+read_dvd = /Volumes/ext-data/
 
 [naming]
 # Per-disc subdirectory naming within TARGET_DIR.
