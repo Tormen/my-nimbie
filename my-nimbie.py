@@ -1409,7 +1409,7 @@ Monitoring a running batch:
                         help="create example config file (default: ~/.my-nimbie.conf, or specify PATH)")
     parser.add_argument("--dry", "-d", action="store_true",
                         help="dry run — print what would be done without executing")
-    parser.add_argument("--verbose", "-V", action="store_true",
+    parser.add_argument("--verbose", "-v", action="store_true",
                         help="verbose output")
     parser.add_argument("--debug", "-D", action="store_true",
                         help="debug output (implies --verbose)")
