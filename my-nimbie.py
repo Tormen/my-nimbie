@@ -102,6 +102,7 @@ _my-nimbie() {
         'accept:Tell paused batch/next to accept the disc'
         'retry:Tell paused batch/next to retry the command'
         'stop:Tell paused batch/next to reject and stop'
+        'reset:Recover Nimbie from error states (bootloader, stuck disc)'
     )
 
     local -a global_opts
@@ -204,6 +205,16 @@ CMD_PLACE_DISC = (0x52, 0x01)   # drop disc from hopper onto open tray
 CMD_ACCEPT     = (0x52, 0x02)   # drop lifted disc into accept pile
 CMD_REJECT     = (0x52, 0x03)   # drop lifted disc into reject pile
 CMD_LIFT_DISC  = (0x47, 0x01)   # lift disc from open tray with gripper
+
+# Microchip PIC HID Bootloader (entered via 0x56 command)
+BL_VID = 0x04D8
+BL_PID = 0x000B
+BL_EP_OUT = 0x01  # Bulk OUT, 64 bytes
+BL_EP_IN  = 0x81  # Bulk IN, 64 bytes
+BL_CMD_QUERY          = 0x00
+BL_CMD_PROGRAM_COMPLETE = 0x04
+BL_CMD_RESET_DEVICE   = 0x06
+BL_CMD_SIGN_FLASH     = 0x07
 
 # AT+ response codes
 AT_OK          = "AT+O"         # operation success
@@ -1810,6 +1821,51 @@ def cmd_load(nimbie, config, _args):
     return has_more
 
 
+def _recover_drive_state(nimbie, mount_point):
+    """Ensure drive is in clean idle state before starting an operation.
+
+    Handles all stuck states:
+    - Tray out (disc on open tray): close tray, try to eject disc to reject bin
+    - Disc in tray (closed): unmount, eject to reject bin
+    - Disc lifted (grabbed by gripper): drop to reject bin
+    Returns True if recovery succeeded (drive is idle now).
+    """
+    state = nimbie.get_state()
+    dbg(f"_recover_drive_state: {state}")
+
+    if not state["disc_in_tray"] and not state["disc_lifted"] and not state["tray_out"]:
+        return True  # already idle
+
+    msg("  Recovering from stuck state...")
+
+    if state["disc_lifted"]:
+        msg("  Disc in gripper — dropping to reject bin...")
+        nimbie.reject_disc()
+
+    if state["tray_out"]:
+        msg("  Tray is open — closing tray...")
+        nimbie.close_tray()
+        # After closing, disc may now be detected in tray
+        state = nimbie.get_state()
+        dbg(f"_recover_drive_state: after close_tray: {state}")
+
+    if state["disc_in_tray"]:
+        msg("  Disc in drive — ejecting to reject bin...")
+        unmount_disc(mount_point)
+        nimbie.eject_reject()
+        msg("  Stale disc rejected.")
+        return True
+
+    # Tray was open but no disc detected after closing — might have been empty tray
+    state = nimbie.get_state()
+    if not state["disc_in_tray"] and not state["disc_lifted"] and not state["tray_out"]:
+        msg("  Drive is now idle.")
+        return True
+
+    warn(f"Could not fully recover drive state: {state}")
+    return False
+
+
 def cmd_eject(nimbie, config, _args):
     mount_point = config.get("nimbie", "mount_point")
     unmount_disc(mount_point)
@@ -1821,6 +1877,317 @@ def cmd_reject(nimbie, config, _args):
     unmount_disc(mount_point)
     msg("Rejecting disc (eject to reject bin)...")
     nimbie.eject_reject()
+
+
+# ---------------------------------------------------------------------------
+# reset command — bootloader recovery and diagnostics
+# ---------------------------------------------------------------------------
+
+def _bl_connect():
+    """Connect to Microchip PIC HID Bootloader device. Returns (dev, True) or (None, False)."""
+    import usb.core
+    import usb.util
+
+    dev = usb.core.find(idVendor=BL_VID, idProduct=BL_PID)
+    if dev is None:
+        return None, False
+
+    try:
+        if dev.is_kernel_driver_active(0):
+            dev.detach_kernel_driver(0)
+    except Exception:
+        pass
+
+    try:
+        dev.set_configuration()
+    except Exception:
+        pass
+
+    try:
+        usb.util.claim_interface(dev, 0)
+    except usb.core.USBError as e:
+        warn(f"Cannot claim bootloader interface: {e}")
+        return None, False
+
+    # Drain stale data
+    for _ in range(5):
+        try:
+            dev.read(BL_EP_IN, 64, timeout=100)
+        except Exception:
+            break
+
+    return dev, True
+
+
+def _bl_send(dev, cmd_bytes, timeout=2000):
+    """Send command to bootloader, return response bytes or None."""
+    pkt = bytearray(64)
+    for i, b in enumerate(cmd_bytes):
+        if i < 64:
+            pkt[i] = b
+
+    try:
+        dev.write(BL_EP_OUT, pkt, timeout=5000)
+    except Exception as e:
+        dbg(f"Bootloader write error: {e}")
+        return None
+
+    time.sleep(0.2)
+
+    try:
+        resp = bytes(dev.read(BL_EP_IN, 64, timeout=timeout))
+        return resp.rstrip(b'\x00')
+    except Exception:
+        return None
+
+
+def _bl_exit_bootloader(dev):
+    """Send RESET_DEVICE to bootloader. Returns True if command was sent."""
+    msg("  Sending RESET_DEVICE to bootloader...")
+    resp = _bl_send(dev, [BL_CMD_RESET_DEVICE])
+    if resp:
+        dbg(f"Bootloader RESET response: {resp.hex()}")
+    return True
+
+
+def cmd_reset(_nimbie, _config, args):
+    """Reset / recover the Nimbie from various error states."""
+    import usb.core
+
+    # Step 1: Detect current state
+    nimbie_dev = usb.core.find(idVendor=NIMBIE_VID, idProduct=NIMBIE_PID)
+    bl_dev = usb.core.find(idVendor=BL_VID, idProduct=BL_PID)
+
+    if args.exit_bootloader:
+        # Explicit --exit-bootloader
+        if nimbie_dev and not bl_dev:
+            msg("Nimbie is already in normal mode (not in bootloader).")
+            return
+        if not bl_dev:
+            err(f"Neither Nimbie ({NIMBIE_VID:#06x}:{NIMBIE_PID:#06x}) nor bootloader "
+                f"({BL_VID:#06x}:{BL_PID:#06x}) found on USB.\n\n"
+                f"  Possible reasons:\n"
+                f"    - Device not connected or not powered on\n"
+                f"    - macOS blocking the accessory (System Settings → Privacy & Security → Accessories)")
+        msg("Nimbie is in Microchip PIC bootloader mode.")
+        msg(f"  Bootloader: VID={BL_VID:#06x} PID={BL_PID:#06x}")
+        dev, ok = _bl_connect()
+        if not ok:
+            err("Cannot connect to bootloader device.")
+        _bl_exit_bootloader(dev)
+        try:
+            import usb.util
+            usb.util.release_interface(dev, 0)
+        except Exception:
+            pass
+        msg("")
+        msg("  RESET command sent.")
+        msg("")
+        msg("  >>> NOW: Turn OFF the Nimbie hardware switch, wait 5 seconds, turn it back ON <<<")
+        msg("")
+        msg("  After power cycle, the Nimbie should return to normal operation.")
+        msg("  Verify with: my-nimbie status")
+        return
+
+    if args.diagnostics:
+        # Show diagnostics from both Nimbie and bootloader
+        if bl_dev:
+            msg("=" * 60)
+            msg("  NIMBIE DIAGNOSTICS — BOOTLOADER MODE")
+            msg("=" * 60)
+            msg("")
+            msg("  USB Mode:      BOOTLOADER (Microchip PIC HID)")
+            msg(f"  VID/PID:       {BL_VID:#06x}:{BL_PID:#06x}")
+            msg(f"  Normal VID/PID: {NIMBIE_VID:#06x}:{NIMBIE_PID:#06x} (NOT active)")
+            msg("")
+            dev, ok = _bl_connect()
+            if ok:
+                resp = _bl_send(dev, [BL_CMD_QUERY])
+                if resp:
+                    msg(f"  Bootloader QUERY response: {resp.hex()}")
+                    if len(resp) >= 4:
+                        msg(f"    Command echo:     {resp[0]:#04x}")
+                        bpp = (resp[2] << 8) | resp[1] if len(resp) >= 3 else 0
+                        msg(f"    Bytes per packet: {bpp}")
+                        msg(f"    Device family:    {resp[3]:#04x}")
+                msg("")
+                msg("  Bootloader endpoints:")
+                msg(f"    EP OUT: {BL_EP_OUT:#04x} (Bulk, 64 bytes)")
+                msg(f"    EP IN:  {BL_EP_IN:#04x} (Bulk, 64 bytes)")
+                msg("")
+                msg("  Available bootloader commands:")
+                msg("    0x00  QUERY_DEVICE       — query bootloader info")
+                msg("    0x01  UNLOCK_CONFIG       — unlock config bits (DANGEROUS)")
+                msg("    0x02  ERASE_FLASH         — erase flash memory (DANGEROUS)")
+                msg("    0x03  PROGRAM_FLASH       — write flash memory (DANGEROUS)")
+                msg("    0x04  PROGRAM_COMPLETE    — signal programming done")
+                msg("    0x05  GET_DATA            — read flash memory")
+                msg("    0x06  RESET_DEVICE        — reset microcontroller")
+                msg("    0x07  SIGN_FLASH          — sign flash for validation")
+                try:
+                    import usb.util
+                    usb.util.release_interface(dev, 0)
+                except Exception:
+                    pass
+            msg("")
+            msg("  LED pattern in bootloader mode:")
+            msg("    ERROR: RED (solid)  LINK: GREEN (solid)  USB3: GREEN (solid)  READY: GREEN (solid)")
+            msg("")
+            msg("  Recovery:")
+            msg("    my-nimbie reset --exit-bootloader")
+            msg("    Then: hardware switch OFF → wait 5s → ON")
+            return
+
+        if not nimbie_dev:
+            err(f"No Nimbie device found on USB.\n\n"
+                f"  Checked:\n"
+                f"    Normal mode:     VID={NIMBIE_VID:#06x} PID={NIMBIE_PID:#06x}\n"
+                f"    Bootloader mode: VID={BL_VID:#06x} PID={BL_PID:#06x}\n\n"
+                f"  Possible reasons:\n"
+                f"    - Device not connected or not powered on\n"
+                f"    - macOS blocking the accessory (System Settings → Privacy & Security → Accessories)")
+
+        msg("=" * 60)
+        msg("  NIMBIE DIAGNOSTICS — NORMAL MODE")
+        msg("=" * 60)
+        msg("")
+
+        nimbie = NimbieDevice(NIMBIE_VID, NIMBIE_PID)
+        nimbie.connect()
+        try:
+            # USB info
+            msg(f"  USB Mode:       NORMAL (Acronova NT21)")
+            msg(f"  VID/PID:        {NIMBIE_VID:#06x}:{NIMBIE_PID:#06x}")
+            try:
+                msg(f"  Manufacturer:   {nimbie.dev.manufacturer}")
+                msg(f"  Product:        {nimbie.dev.product}")
+            except Exception:
+                pass
+            msg(f"  Endpoints:")
+            msg(f"    EP OUT: {EP_OUT:#04x} (Interrupt, 8 bytes)")
+            msg(f"    EP IN:  {EP_IN:#04x} (Interrupt, 64 bytes)")
+            msg("")
+
+            # State
+            state = nimbie.get_state()
+            bits = state["raw"]
+            msg(f"  State bits:     {{{bits}}}")
+            msg("")
+            msg(f"    Bit 0: {bits[0]}   (unknown)")
+            msg(f"    Bit 1: {bits[1]}   disc_available   — {'YES: discs in input hopper' if state['disc_available'] else 'no: hopper empty'}")
+            msg(f"    Bit 2: {bits[2]}   (unknown)")
+            msg(f"    Bit 3: {bits[3]}   disc_in_tray     — {'YES: disc sitting on ejected tray' if state['disc_in_tray'] else 'no: tray empty'}")
+            msg(f"    Bit 4: {bits[4]}   disc_lifted      — {'YES: disc held by gripper' if state['disc_lifted'] else 'no: gripper empty'}")
+            msg(f"    Bit 5: {bits[5]}   tray_out         — {'YES: drive tray is ejected' if state['tray_out'] else 'no: tray closed'}")
+            for i in range(6, len(bits)):
+                msg(f"    Bit {i}: {bits[i]}   (unknown)")
+            msg("")
+
+            # LED interpretation
+            msg("  LED status (estimated from state):")
+            if state["disc_available"]:
+                msg("    READY: GREEN (solid) — discs available")
+            else:
+                msg("    READY: GREEN (blinking) — hopper empty")
+            msg("    ERROR: OFF — no error")
+            msg("    LINK:  GREEN (solid) — USB connected")
+            msg("")
+
+            # Diagnostics command (0x49)
+            msg("  Hardware diagnostics (CMD 0x49):")
+            diag_resps = nimbie._send_and_read((0x49,), "DIAGNOSTICS", timeout=3000)
+            if diag_resps:
+                # Parse interleaved name/value pairs: ["OK", "OL-Timer", "00000009", "Supply-N", ...]
+                pairs = [r for r in diag_resps if r not in ("OK", "AT+O")]
+                for i in range(0, len(pairs) - 1, 2):
+                    name = pairs[i]
+                    value = pairs[i + 1] if i + 1 < len(pairs) else "?"
+                    try:
+                        msg(f"    {name:12s} = {int(value):,d}")
+                    except ValueError:
+                        msg(f"    {name:12s} = {value}")
+            else:
+                msg("    (no response)")
+            msg("")
+
+            # Counters command (0x4A)
+            msg("  Hardware counters (CMD 0x4A):")
+            counter_resps = nimbie._send_and_read((0x4A,), "COUNTERS", timeout=3000)
+            if counter_resps:
+                pairs = [r for r in counter_resps if r not in ("OK", "AT+O")]
+                if any(r == "AT+E09" for r in counter_resps):
+                    msg("    (command not supported on this device)")
+                else:
+                    for i in range(0, len(pairs) - 1, 2):
+                        name = pairs[i]
+                        value = pairs[i + 1] if i + 1 < len(pairs) else "?"
+                        try:
+                            msg(f"    {name:12s} = {int(value):,d}")
+                        except ValueError:
+                            msg(f"    {name:12s} = {value}")
+            else:
+                msg("    (no response)")
+            msg("")
+
+            # Drive info via drutil
+            msg("  Optical drive (via drutil):")
+            import subprocess
+            result = subprocess.run(["drutil", "status"], capture_output=True, text=True)
+            for line in result.stdout.strip().split("\n"):
+                msg(f"    {line.strip()}")
+            msg("")
+
+            # Summary
+            msg("  Known commands:")
+            msg("    0x43       GET_STATE    — query hardware state bits")
+            msg("    0x47,0x01  LIFT_DISC    — lift disc from tray with gripper")
+            msg("    0x49       DIAGNOSTICS  — OL-Timer, Supply, Pulley counters")
+            msg("    0x4A       COUNTERS     — Pick, Release counters")
+            msg("    0x52,0x01  PLACE_DISC   — drop disc from hopper onto tray")
+            msg("    0x52,0x02  ACCEPT       — drop disc to accept (done) bin")
+            msg("    0x52,0x03  REJECT       — drop disc to reject bin")
+
+        finally:
+            nimbie.disconnect()
+        return
+
+    # Default: auto-detect and recover
+    if bl_dev:
+        msg("Nimbie detected in BOOTLOADER mode — auto-recovering...")
+        msg(f"  Bootloader: VID={BL_VID:#06x} PID={BL_PID:#06x}")
+        msg("")
+        dev, ok = _bl_connect()
+        if not ok:
+            err("Cannot connect to bootloader device.")
+        _bl_exit_bootloader(dev)
+        try:
+            import usb.util
+            usb.util.release_interface(dev, 0)
+        except Exception:
+            pass
+        msg("")
+        msg("  RESET command sent.")
+        msg("")
+        msg("  >>> NOW: Turn OFF the Nimbie hardware switch, wait 5 seconds, turn it back ON <<<")
+        msg("")
+        msg("  After power cycle, the Nimbie should return to normal operation.")
+        msg("  Verify with: my-nimbie status")
+        return
+
+    if nimbie_dev:
+        msg("Nimbie is in normal mode — no recovery needed.")
+        msg("")
+        msg("  Use 'my-nimbie reset --diagnostics' to view device diagnostics.")
+        return
+
+    err(f"No Nimbie device found on USB.\n\n"
+        f"  Checked:\n"
+        f"    Normal mode:     VID={NIMBIE_VID:#06x} PID={NIMBIE_PID:#06x}\n"
+        f"    Bootloader mode: VID={BL_VID:#06x} PID={BL_PID:#06x}\n\n"
+        f"  Possible reasons:\n"
+        f"    - Device not connected or not powered on\n"
+        f"    - macOS blocking the accessory (System Settings → Privacy & Security → Accessories)\n"
+        f"    - Try unplugging USB, turning off device, waiting 10 seconds, then reconnecting")
 
 
 def cmd_status(nimbie, config, _args):
@@ -2012,6 +2379,27 @@ def cmd_status(nimbie, config, _args):
     4. Open tray, lift disc (gripper picks it up)
     5. Drop disc to accept (done) or reject bin""")
 
+    # Verbose: show hardware diagnostics (same as reset --diagnostics)
+    if verbose:
+        msg("")
+        msg("  Hardware diagnostics (CMD 0x49):")
+        diag_resps = nimbie._send_and_read((0x49,), "DIAGNOSTICS", timeout=3000)
+        if diag_resps:
+            pairs = [r for r in diag_resps if r not in ("OK", "AT+O")]
+            for i in range(0, len(pairs) - 1, 2):
+                name = pairs[i]
+                value = pairs[i + 1] if i + 1 < len(pairs) else "?"
+                try:
+                    msg(f"    {name:12s} = {int(value):,d}")
+                except ValueError:
+                    msg(f"    {name:12s} = {value}")
+        msg("")
+        import subprocess
+        msg("  Optical drive:")
+        result = subprocess.run(["drutil", "status"], capture_output=True, text=True)
+        for line in result.stdout.strip().split("\n"):
+            msg(f"    {line.strip()}")
+
 
 def cmd_next(nimbie, config, args):
     """Process exactly one disc: load → run command → accept/reject."""
@@ -2094,15 +2482,9 @@ def cmd_next(nimbie, config, args):
     msg(f"  Target dir: {target_dir}")
     msg(f"  Dir name:   {dir_name}")
 
-    # Check if there's already a disc in the drive
+    # Recover from any stuck state before loading
     if not dry_run:
-        state = nimbie.get_state()
-        dbg(f"cmd_next: device state before load: {state}")
-        if state["disc_in_tray"]:
-            msg("\n  Disc already in drive — ejecting to accept bin first...")
-            unmount_disc(mount_point)
-            nimbie.eject_accept()
-            msg("  Previous disc accepted.")
+        _recover_drive_state(nimbie, mount_point)
 
     # Load
     status.start_disc_timer()
@@ -2296,6 +2678,10 @@ def cmd_batch(nimbie, config, args):
     msg(f"  Dir naming: {preview_dir_name}  (preview for disc #1)")
 
     status.update("running")
+
+    # Recover from any stuck state before first disc
+    if not dry_run:
+        _recover_drive_state(nimbie, mount_point)
 
     try:
         while not interrupted:
@@ -2701,7 +3087,7 @@ class TestArgvExpansion(unittest.TestCase):
                 expanded.extend(["-D"] * len(arg[1:]))
             else:
                 expanded.append(arg)
-        subcommands = {"load", "eject", "reject", "status", "next", "batch"}
+        subcommands = {"load", "eject", "reject", "status", "next", "batch", "reset"}
         global_flags = {"-D", "-v", "-d", "--debug", "--verbose", "--dry"}
         hoisted = []
         rest = []
@@ -2896,6 +3282,29 @@ Monitoring a running batch:
     sub.add_parser("retry",  help="Tell a paused batch/next to retry the command")
     sub.add_parser("stop",   help="Tell a paused batch/next to reject and stop")
 
+    reset_parser = sub.add_parser("reset", help="Recover Nimbie from error states (bootloader mode, stuck disc)",
+                                  formatter_class=argparse.RawDescriptionHelpFormatter,
+                                  description="""\
+Detect and recover the Nimbie from various error states.
+
+Without flags, auto-detects the device state and recovers:
+  - If in bootloader mode: sends RESET command (then you power cycle)
+  - If in normal mode: reports no recovery needed
+
+Recovery flags:
+  --exit-bootloader   Exit Microchip PIC bootloader mode (after accidental 0x56 command)
+  --diagnostics       Show device diagnostics (counters, state, bootloader info)
+
+After --exit-bootloader, you MUST power cycle the device:
+  1. Turn OFF the hardware switch
+  2. Wait 5 seconds
+  3. Turn it back ON
+  4. Verify with: my-nimbie status""")
+    reset_parser.add_argument("--exit-bootloader", action="store_true",
+                              help="exit Microchip PIC bootloader mode (requires power cycle after)")
+    reset_parser.add_argument("--diagnostics", action="store_true",
+                              help="show device diagnostics (counters, timers, state)")
+
     # --- next: process exactly one disc (same setup as batch, for testing) ---
     next_parser = sub.add_parser("next", help="Process exactly one disc (same setup as batch, for testing)",
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3007,7 +3416,7 @@ def main():
         else:
             expanded.append(arg)
     # Hoist global flags (-D, -v, -d, --debug, --verbose, --dry) before the subcommand
-    subcommands = {"load", "eject", "reject", "status", "next", "batch"}
+    subcommands = {"load", "eject", "reject", "status", "next", "batch", "reset"}
     global_flags = {"-D", "-v", "-d", "--debug", "--verbose", "--dry"}
     hoisted = []
     rest = []
@@ -3085,6 +3494,11 @@ def main():
                 cmd_status(None, config, args)
                 return
             # Process crashed — fall through to connect USB and show full status
+
+    # reset command handles its own USB (may talk to bootloader, not normal Nimbie)
+    if args.command == "reset":
+        cmd_reset(None, config, args)
+        return
 
     # Create device
     if dry_run:
