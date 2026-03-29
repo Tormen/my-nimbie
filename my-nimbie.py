@@ -1256,30 +1256,34 @@ class NimbieDevice:
 
         Returns True if there are more discs in the hopper, False if this was the last one.
         """
-        # Mechanical operation: hopper picks up disc and drops it on tray.
-        # This can take 10-15 seconds, so use a generous read timeout and
-        # keep reading through idle packets until the AT+S status arrives.
+        # Send command and read initial response (OK/AT+O arrive quickly).
+        # Don't hammer USB with 100 reads — the AT+S status often never comes.
+        # Instead, poll state bits to confirm disc was placed.
         responses = self._send_and_read(CMD_PLACE_DISC, "PLACE_DISC",
-                                        timeout=20000, max_reads=100,
+                                        timeout=5000, max_reads=10,
                                         wait_for_at=True)
         at = self._find_at_response(responses)
 
         if at == AT_HOPPER_EMPTY:
             return False
-        elif at == AT_PLACED:
-            # Wait for disc to settle in tray + dropper retract
-            time.sleep(0.8)
-            return True
-        elif at == AT_OK:
-            # AT+O without AT+S07 — disc likely placed successfully
-            dbg("place_disc: got AT+O without AT+S07, assuming success")
-            time.sleep(0.8)
-            return True
         elif at == AT_TRAY_WRONG:
             err("Cannot place disc: tray is not open.\n"
                 "  Open the tray first with: my-nimbie load")
         elif at == AT_TRAY_HAS:
             err("Cannot place disc: tray already has a disc.")
+        elif at in (AT_PLACED, AT_OK, None):
+            # AT+S07 (placed), AT+O (accepted), or no AT response — all normal.
+            # Confirm via state polling: disc_in_tray becomes True, or hopper empties.
+            dbg(f"place_disc: AT response={at}, polling state to confirm...")
+            state = self._poll_state(
+                lambda s: s["disc_in_tray"] or not s["disc_available"],
+                "disc to be placed on tray (or hopper empty)",
+                timeout=20)
+            if not state["disc_in_tray"] and not state["disc_available"]:
+                # Hopper ran empty during placement
+                return False
+            time.sleep(0.8)
+            return True
         else:
             err(f"Unexpected response from PLACE_DISC: {at}\n"
                 f"  All responses: {responses}")
@@ -1287,7 +1291,7 @@ class NimbieDevice:
     def lift_disc(self):
         """Lift disc from open tray with the gripper mechanism. Returns True on success."""
         responses = self._send_and_read(CMD_LIFT_DISC, "LIFT_DISC",
-                                        timeout=15000, max_reads=100,
+                                        timeout=5000, max_reads=10,
                                         wait_for_at=True)
         at = self._find_at_response(responses)
 
@@ -1308,7 +1312,7 @@ class NimbieDevice:
     def accept_disc(self):
         """Drop a lifted disc into the accept (done) pile."""
         responses = self._send_and_read(CMD_ACCEPT, "ACCEPT_DISC",
-                                        timeout=15000, max_reads=100,
+                                        timeout=5000, max_reads=10,
                                         wait_for_at=True)
         at = self._find_at_response(responses)
 
@@ -1324,7 +1328,7 @@ class NimbieDevice:
     def reject_disc(self):
         """Drop a lifted disc into the reject pile."""
         responses = self._send_and_read(CMD_REJECT, "REJECT_DISC",
-                                        timeout=15000, max_reads=100,
+                                        timeout=5000, max_reads=10,
                                         wait_for_at=True)
         at = self._find_at_response(responses)
 
