@@ -2372,12 +2372,18 @@ def cmd_status(nimbie, config, _args):
             if _nimbie is None:
                 # Try to connect briefly for diagnostics (another process may hold USB)
                 try:
-                    import configparser as _cp
                     _vid = int(config.get("nimbie", "vid"), 16)
                     _pid = int(config.get("nimbie", "pid"), 16)
                     _nimbie = NimbieDevice(_vid, _pid)
-                    _nimbie.connect()
-                except Exception:
+                    # Suppress err() output during probe — redirect stderr
+                    _old_stderr = sys.stderr
+                    sys.stderr = open(os.devnull, "w")
+                    try:
+                        _nimbie.connect()
+                    finally:
+                        sys.stderr.close()
+                        sys.stderr = _old_stderr
+                except (Exception, SystemExit):
                     _nimbie = None
             if _nimbie is not None:
                 try:
