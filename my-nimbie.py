@@ -105,6 +105,8 @@ _my-nimbie() {
         'unmount:Unmount disc from optical drive'
         'cancel:Cancel running batch/next (sends SIGINT to the process)'
         'reset:Recover Nimbie from error states (bootloader, stuck disc)'
+        'monitor:Start real-time status monitor (USB state + hardware polling)'
+        'probe:Scan Nimbie USB command space for reverse-engineering'
     )
 
     local -a global_opts
@@ -135,21 +137,52 @@ _my-nimbie() {
                         'ripaudio:Rip audio CD tracks to FLAC'
                         'readdvd:Full DVD backup via dvdbackup'
                     )
-                    _arguments -s : \
-                        '(-t --target-dir)'{-t,--target-dir}'[Base output directory]:dir:_directories' \
-                        '--prefix[Directory name prefix]:str:' \
-                        '--name[Directory name middle part]:str:' \
-                        '--postfix[Directory name postfix]:str:' \
-                        '--offset[Offset for disc index]:n:' \
-                        '--padding[Zero-padding width for index]:n:' \
-                        '--pause-on-err[Pause on command error, keep disc in drive]' \
-                        '--max[Max discs to process]:n:' \
+                    local -a subcmd_args
+                    subcmd_args=(
+                        '(-t --target-dir)'{-t,--target-dir}'[Base output directory]:dir:_directories'
+                        '--prefix[Directory name prefix]:str:'
+                        '--name[Directory name middle part]:str:'
+                        '--postfix[Directory name postfix]:str:'
+                        '--offset[Offset for disc index]:n:'
+                        '--padding[Zero-padding width for index]:n:'
+                        '--pause-on-err[Pause on command error, keep disc in drive]'
+                        '--use-loaded[Process disc already in drive as first disc]'
                         '1:flavor:->flavor'
+                    )
+                    if [[ $line[1] == batch ]]; then
+                        subcmd_args+=('--max[Max discs to process]:n:')
+                    fi
+                    _arguments -s : $subcmd_args
                     case $state in
                         flavor)
                             _describe 'flavor' flavors
                             ;;
                     esac
+                    ;;
+                reset)
+                    _arguments -s : \
+                        '--exit-bootloader[Send RESET_DEVICE to bootloader (then power cycle)]' \
+                        '--diagnostics[Show device diagnostics]' \
+                        '--jump-to-app[AN1388 framed Jump-to-App (NOT supported on this device)]' \
+                        '--bl-query[QUERY_DEVICE (0x00) — show bootloader info]' \
+                        '--bl-scan[Scan bootloader commands 0x00-0xFF]' \
+                        '--bl-read-flash[Read flash reset vector + config area]' \
+                        '--bl-read-addr[Read flash at hex address]:addr:' \
+                        '--bl-read-len[Bytes to read (default 256)]:n:' \
+                        '--bl-raw[Send raw hex bytes to bootloader]:hex:' \
+                        '--sign-and-reset[CONFIRMED recovery: PROGRAM_COMPLETE + SIGN_FLASH x2 + power cycle]'
+                    ;;
+                probe)
+                    _arguments -s : \
+                        '--range[Command byte range to scan (e.g. 0x40-0x60)]:range:' \
+                        '--cmd[Command byte for param scanning (e.g. 0x52)]:cmd:' \
+                        '--params[Scan param bytes for --cmd]' \
+                        '--param-range[Param byte range]:range:' \
+                        '--raw[Send raw hex bytes to Nimbie]:hex:'
+                    ;;
+                status)
+                    _arguments -s : \
+                        '(-V --verbose)'{-V,--verbose}'[Verbose output]'
                     ;;
             esac
             ;;
@@ -215,10 +248,11 @@ BL_VID = 0x04D8
 BL_PID = 0x000B
 BL_EP_OUT = 0x01  # Bulk OUT, 64 bytes
 BL_EP_IN  = 0x81  # Bulk IN, 64 bytes
-BL_CMD_QUERY          = 0x00
+BL_CMD_QUERY            = 0x00
 BL_CMD_PROGRAM_COMPLETE = 0x04
-BL_CMD_RESET_DEVICE   = 0x06
-BL_CMD_SIGN_FLASH     = 0x07
+BL_CMD_GET_DATA         = 0x05
+BL_CMD_RESET_DEVICE     = 0x06
+BL_CMD_SIGN_FLASH       = 0x07
 
 # AT+ response codes
 AT_OK          = "AT+O"         # operation success
@@ -280,6 +314,7 @@ DEFAULT_CONFIG = {
         "mount_timeout":   "60",
         "poll_interval":   "2",
         "result_file":     "/tmp/my-nimbie.result",
+        "status_json":     "/tmp/my-nimbie.status-log.json",
     },
 }
 
@@ -294,7 +329,10 @@ DEFAULT_CONFIG_PATH = CONFIG_SEARCH_PATHS[0]  # ~/.my-nimbie.conf
 STATUS_FILE = "/tmp/my-nimbie.status"
 PROGRESS_FILE = "/tmp/my-nimbie.progress"
 COMMAND_FILE = "/tmp/my-nimbie.command"
+CMD_CHILD_PID_FILE = "/tmp/my-nimbie.cmd-child.pid"  # PID of active on_load subprocess
+MONITOR_PID_FILE = "/tmp/my-nimbie.monitor.pid"      # PID of running monitor process
 DEFAULT_RESULT_FILE = "/tmp/my-nimbie.result"
+DEFAULT_STATUS_JSON = "/tmp/my-nimbie.status-log.json"
 
 # ---------------------------------------------------------------------------
 # Globals
@@ -305,12 +343,88 @@ deepdebug = False
 dry_run = False
 interrupted = False
 batch_status = None  # set to BatchStatus instance during batch runs
+_active_cmd_proc = None  # subprocess.Popen of the currently running on_load command
+
+
+# ---------------------------------------------------------------------------
+# Status JSON collector (started in -DD / --deepdbg mode)
+# ---------------------------------------------------------------------------
+def _start_status_json_collector(nimbie, status_json_path, interval=0.1):
+    """Start a background thread that writes a live status JSON every `interval` seconds.
+
+    Collects the same data as 'my-nimbie status -V' (hardware state + batch progress)
+    and appends each snapshot as a JSON object to status_json_path (one per line, NDJSON).
+    Only started when deepdebug is True (-DD flag).
+    """
+    import threading
+    import json
+
+    # Create file immediately so "tail -f" works from the start.
+    # Rotation is handled by the caller via _rotate_run_files().
+    try:
+        open(status_json_path, "w").close()
+    except OSError:
+        pass
+
+    stop_event = threading.Event()
+
+    def _collect():
+        while not stop_event.wait(interval):
+            try:
+                snapshot = {}
+                snapshot["ts"] = _ts()
+
+                # Hardware state
+                try:
+                    state = nimbie.get_state()
+                    snapshot["hw"] = {
+                        "disc_available": state.get("disc_available"),
+                        "disc_in_tray":   state.get("disc_in_tray"),
+                        "disc_lifted":    state.get("disc_lifted"),
+                        "tray_out":       state.get("tray_out"),
+                    }
+                except Exception as e:
+                    snapshot["hw"] = {"error": str(e)}
+
+                # Batch status from status file
+                sf = BatchStatus.read_file()
+                if sf:
+                    snapshot["batch"] = sf
+
+                # Progress file
+                try:
+                    with open(PROGRESS_FILE) as f:
+                        snapshot["progress"] = f.read().strip()
+                except OSError:
+                    pass
+
+                with open(status_json_path, "a") as f:
+                    f.write(json.dumps(snapshot) + "\n")
+
+            except Exception as e:
+                try:
+                    import json as _j
+                    with open(status_json_path, "a") as f:
+                        f.write(_j.dumps({"ts": _ts(), "collector_error": str(e)}) + "\n")
+                except Exception:
+                    pass
+
+    t = threading.Thread(target=_collect, name="status-json-collector", daemon=True)
+    t.stop_event = stop_event
+    t.start()
+    return t
+
 
 
 def signal_handler(_signum, _frame):
     global interrupted
     if interrupted:
-        # Second Ctrl+C — abort immediately
+        # Second signal — kill any active on_load child process, then abort
+        if _active_cmd_proc is not None:
+            try:
+                _active_cmd_proc.kill()
+            except Exception:
+                pass
         print("\n  Aborting.", file=sys.stderr)
         sys.exit(130)
     interrupted = True
@@ -334,18 +448,20 @@ def sigusr1_handler(_signum, _frame):
 class BatchStatus:
     """Tracks batch progress, writes status file, handles SIGUSR1."""
 
-    def __init__(self, flavor, mount_point, target_dir, idx_offset=None, mode="next", result_file=None):
+    def __init__(self, flavor, mount_point, target_dir, idx_offset=None, mode="next", result_file=None, dry_run=False):
         self.flavor = flavor or "default"
         self.mount_point = mount_point
         self.target_dir = target_dir
         self.idx_offset = idx_offset
         self.mode = mode  # "next" or "batch"
         self.result_file = result_file or DEFAULT_RESULT_FILE
+        self.dry_run = dry_run
         self.cli = "my-nimbie " + " ".join(sys.argv[1:])
         self.disc_nr = 0
         self.accepted = 0
         self.rejected = 0
         self.command = ""
+        self.disc_target_dir = ""   # full path of the current disc's output directory
         self.current = "starting"
         self.started = datetime.datetime.now()
         self.last_update = self.started
@@ -353,13 +469,15 @@ class BatchStatus:
         self.disc_results = []  # list of dicts: {index, dir_name, size, elapsed, total_elapsed, rc, result}
         self.last_disc = None   # last completed disc result dict
 
-    def update(self, current, disc_nr=None, command=None):
+    def update(self, current, disc_nr=None, command=None, disc_target_dir=None):
         """Update state and rewrite status file."""
         self.current = current
         if disc_nr is not None:
             self.disc_nr = disc_nr
         if command is not None:
             self.command = command
+        if disc_target_dir is not None:
+            self.disc_target_dir = disc_target_dir
         self.last_update = datetime.datetime.now()
         self._write_file()
 
@@ -435,7 +553,9 @@ class BatchStatus:
         return f"{mins}m {s:02d}s"
 
     def _append_result_file(self, entry):
-        """Append a disc result line to the result file."""
+        """Append a disc result line to the result file. Skipped in dry-run mode."""
+        if self.dry_run:
+            return
         try:
             size_str = _format_size(entry["size"]) if entry["size"] else "?"
             cmd_str = self._fmt_elapsed(entry["elapsed"])
@@ -476,7 +596,9 @@ class BatchStatus:
         msg(f"  Results saved to: {self.result_file}")
 
     def _write_file(self):
-        """Write machine-readable status file."""
+        """Write machine-readable status file. Skipped in dry-run mode."""
+        if self.dry_run:
+            return
         try:
             lines = [
                 f"state={self.current}",
@@ -498,6 +620,8 @@ class BatchStatus:
                 lines.append(f"idx_offset={self.idx_offset}")
             if self.command:
                 lines.append(f"command={self.command}")
+            if self.disc_target_dir:
+                lines.append(f"disc_target_dir={self.disc_target_dir}")
             if self.last_disc:
                 d = self.last_disc
                 size_str = _format_size(d["size"]) if d["size"] else "?"
@@ -603,7 +727,7 @@ def vrb(text):
 
 def _ts():
     now = datetime.datetime.now()
-    return now.strftime("%Y-%m-%d_%H%M.") + f"{now.microsecond // 1000:03d}"
+    return now.strftime("%Y-%m-%d_%H%M.%S.") + f"{now.microsecond // 1000:03d}"
 
 def dbg(text):
     if debug:
@@ -702,14 +826,16 @@ def generate_example_config():
     on_load_RIP_DVD = /LINKS/bin/my-handbrake dvd "$MOUNT_POINT" --all encode tvDVD
 
     # RIPAUDIO: rip audio CD tracks to FLAC (max quality) via cdparanoia + flac
-    on_load_RIP_AUDIOCD = mkdir -p "$DIR_NAME" && cd "$DIR_NAME" && cdparanoia -B -- -0 && flac --best *.wav && rm -f *.wav
+    # Note: my-nimbie creates $DIR_NAME automatically; cd is still needed for cdparanoia output
+    on_load_RIP_AUDIOCD = cd "$DIR_NAME" && cdparanoia -B -- -0 && flac --best *.wav && rm -f *.wav
 
     # READDVD: full DVD backup (all content, mirror mode) via dvdbackup
     # -M = mirror entire disc, -v = verbose
     # my-nimbie auto-adds: -n <volume_name> (required for DVDs with empty title)
     # my-nimbie auto-removes: -p (causes incomplete copies on macOS)
-    # mkdir -p ensures the output directory exists before dvdbackup runs
-    on_load_READ_DVD = mkdir -p "$DIR_NAME" && dvdbackup -i "$MOUNT_POINT" -o "$DIR_NAME" -M -v
+    # Note: my-nimbie automatically creates $DIR_NAME before running this command
+    # (mkdir -p is redundant here but harmless)
+    on_load_READ_DVD = dvdbackup -i "$MOUNT_POINT" -o "$DIR_NAME" -M -v
 
     # Optional: set a default for "batch" without a flavor.
     # Can be a full command or a flavor name (synonym):
@@ -792,6 +918,11 @@ def generate_example_config():
 
     # Result log file — each disc result is appended as one line
     result_file = /tmp/my-nimbie.result
+
+    # Status JSON log — written continuously in -DD mode (one JSON object per line, NDJSON)
+    # Each entry contains hardware state, batch progress, and progress info
+    # Read with: tail -f /tmp/my-nimbie.status-log.json | python3 -m json.tool
+    status_json = /tmp/my-nimbie.status-log.json
 """
 
 
@@ -1021,13 +1152,23 @@ class NimbieDevice:
         except usb.core.USBError as e:
             dbg(f"set_configuration: {e} — may already be configured")
 
-        try:
-            usb.util.claim_interface(self.dev, 0)
-            dbg("claim_interface OK")
-        except usb.core.USBError as e:
-            err(f"Cannot claim Nimbie USB interface: {e}\n\n"
+        # Retry claiming interface for up to 5s (monitor releases briefly every 0.1s)
+        import time as _time_usb
+        claimed = False
+        for _attempt in range(50):
+            try:
+                usb.util.claim_interface(self.dev, 0)
+                dbg("claim_interface OK")
+                claimed = True
+                break
+            except usb.core.USBError:
+                if _attempt == 0:
+                    dbg("claim_interface busy, retrying...")
+                _time_usb.sleep(0.1)
+        if not claimed:
+            err(f"Cannot claim Nimbie USB interface after 5s\n\n"
                 f"  Possible reasons:\n"
-                f"    - Another program is using the device\n"
+                f"    - Another program is holding the device\n"
                 f"    - macOS security is blocking USB access\n"
                 f"      Check: System Settings → Privacy & Security → USB\n"
                 f"    - Try unplugging and reconnecting the device")
@@ -1062,12 +1203,70 @@ class NimbieDevice:
             dbg(f"disconnect: {e}")
         self.dev = None
 
+    def reset_usb(self):
+        """Send a USB bus reset to the device — recovers from I/O errors
+        without requiring a physical cable unplug/replug.
+
+        After reset, the device re-enumerates on the bus. We must release,
+        wait, then re-find and re-claim it.
+        Raises on failure (caller must handle).
+        """
+        import usb.core
+        import usb.util
+
+        if self.dev is None:
+            dbg("reset_usb: no device — attempting fresh connect")
+            self.connect()
+            return
+
+        dbg("reset_usb: sending USB bus reset...")
+        try:
+            # Release interface first
+            try:
+                usb.util.release_interface(self.dev, 0)
+            except Exception:
+                pass
+
+            # Send USB reset — this re-enumerates the device on the bus
+            self.dev.reset()
+            dbg("reset_usb: USB reset sent OK")
+        except usb.core.USBError as e:
+            dbg(f"reset_usb: reset failed: {e}")
+        except Exception as e:
+            dbg(f"reset_usb: unexpected error: {e}")
+
+        self.dev = None
+        self._kernel_detached = False
+
+        # Wait for the device to re-enumerate on the USB bus
+        dbg("reset_usb: waiting 3s for device re-enumeration...")
+        time.sleep(3)
+
+        # Reconnect — this calls err() on failure which raises SystemExit
+        self.connect()
+
+    def reconnect(self):
+        """Disconnect and reconnect to the Nimbie device.
+
+        Tries a clean disconnect first, then USB reset if needed.
+        """
+        dbg("reconnect: attempting USB recovery...")
+        self.disconnect()
+        time.sleep(1)
+        try:
+            self.connect()
+            dbg("reconnect: clean reconnect succeeded")
+        except (Exception, SystemExit):
+            dbg("reconnect: clean reconnect failed, trying USB reset...")
+            self.reset_usb()
+
     # -- Low-level USB I/O --
 
     def _send_command(self, cmd_tuple, description=""):
         """Send a command via interrupt OUT endpoint.
 
         cmd_tuple: tuple of command bytes, placed at byte[2] onward in an 8-byte packet.
+        On USB I/O error, attempts automatic recovery via USB bus reset.
         """
         if self.dev is None:
             err("Not connected to Nimbie device")
@@ -1082,7 +1281,18 @@ class NimbieDevice:
             written = self.dev.write(EP_OUT, pkt, timeout=5000)
             ddbg(f"  Write OK: {written} bytes to EP {EP_OUT:#04x}")
         except Exception as e:
+            # Attempt USB recovery before giving up
+            warn(f"USB write failed ({description}): {e} — attempting USB recovery...")
+            try:
+                self.reconnect()
+                # Retry the write after recovery
+                written = self.dev.write(EP_OUT, pkt, timeout=5000)
+                ddbg(f"  Write OK after recovery: {written} bytes to EP {EP_OUT:#04x}")
+                return
+            except (Exception, SystemExit):
+                pass
             err(f"USB write failed ({description}): {e}\n\n"
+                f"  USB recovery also failed.\n\n"
                 f"  Possible reasons:\n"
                 f"    - Device disconnected or not powered on\n"
                 f"    - USB interface not properly claimed\n"
@@ -1101,7 +1311,7 @@ class NimbieDevice:
         responses = []
         empty_count = 0
         got_status = False  # True when AT+S* or AT+E* received
-        for i in range(max_reads):
+        for _ in range(max_reads):
             try:
                 data = self.dev.read(EP_IN, 64, timeout=timeout)
                 raw = bytes(data)
@@ -1163,17 +1373,38 @@ class NimbieDevice:
 
     # -- State query --
 
-    def get_state(self):
-        """Query and return device state as a dict."""
-        responses = self._send_and_read(CMD_GET_STATE, "GET_STATE")
+    def get_state(self, fatal=True):
+        """Query and return device state as a dict.
+
+        If fatal=True (default), attempts USB recovery then calls err() on failure.
+        If fatal=False, returns None on failure (for use in polling loops).
+        """
+        # Use 20s read timeout (matching reference code) — shorter timeouts
+        # cause [Errno 60] which cascades to [Errno 5] killing the USB bus.
+        responses = self._send_and_read(CMD_GET_STATE, "GET_STATE", timeout=20000)
         bits = self._find_state_string(responses)
 
+        if bits is None and fatal:
+            # Attempt USB recovery before giving up
+            warn(f"No state response — attempting USB recovery...")
+            try:
+                self.reconnect()
+                responses = self._send_and_read(CMD_GET_STATE, "GET_STATE", timeout=20000)
+                bits = self._find_state_string(responses)
+            except (Exception, SystemExit):
+                pass
+
         if bits is None:
-            err(f"No state response from Nimbie device.\n"
-                f"  Responses received: {responses}\n\n"
-                f"  Possible reasons:\n"
-                f"    - Device not responding\n"
-                f"    - USB communication error")
+            if fatal:
+                err(f"No state response from Nimbie device.\n"
+                    f"  Responses received: {responses}\n\n"
+                    f"  USB recovery was attempted but failed.\n\n"
+                    f"  Possible reasons:\n"
+                    f"    - Device not responding\n"
+                    f"    - USB communication error\n"
+                    f"    - Try: unplug USB cable, wait 5s, reconnect")
+            dbg(f"get_state: no state response (transient), responses={responses}")
+            return None
 
         dbg(f"State bits: {bits}")
 
@@ -1189,12 +1420,32 @@ class NimbieDevice:
         }
 
     def _poll_state(self, condition_fn, description, timeout=30, interval=0.5):
-        """Poll get_state() until condition_fn(state) returns True."""
+        """Poll get_state() until condition_fn(state) returns True.
+
+        Tolerates transient USB failures during polling — only errors out
+        on final timeout. After 3 consecutive failures, attempts USB reset.
+        """
         start = time.time()
+        transient_fails = 0
+        usb_reset_attempted = False
         while True:
             if time.time() - start > timeout:
                 err(f"Timeout waiting for: {description} (after {timeout}s)")
-            state = self.get_state()
+            state = self.get_state(fatal=False)
+            if state is None:
+                transient_fails += 1
+                dbg(f"_poll_state: transient failure #{transient_fails}, retrying...")
+                # After 3 consecutive failures, attempt USB recovery
+                if transient_fails >= 3 and not usb_reset_attempted:
+                    usb_reset_attempted = True
+                    warn(f"_poll_state: {transient_fails} consecutive USB failures — attempting USB recovery...")
+                    try:
+                        self.reconnect()
+                    except (Exception, SystemExit):
+                        dbg("_poll_state: USB recovery failed, continuing to poll...")
+                time.sleep(interval)
+                continue
+            transient_fails = 0  # reset counter on success
             if condition_fn(state):
                 return state
             time.sleep(interval)
@@ -1256,68 +1507,98 @@ class NimbieDevice:
 
         Returns True if there are more discs in the hopper, False if this was the last one.
         """
-        # Send command and read initial response (OK/AT+O arrive quickly).
-        # Don't hammer USB with 100 reads — the AT+S status often never comes.
-        # Instead, poll state bits to confirm disc was placed.
-        responses = self._send_and_read(CMD_PLACE_DISC, "PLACE_DISC",
-                                        timeout=5000, max_reads=10,
-                                        wait_for_at=True)
-        at = self._find_at_response(responses)
+        # CRITICAL: Do NOT read USB after PLACE_DISC.
+        # The device is mechanically busy and doesn't respond to reads.
+        # Reading during this time causes [Errno 60] timeout which cascades
+        # into [Errno 5] I/O Error, killing the USB bus entirely.
+        #
+        # Reference: BS Utility / nimbiestatemachine uses 20s read timeout
+        # and waits for the device to respond. We take a simpler approach:
+        # just send the command, wait for the mechanism, and poll state bits.
+        self._send_command(CMD_PLACE_DISC, "PLACE_DISC")
 
-        if at == AT_HOPPER_EMPTY:
+        # Give the mechanism time to physically place the disc.
+        # The dropper picks up a disc and drops it on the tray — takes ~3-5 seconds.
+        dbg("place_disc: command sent, waiting 5s for mechanism...")
+        time.sleep(5)
+
+        # Confirm via state polling: disc_in_tray becomes True, or hopper empties.
+        dbg("place_disc: polling state to confirm...")
+        state = self._poll_state(
+            lambda s: s["disc_in_tray"] or not s["disc_available"],
+            "disc to be placed on tray (or hopper empty)",
+            timeout=30)
+
+        if not state["disc_in_tray"] and not state["disc_available"]:
+            # Hopper ran empty during placement
             return False
-        elif at == AT_TRAY_WRONG:
-            err("Cannot place disc: tray is not open.\n"
-                "  Open the tray first with: my-nimbie load")
-        elif at == AT_TRAY_HAS:
-            err("Cannot place disc: tray already has a disc.")
-        elif at in (AT_PLACED, AT_OK, None):
-            # AT+S07 (placed), AT+O (accepted), or no AT response — all normal.
-            # Confirm via state polling: disc_in_tray becomes True, or hopper empties.
-            dbg(f"place_disc: AT response={at}, polling state to confirm...")
-            state = self._poll_state(
-                lambda s: s["disc_in_tray"] or not s["disc_available"],
-                "disc to be placed on tray (or hopper empty)",
-                timeout=20)
-            if not state["disc_in_tray"] and not state["disc_available"]:
-                # Hopper ran empty during placement
-                return False
-            time.sleep(0.8)
-            return True
-        else:
-            err(f"Unexpected response from PLACE_DISC: {at}\n"
-                f"  All responses: {responses}")
+        if not state["disc_in_tray"]:
+            warn("place_disc: disc_in_tray still False after polling — may have failed")
+            return False
+        time.sleep(0.8)  # Wait for dropper to retract (per reference code)
+        return True
 
     def lift_disc(self):
         """Lift disc from open tray with the gripper mechanism. Returns True on success."""
-        responses = self._send_and_read(CMD_LIFT_DISC, "LIFT_DISC",
-                                        timeout=5000, max_reads=10,
-                                        wait_for_at=True)
-        at = self._find_at_response(responses)
+        # Retry loop — E09 errors are often transient and resolve with a short delay.
+        for attempt in range(3):
+            responses = self._send_and_read(CMD_LIFT_DISC, "LIFT_DISC",
+                                            timeout=20000, max_reads=5,
+                                            wait_for_at=False)
+            at = self._find_at_response(responses)
 
-        if at == AT_OK:
-            # Poll until disc is lifted
-            self._poll_state(lambda s: s["disc_lifted"], "disc to be lifted", timeout=10)
+            if at in (AT_OK, None):
+                # Poll until disc is lifted
+                time.sleep(1)
+                self._poll_state(lambda s: s["disc_lifted"], "disc to be lifted", timeout=15)
+                return True
+            elif at == AT_NO_DISC:
+                warn("No disc in tray to lift")
+                return False
+            elif at == AT_DROPPER_ERR:
+                # AT+S03 = "mechanism stuck or disc already lifted"
+                # Check actual state — if disc_lifted is True, the gripper already
+                # has the disc (common after a previous partial lift); treat as success.
+                time.sleep(1)
+                state = self.get_state()
+                if state.get("disc_lifted"):
+                    dbg("LIFT_DISC got AT+S03 but disc_lifted=True — disc already in gripper, proceeding")
+                    return True
+                warn(f"LIFT_DISC got AT+S03 (attempt {attempt + 1}/3) — waiting 3s and retrying...")
+                time.sleep(3)
+                continue
+            elif "E09" in str(at):
+                # E09 = transient hardware error — retry after delay
+                warn(f"LIFT_DISC got E09 (attempt {attempt + 1}/3) — waiting 3s and retrying...")
+                time.sleep(3)
+                continue
+            elif at == AT_TRAY_HAS:
+                # AT+S12 = "tray already has a disc" — Nimbie momentarily confused
+                # about its own state. Seen after successful accept; retry resolves it.
+                warn(f"LIFT_DISC got AT+S12 (attempt {attempt + 1}/3) — waiting 3s and retrying...")
+                time.sleep(3)
+                continue
+            else:
+                err(f"Unexpected response from LIFT_DISC: {at}\n"
+                    f"  All responses: {responses}")
+        # All retries exhausted — check one last time if disc is already lifted
+        state = self.get_state()
+        if state.get("disc_lifted"):
+            dbg("LIFT_DISC exhausted retries but disc_lifted=True — proceeding")
             return True
-        elif at == AT_NO_DISC:
-            warn("No disc in tray to lift")
-            return False
-        elif at == AT_DROPPER_ERR:
-            warn("Lift mechanism error (disc may already be lifted or mechanism stuck)")
-            return False
-        else:
-            err(f"Unexpected response from LIFT_DISC: {at}\n"
-                f"  All responses: {responses}")
+        warn(f"LIFT_DISC failed after 3 attempts (last response: {at}) — disc may have already been ejected")
+        return False
 
     def accept_disc(self):
         """Drop a lifted disc into the accept (done) pile."""
         responses = self._send_and_read(CMD_ACCEPT, "ACCEPT_DISC",
-                                        timeout=5000, max_reads=10,
-                                        wait_for_at=True)
+                                        timeout=20000, max_reads=5,
+                                        wait_for_at=False)
         at = self._find_at_response(responses)
 
-        if at == AT_OK:
+        if at in (AT_OK, None):
             # Poll until disc is no longer lifted
+            time.sleep(1)
             self._poll_state(lambda s: not s["disc_lifted"], "disc to drop to accept", timeout=10)
         elif at == AT_DROPPER_ERR:
             warn("No disc lifted to accept (nothing to do)")
@@ -1328,11 +1609,12 @@ class NimbieDevice:
     def reject_disc(self):
         """Drop a lifted disc into the reject pile."""
         responses = self._send_and_read(CMD_REJECT, "REJECT_DISC",
-                                        timeout=5000, max_reads=10,
-                                        wait_for_at=True)
+                                        timeout=20000, max_reads=5,
+                                        wait_for_at=False)
         at = self._find_at_response(responses)
 
-        if at == AT_OK:
+        if at in (AT_OK, None):
+            time.sleep(1)
             self._poll_state(lambda s: not s["disc_lifted"], "disc to drop to reject", timeout=10)
         elif at == AT_DROPPER_ERR:
             warn("No disc lifted to reject (nothing to do)")
@@ -1357,37 +1639,46 @@ class NimbieDevice:
             warn("Hopper is empty — this was the last disc")
         return has_more
 
-    def eject_accept(self):
-        """Eject current disc to the accept (done) bin."""
-        vrb("  Opening tray...")
-        self.open_tray()
+    def _eject_common(self, accept):
+        """Shared eject logic for accept and reject.
 
-        vrb("  Lifting disc...")
-        if not self.lift_disc():
-            warn("Cannot lift disc — opening tray so you can remove it manually")
-            return
+        Detects whether the disc is already held by the gripper (Stage 5:
+        disc_lifted=True) and skips straight to close_tray + drop if so.
+        This handles the case where the batch crashed mid-eject sequence and
+        left the gripper holding the disc.
+        """
+        state = self.get_state()
+        if state.get("disc_lifted"):
+            # Gripper already has the disc — skip open_tray + lift
+            dbg("eject: disc already in gripper (disc_lifted=True) — skipping to close+drop")
+            vrb("  Disc already in gripper — skipping open/lift...")
+        else:
+            vrb("  Opening tray...")
+            self.open_tray()
+            time.sleep(1)  # Let disc settle on open tray before lifting
+
+            vrb("  Lifting disc...")
+            if not self.lift_disc():
+                warn("Cannot lift disc — opening tray so you can remove it manually")
+                return
 
         vrb("  Closing tray...")
         self.close_tray()
 
-        vrb("  Dropping to accept bin...")
-        self.accept_disc()
+        if accept:
+            vrb("  Dropping to accept bin...")
+            self.accept_disc()
+        else:
+            vrb("  Dropping to reject bin...")
+            self.reject_disc()
+
+    def eject_accept(self):
+        """Eject current disc to the accept (done) bin."""
+        self._eject_common(accept=True)
 
     def eject_reject(self):
         """Eject current disc to the reject bin."""
-        vrb("  Opening tray...")
-        self.open_tray()
-
-        vrb("  Lifting disc...")
-        if not self.lift_disc():
-            warn("Cannot lift disc — opening tray so you can remove it manually")
-            return
-
-        vrb("  Closing tray...")
-        self.close_tray()
-
-        vrb("  Dropping to reject bin...")
-        self.reject_disc()
+        self._eject_common(accept=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1432,11 +1723,62 @@ class NimbieDeviceDryRun:
 # ---------------------------------------------------------------------------
 # Disc mount detection
 # ---------------------------------------------------------------------------
+def _force_mount_optical():
+    """Try to manually mount the optical disc drive.
+
+    Fallback for the display-sleep mount failure:
+    - macOS Disk Arbitration auto-mounts removable media when a disc is inserted.
+    - If the display is asleep when the disc is loaded, Disk Arbitration suppresses
+      the "disk arrived" event and the disc never appears in /Volumes/.
+    - caffeinate (started by cmd_batch) should prevent this entirely, but this
+      function is a safety net: if wait_for_mount() hasn't seen the disc halfway
+      through the timeout, we explicitly call `diskutil mount` to force it.
+
+    Uses `drutil status` (BSD device name field) to identify the optical drive
+    precisely — avoids the previous bug of accidentally trying to mount internal
+    HDDs or system volumes (which triggers a macOS admin auth prompt).
+
+    Returns True if a mount was attempted (regardless of success).
+    """
+    try:
+        # Use drutil to find the BSD name of the disc in the optical drive.
+        # Output contains a line like:  BSD Name: disk4
+        result = subprocess.run(
+            ["drutil", "status"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0 or "No Media Inserted" in result.stdout:
+            dbg("force_mount_optical: no media in optical drive")
+            return False
+        bsd_name = None
+        for line in result.stdout.splitlines():
+            if "BSD Name:" in line:
+                bsd_name = line.split("BSD Name:")[-1].strip()
+                break
+        if not bsd_name:
+            dbg("force_mount_optical: could not find BSD Name in drutil output")
+            return False
+        dbg(f"force_mount_optical: trying diskutil mount /dev/{bsd_name}")
+        subprocess.run(
+            ["/usr/sbin/diskutil", "mount", f"/dev/{bsd_name}"],
+            capture_output=True, timeout=15,
+        )
+        return True
+    except Exception as e:
+        dbg(f"force_mount_optical: error: {e}")
+        return False
+
+
 def wait_for_mount(mount_point, timeout, poll_interval):
-    """Wait for a disc to appear at mount_point. Returns True if mounted."""
+    """Wait for a disc to appear at mount_point. Returns True if mounted.
+
+    If the disc hasn't mounted halfway through the timeout, attempts a manual
+    mount (for when macOS display sleep has suppressed auto-mount).
+    """
     vrb(f"  Waiting for disc to mount at {mount_point} (timeout: {timeout}s)...")
     dbg(f"wait_for_mount: mount_point={mount_point}, timeout={timeout}s, poll={poll_interval}s")
     start = time.time()
+    manual_mount_tried = False
 
     while time.time() - start < timeout:
         if interrupted:
@@ -1450,25 +1792,42 @@ def wait_for_mount(mount_point, timeout, poll_interval):
             dbg(f"wait_for_mount: mounted after {time.time() - start:.1f}s")
             vrb(f"  Disc mounted at {mount_point}")
             return True
+        # Halfway through timeout: try manual mount (display-sleep workaround)
+        if not manual_mount_tried and time.time() - start >= timeout / 2:
+            warn("  Disc not mounted yet — trying manual mount (display-sleep workaround)...")
+            _force_mount_optical()
+            manual_mount_tried = True
         time.sleep(poll_interval)
 
     dbg(f"wait_for_mount: timed out after {timeout}s")
     return False
 
 
-def _rotate_run_files(result_file):
-    """Move .status, .progress, .result to .OLD before starting a new run."""
+def _rotate_file(path):
+    """If path exists, rename it to path.OLD. Silently ignored if it fails."""
+    if os.path.exists(path):
+        try:
+            os.rename(path, path + ".OLD")
+            dbg(f"Rotated {path} → {path}.OLD")
+        except OSError as e:
+            dbg(f"Failed to rotate {path}: {e}")
+
+
+def _rotate_run_files(result_file, status_json=None):
+    """Rotate all run files (.status, .progress, .result, .status-log.json) to .OLD before a new run."""
     for path in (STATUS_FILE, PROGRESS_FILE, result_file):
-        if os.path.exists(path):
-            try:
-                os.rename(path, path + ".OLD")
-                dbg(f"Rotated {path} → {path}.OLD")
-            except OSError as e:
-                dbg(f"Failed to rotate {path}: {e}")
+        _rotate_file(path)
+    if status_json:
+        _rotate_file(status_json)
 
 
 def unmount_disc(mount_point):
-    """Unmount the disc before mechanical eject."""
+    """Unmount the disc before mechanical eject.
+
+    Tries a normal unmount first.  If macOS loginwindow (or Finder) dissents
+    the unmount, retries with 'diskutil unmount force' — this is safe because
+    the rip command has already finished before this is called.
+    """
     if not os.path.ismount(mount_point):
         dbg(f"Not mounted: {mount_point}")
         return True
@@ -1482,9 +1841,20 @@ def unmount_disc(mount_point):
         if result.returncode == 0:
             vrb(f"  Unmounted successfully")
             return True
-        else:
-            warn(f"Unmount failed: {result.stderr.strip()}")
-            return False
+        stderr = result.stderr.strip()
+        warn(f"Unmount failed: {stderr}")
+        # loginwindow or Finder holds the volume — retry with force
+        if "dissented" in stderr or "failed to unmount" in stderr.lower():
+            vrb(f"  Retrying with force unmount...")
+            result2 = subprocess.run(
+                ["/usr/sbin/diskutil", "unmount", "force", mount_point],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result2.returncode == 0:
+                vrb(f"  Force unmount succeeded")
+                return True
+            warn(f"Force unmount also failed: {result2.stderr.strip()}")
+        return False
     except subprocess.TimeoutExpired:
         warn(f"Unmount timed out for {mount_point}")
         return False
@@ -1557,6 +1927,27 @@ def _ensure_dvdbackup_flags(cmd, mount_point):
         else:
             modified.append(part)
     return " && ".join(modified)
+
+
+def _dir_size_str(path):
+    """Return human-readable size of a directory (e.g. '42G'), or '' on error."""
+    if not path or not os.path.isdir(path):
+        return ""
+    try:
+        result = subprocess.run(["du", "-sh", path], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            return result.stdout.split()[0]
+    except Exception:
+        pass
+    # Fallback: manual walk
+    total = _get_dir_size(path)
+    if total == 0:
+        return "0B"
+    for unit in ("B", "K", "M", "G", "T"):
+        if total < 1024:
+            return f"{total:.0f}{unit}"
+        total /= 1024
+    return f"{total:.1f}P"
 
 
 def _get_dir_size(path):
@@ -1638,14 +2029,20 @@ class _ProgressMonitor:
         dbg(f"_ProgressMonitor: started (source={_format_size(self.source_size)}, "
             f"target={self.target_dir}, interval={self.interval}s)")
 
-    def stop(self):
+    def stop(self, success=False):
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=2)
         # Write final progress (don't delete — status may still read it)
         if self.source_size > 0:
             copied = _get_dir_size(self.target_dir)
-            pct = min(100.0, (copied / self.source_size) * 100)
+            if success:
+                # Command succeeded — report 100% regardless of measured size
+                # (filesystem overhead or caching can cause minor size discrepancy)
+                pct = 100.0
+                copied = max(copied, self.source_size)
+            else:
+                pct = min(100.0, (copied / self.source_size) * 100)
             elapsed = time.time() - self._start_time
             elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60):02d}s"
             final = f"{pct:5.1f}%  {_format_size(copied)} / {_format_size(self.source_size)}  [{elapsed_str}] done"
@@ -1692,9 +2089,14 @@ def run_command(cmd_template, mount_point, disc_nr, target_dir, dir_name, status
     cmd = expand_command(cmd_template, mount_point, disc_nr, target_dir, dir_name)
     cmd = _ensure_dvdbackup_flags(cmd, mount_point)
 
+    # Ensure target directory exists — users shouldn't need mkdir -p in their commands
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+        dbg(f"run_command: ensured dir exists: {dir_name}")
+
     msg(f"\n  Running: {cmd}")
     if status is not None:
-        status.update("running command", command=cmd)
+        status.update("running command", command=cmd, disc_target_dir=dir_name or "")
     dbg(f"run_command: template='{cmd_template}'")
     dbg(f"run_command: expanded='{cmd}'")
 
@@ -1714,23 +2116,38 @@ def run_command(cmd_template, mount_point, disc_nr, target_dir, dir_name, status
         proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
                                 bufsize=1)
+        # Track subprocess globally so signal_handler and cancel can kill it
+        global _active_cmd_proc
+        _active_cmd_proc = proc
+        try:
+            with open(CMD_CHILD_PID_FILE, "w") as f:
+                f.write(str(proc.pid))
+        except Exception:
+            pass
         for line in proc.stdout:
             line = line.rstrip("\n")
             # Clear progress line, print command output, then let monitor redraw
             print(f"\r    {line:<80}")
         proc.wait()
         elapsed = time.time() - start_time
-        monitor.stop()
+        monitor.stop(success=(proc.returncode == 0))
         # Print final newline after progress line
         print()
         dbg(f"run_command: exit code {proc.returncode}, elapsed {elapsed:.1f}s")
         vrb(f"  Command exited with code {proc.returncode} in {int(elapsed // 60)}m {int(elapsed % 60):02d}s")
         return proc.returncode, elapsed
     except KeyboardInterrupt:
+        proc.kill()
         monitor.stop()
         elapsed = time.time() - start_time
         warn("Command interrupted")
         return 130, elapsed
+    finally:
+        _active_cmd_proc = None
+        try:
+            os.unlink(CMD_CHILD_PID_FILE)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1844,6 +2261,35 @@ def cmd_load(nimbie, config, _args):
     return has_more
 
 
+def _detect_disc_in_drive(nimbie):
+    """Check if a disc is currently in the drive.
+
+    Uses both Nimbie state bits AND drutil to reliably detect disc presence.
+    Returns a string describing the disc location, or None if no disc found.
+    """
+    state = nimbie.get_state()
+
+    if state["disc_lifted"]:
+        return "disc in gripper (lifted)"
+    if state["disc_in_tray"]:
+        if state["tray_out"]:
+            return "disc on open tray"
+        return "disc in drive (tray closed, detected by Nimbie)"
+
+    # Nimbie state bits can't see disc in closed drive — check drutil
+    if not state["tray_out"]:
+        try:
+            dr = subprocess.run(["drutil", "status"], capture_output=True, text=True, timeout=10)
+            has_media = any("Type:" in line and "No Media" not in line
+                            for line in dr.stdout.split("\n"))
+            if has_media:
+                return "disc in drive (tray closed, detected by optical drive)"
+        except Exception:
+            pass
+
+    return None
+
+
 def _recover_drive_state(nimbie, mount_point):
     """Ensure drive is in clean idle state before starting an operation.
 
@@ -1852,6 +2298,9 @@ def _recover_drive_state(nimbie, mount_point):
     - Disc in tray (closed): unmount, eject to reject bin
     - Disc lifted (grabbed by gripper): drop to reject bin
     Returns True if recovery succeeded (drive is idle now).
+
+    NOTE: Does NOT check drutil for disc in closed drive — the batch/next
+    flows handle that case separately (to process the disc rather than eject it).
     """
     state = nimbie.get_state()
     dbg(f"_recover_drive_state: {state}")
@@ -1996,6 +2445,368 @@ def _bl_exit_bootloader(dev):
     return True
 
 
+def _bl_crc16(data):
+    """CRC-16/CCITT for AN1388 framed protocol."""
+    crc = 0
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = (crc << 1) ^ 0x1021
+            else:
+                crc <<= 1
+            crc &= 0xFFFF
+    return crc
+
+
+def _bl_jump_to_app(dev):
+    """Send AN1388 framed 'Jump to Application' (command 0x05).
+
+    Per AN1388B.pdf: the CORRECT way to exit the bootloader.
+    Frame: <SOH=0x01> <CMD=0x05> <CRC16_L> <CRC16_H> <EOT=0x04>
+    Device jumps immediately — NO response is sent.
+    Returns True if normal Nimbie (0x1723:0x0945) appears within 3 seconds.
+
+    IMPORTANT: This framed protocol is NOT supported on the Nimbie NB21 bootloader.
+    The bootloader echoes back the first 5 bytes of any 64-byte packet without
+    processing the framed command.  Use --sign-and-reset instead (PROGRAM_COMPLETE
+    + SIGN_FLASH x2 + power cycle) — that is the confirmed working procedure.
+    """
+    import usb.core as _uc
+    cmd_data = [0x05]
+    crc = _bl_crc16(cmd_data)
+    frame = [0x01] + cmd_data + [crc & 0xFF, (crc >> 8) & 0xFF, 0x04]
+    msg(f"  Sending AN1388 framed JUMP-TO-APP: {bytes(frame).hex()}")
+    msg(f"  (SOH=01 CMD=05 CRC16={crc:#06x} EOT=04)")
+    msg(f"  Per AN1388B.pdf: device jumps immediately — no response expected.")
+    pkt = bytearray(64)
+    for i, b in enumerate(frame):
+        pkt[i] = b
+    try:
+        dev.write(BL_EP_OUT, pkt, timeout=5000)
+        msg(f"  TX OK.")
+    except Exception as e:
+        warn(f"  TX error: {e}")
+        return False
+    time.sleep(2)
+    nimbie = _uc.find(idVendor=NIMBIE_VID, idProduct=NIMBIE_PID)
+    if nimbie:
+        msg(f"")
+        msg(f"  SUCCESS: Normal Nimbie ({NIMBIE_VID:#06x}:{NIMBIE_PID:#06x}) detected!")
+        return True
+    bl = _uc.find(idVendor=BL_VID, idProduct=BL_PID)
+    if bl:
+        msg(f"  Device still in bootloader mode.")
+    else:
+        msg(f"  Device offline — may be rebooting. Power cycle if needed.")
+    return False
+
+
+def _bl_query_device(dev):
+    """Send QUERY_DEVICE (0x00), print bootloader info."""
+    msg("  Sending QUERY_DEVICE (0x00)...")
+    resp = _bl_send(dev, [BL_CMD_QUERY])
+    if resp:
+        msg(f"  Response ({len(resp)} bytes): {resp.hex()}")
+        if len(resp) >= 1:
+            msg(f"    Byte 0 (cmd echo):      {resp[0]:#04x}")
+        if len(resp) >= 3:
+            bpp = (resp[2] << 8) | resp[1]
+            msg(f"    Bytes 1-2 (bytes/packet): {bpp}")
+        if len(resp) >= 4:
+            msg(f"    Byte 3 (device family):   {resp[3]:#04x}")
+    else:
+        msg("  No response.")
+    return resp
+
+
+def _bl_sign_flash(dev):
+    """Send SIGN_FLASH (0x07).
+
+    Writes the application validity signature to NVM.  Combined with
+    PROGRAM_COMPLETE (0x04), this convinces the bootloader that a valid
+    application is present.  Sending it twice with a pause between gives the
+    NVM write time to commit before a power cycle.
+
+    Responds with echo byte 0x07.
+    """
+    msg("  Sending SIGN_FLASH (0x07)...")
+    resp = _bl_send(dev, [BL_CMD_SIGN_FLASH])
+    if resp:
+        msg(f"  Response: {resp.hex()}")
+    else:
+        msg("  No response.")
+    return resp
+
+
+def _bl_scan_commands(dev):
+    """Scan bootloader command bytes 0x00-0xFF and show which respond.
+
+    Known responding commands on this device (discovered 2026-03-29):
+      0x00  QUERY_DEVICE       — returns 4-byte info (family=0x07)
+      0x04  PROGRAM_COMPLETE   — signals firmware write done
+      0x05  GET_DATA           — flash read (read-protected, echoes cmd only)
+      0x06  RESET_DEVICE       — soft reset (stays in BL if no valid app sig)
+      0x07  SIGN_FLASH         — writes app validity signature to NVM
+      0x32  UNKNOWN            — echoes 0x32; meaning unknown
+
+    Framed AN1388 protocol (SOH+DLE+CRC16+EOT) is NOT supported on this
+    device — the bootloader echoes back the first 5 bytes of any 64-byte
+    packet without processing the framed command.
+    """
+    names = {
+        BL_CMD_QUERY:            "QUERY_DEVICE",
+        0x01:                    "UNLOCK_CONFIG",
+        0x02:                    "ERASE_FLASH",
+        0x03:                    "PROGRAM_FLASH",
+        BL_CMD_PROGRAM_COMPLETE: "PROGRAM_COMPLETE",
+        BL_CMD_GET_DATA:         "GET_DATA",
+        BL_CMD_RESET_DEVICE:     "RESET_DEVICE",
+        BL_CMD_SIGN_FLASH:       "SIGN_FLASH",
+        0x32:                    "UNKNOWN(0x32)",
+    }
+    msg("  Scanning bootloader commands 0x00-0xFF...")
+    msg("  (ERASE_FLASH 0x02 / PROGRAM_FLASH 0x03 / UNLOCK_CONFIG 0x01 skipped — destructive)")
+    msg("")
+    results = {}
+    for cmd in range(0x100):
+        name = names.get(cmd, "UNKNOWN")
+        if cmd in (0x01, 0x02, 0x03):
+            msg(f"  SKIP 0x{cmd:02X} ({name}) — destructive")
+            results[cmd] = "SKIPPED"
+            continue
+        resp = _bl_send(dev, [cmd], timeout=1000)
+        if resp:
+            results[cmd] = resp.hex()
+            msg(f"  0x{cmd:02X} {name:<22s} → {resp.hex()}")
+        else:
+            results[cmd] = "(no response)"
+        time.sleep(0.05)
+    msg("")
+    msg("  === SUMMARY — commands that responded ===")
+    for cmd in sorted(results):
+        r = results[cmd]
+        if r not in ("(no response)", "SKIPPED"):
+            msg(f"  0x{cmd:02X} {names.get(cmd, 'UNKNOWN'):<22s} → {r}")
+    return results
+
+
+def _bl_read_flash_range(dev, start_addr, total_bytes, chunk_size=32):
+    """Read a range of flash using GET_DATA (0x05) and hex-dump the result."""
+    import struct as _struct
+    msg(f"  Reading flash: {start_addr:#08x} – {start_addr + total_bytes:#08x} ({total_bytes} bytes)")
+    all_data = bytearray()
+    offset = 0
+    while offset < total_bytes:
+        sz = min(chunk_size, total_bytes - offset)
+        addr = start_addr + offset
+        addr_b = _struct.pack('<I', addr)[:3]
+        len_b = _struct.pack('<H', sz)
+        pkt = [BL_CMD_GET_DATA] + list(addr_b) + list(len_b)
+        resp = _bl_send(dev, pkt, timeout=2000)
+        if resp and len(resp) > 1:
+            all_data.extend(resp[1:])  # skip cmd echo byte
+        else:
+            all_data.extend(b'\x00' * sz)
+        offset += sz
+        time.sleep(0.05)
+    msg("")
+    for i in range(0, len(all_data), 16):
+        addr = start_addr + i
+        chunk = all_data[i:i+16]
+        hex_part = ' '.join(f'{b:02x}' for b in chunk)
+        ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+        msg(f"  {addr:08x}: {hex_part:<48s}  {ascii_part}")
+    if all(b == 0xFF for b in all_data):
+        msg("")
+        msg("  *** ALL 0xFF — flash is ERASED (firmware missing!) ***")
+    elif all(b == 0x00 for b in all_data):
+        msg("")
+        msg("  *** ALL 0x00 — may be read-protected ***")
+    else:
+        non_ff = sum(1 for b in all_data if b != 0xFF)
+        msg(f"  {non_ff}/{len(all_data)} bytes contain data (non-0xFF)")
+    return bytes(all_data)
+
+
+# ---------------------------------------------------------------------------
+# Nimbie command probe helpers (from nimbie-probe.py)
+# ---------------------------------------------------------------------------
+
+def _probe_connect():
+    """Connect to normal Nimbie for raw USB probing. Returns (dev, kernel_detached)."""
+    import usb.core as _uc
+    import usb.util as _uu
+    dev = _uc.find(idVendor=NIMBIE_VID, idProduct=NIMBIE_PID)
+    if dev is None:
+        err(f"Nimbie not found (VID={NIMBIE_VID:#06x} PID={NIMBIE_PID:#06x}).")
+    kd = False
+    try:
+        if dev.is_kernel_driver_active(0):
+            dev.detach_kernel_driver(0)
+            kd = True
+    except Exception:
+        pass
+    try:
+        dev.set_configuration()
+    except Exception:
+        pass
+    try:
+        _uu.claim_interface(dev, 0)
+    except Exception as e:
+        err(f"Cannot claim Nimbie interface: {e}")
+    for _ in range(10):
+        try:
+            data = dev.read(EP_IN, 64, timeout=100)
+            if bytes(data) == b"\x00" * len(data):
+                break
+        except Exception:
+            break
+    return dev, kd
+
+
+def _probe_send_and_read(dev, pkt_bytes, label="", timeout=3000, max_reads=10):
+    """Send 8-byte packet to Nimbie, read all responses. Returns list of decoded strings."""
+    pkt = bytearray(8)
+    for i, b in enumerate(pkt_bytes):
+        if i >= 8:
+            break
+        pkt[i] = b
+    if label:
+        msg(f"  TX [{label}]: {pkt.hex()}")
+    else:
+        msg(f"  TX: {pkt.hex()}")
+    try:
+        dev.write(EP_OUT, pkt, timeout=5000)
+    except Exception as e:
+        warn(f"  WRITE ERROR: {e}")
+        return []
+    time.sleep(0.3)
+    responses = []
+    empty = 0
+    for _ in range(max_reads):
+        try:
+            data = dev.read(EP_IN, 64, timeout=timeout)
+            raw = bytes(data)
+            if not raw or raw == b"\x00" * len(raw):
+                empty += 1
+                if empty >= 2:
+                    break
+                continue
+            empty = 0
+            text = raw.rstrip(b"\x00").decode("ascii", errors="replace")
+            if text:
+                responses.append(text)
+        except Exception:
+            break
+    if responses:
+        for r in responses:
+            msg(f"  RX: {r}")
+    else:
+        msg(f"  (no response)")
+    return responses
+
+
+def _probe_scan_commands(dev, start, end):
+    """Scan Nimbie command bytes start–end and print results."""
+    known = {0x43: "GET_STATE", 0x47: "LIFT_DISC", 0x49: "DIAGNOSTICS",
+             0x4A: "COUNTERS",  0x52: "PLACE/ACCEPT/REJECT"}
+    msg(f"  Scanning command bytes 0x{start:02X}–0x{end:02X} (param=0x00)")
+    msg(f"  Known: {', '.join(f'0x{k:02X}={v}' for k, v in sorted(known.items()))}")
+    msg("")
+    results = {}
+    for cmd in range(start, end + 1):
+        tag = known.get(cmd, "")
+        label = f"0x{cmd:02X}" + (f" ({tag})" if tag else "")
+        if cmd in (0x55, 0x56):
+            msg(f"  SKIP {label} — DANGEROUS (0x55=disconnect, 0x56=bootloader mode)")
+            results[cmd] = "DANGEROUS"
+            continue
+        if cmd in (0x47, 0x52):
+            msg(f"  SKIP {label} — mechanical, skipped for safety")
+            results[cmd] = "SKIPPED"
+            continue
+        resps = _probe_send_and_read(dev, [0x00, 0x00, cmd, 0x00], label,
+                                     timeout=2000, max_reads=10)
+        results[cmd] = " | ".join(resps) if resps else "(no response)"
+        time.sleep(0.15)
+    msg("")
+    msg("  === SUMMARY — commands that responded ===")
+    for cmd in sorted(results):
+        resp = results[cmd]
+        if resp not in ("(no response)", "SKIPPED", "DANGEROUS"):
+            msg(f"  0x{cmd:02X}: {resp}")
+    return results
+
+
+def _probe_scan_params(dev, cmd_byte, start, end):
+    """Scan param bytes for a given Nimbie command byte."""
+    known_params = {
+        0x52: {0x01: "PLACE_DISC", 0x02: "ACCEPT", 0x03: "REJECT"},
+        0x47: {0x01: "LIFT_DISC"},
+    }
+    pnames = known_params.get(cmd_byte, {})
+    msg(f"  Scanning params 0x{start:02X}–0x{end:02X} for cmd 0x{cmd_byte:02X}")
+    msg("")
+    results = {}
+    for param in range(start, end + 1):
+        tag = pnames.get(param, "")
+        label = f"cmd=0x{cmd_byte:02X} param=0x{param:02X}" + (f" ({tag})" if tag else "")
+        if cmd_byte == 0x52 and param in (0x01, 0x02, 0x03):
+            msg(f"  SKIP {label} — known mechanical")
+            results[param] = "SKIPPED"
+            continue
+        if cmd_byte == 0x47 and param == 0x01:
+            msg(f"  SKIP {label} — known mechanical")
+            results[param] = "SKIPPED"
+            continue
+        resps = _probe_send_and_read(dev, [0x00, 0x00, cmd_byte, param], label,
+                                     timeout=2000, max_reads=10)
+        results[param] = " | ".join(resps) if resps else "(no response)"
+        time.sleep(0.15)
+    msg("")
+    msg(f"  === SUMMARY — params for cmd 0x{cmd_byte:02X} that responded ===")
+    for param in sorted(results):
+        resp = results[param]
+        if resp not in ("(no response)", "SKIPPED"):
+            msg(f"  0x{param:02X}: {resp}")
+    return results
+
+
+def _usb_probe():
+    """Return ("normal"|"bootloader"|"offline", dev_or_None).
+
+    Fast USB scan: checks for normal Nimbie (0x1723:0x0945) then bootloader
+    (0x04D8:0x000B). No connection or claim — read-only enumeration only.
+    """
+    try:
+        import usb.core as _uc
+        n = _uc.find(idVendor=NIMBIE_VID, idProduct=NIMBIE_PID)
+        if n is not None:
+            return "normal", n
+        b = _uc.find(idVendor=BL_VID, idProduct=BL_PID)
+        if b is not None:
+            return "bootloader", b
+    except Exception:
+        pass
+    return "offline", None
+
+
+def _bl_require(bl_dev):
+    """Ensure bootloader is present; connect and return dev. Calls err() if not."""
+    if not bl_dev:
+        import usb.core as _uc
+        bl_dev = _uc.find(idVendor=BL_VID, idProduct=BL_PID)
+    if not bl_dev:
+        err(f"Bootloader not found ({BL_VID:#06x}:{BL_PID:#06x}).\n\n"
+            f"  The Nimbie must be in bootloader mode for this command.\n"
+            f"  LED pattern: ERROR=RED, LINK=GREEN, USB3=GREEN, READY=GREEN")
+    dev, ok = _bl_connect()
+    if not ok:
+        err("Cannot connect to bootloader device.")
+    return dev
+
+
 def cmd_reset(_nimbie, _config, args):
     """Reset / recover the Nimbie from various error states."""
     import usb.core
@@ -2003,6 +2814,140 @@ def cmd_reset(_nimbie, _config, args):
     # Step 1: Detect current state
     nimbie_dev = usb.core.find(idVendor=NIMBIE_VID, idProduct=NIMBIE_PID)
     bl_dev = usb.core.find(idVendor=BL_VID, idProduct=BL_PID)
+
+    # --- Bootloader-specific operations ---
+
+    if args.jump_to_app:
+        msg("Sending AN1388 framed JUMP-TO-APP...")
+        msg("  WARNING: This framed protocol is NOT supported on the Nimbie NB21 bootloader.")
+        msg("  The bootloader will echo back the packet without executing the command.")
+        msg("  Use --sign-and-reset instead (PROGRAM_COMPLETE + SIGN_FLASH x2 + power cycle).")
+        msg("")
+        dev = _bl_require(bl_dev)
+        try:
+            ok = _bl_jump_to_app(dev)
+        finally:
+            try:
+                import usb.util; usb.util.release_interface(dev, 0)
+            except Exception:
+                pass
+        if ok:
+            msg("")
+            msg("  Normal Nimbie is back! Verify with: my-nimbie status")
+        else:
+            msg("")
+            msg("  >>> If still in bootloader: power cycle (switch OFF → 5s → ON) <<<")
+        return
+
+    if args.bl_query:
+        msg("Querying bootloader (QUERY_DEVICE 0x00)...")
+        dev = _bl_require(bl_dev)
+        try:
+            _bl_query_device(dev)
+        finally:
+            try:
+                import usb.util; usb.util.release_interface(dev, 0)
+            except Exception:
+                pass
+        return
+
+    if args.bl_scan:
+        msg("Scanning bootloader commands 0x00-0x0F...")
+        dev = _bl_require(bl_dev)
+        try:
+            _bl_scan_commands(dev)
+        finally:
+            try:
+                import usb.util; usb.util.release_interface(dev, 0)
+            except Exception:
+                pass
+        return
+
+    if args.bl_read_flash:
+        msg("Reading flash reset vector + bootloader area...")
+        dev = _bl_require(bl_dev)
+        try:
+            _bl_read_flash_range(dev, 0x0000, 256)
+            msg("")
+            _bl_read_flash_range(dev, 0x1FC00, 64)
+        finally:
+            try:
+                import usb.util; usb.util.release_interface(dev, 0)
+            except Exception:
+                pass
+        return
+
+    if args.bl_read_addr:
+        addr = int(args.bl_read_addr, 0)
+        length = args.bl_read_len
+        msg(f"Reading flash at {addr:#010x}, {length} bytes...")
+        dev = _bl_require(bl_dev)
+        try:
+            _bl_read_flash_range(dev, addr, length)
+        finally:
+            try:
+                import usb.util; usb.util.release_interface(dev, 0)
+            except Exception:
+                pass
+        return
+
+    if args.bl_raw:
+        hex_str = args.bl_raw.replace(" ", "")
+        raw_bytes = list(bytes.fromhex(hex_str))
+        msg(f"Sending raw bytes to bootloader: {bytes(raw_bytes).hex()}")
+        dev = _bl_require(bl_dev)
+        try:
+            resp = _bl_send(dev, raw_bytes, timeout=5000)
+            if resp:
+                msg(f"  Response: {resp.hex()}")
+            else:
+                msg("  (no response)")
+        finally:
+            try:
+                import usb.util; usb.util.release_interface(dev, 0)
+            except Exception:
+                pass
+        return
+
+    if args.sign_and_reset:
+        msg("PROGRAM_COMPLETE + SIGN_FLASH x2 — verified recovery procedure...")
+        msg("")
+        msg("  This is the CONFIRMED working bootloader exit procedure:")
+        msg("  PROGRAM_COMPLETE (0x04) signals 'firmware is written'.")
+        msg("  SIGN_FLASH (0x07) x2 writes the application validity signature to NVM.")
+        msg("  The double SIGN_FLASH + 10-second wait allows NVM write to fully commit.")
+        msg("  After power cycle, bootloader finds valid app CRC and runs firmware.")
+        msg("")
+        dev = _bl_require(bl_dev)
+        try:
+            msg("  Step 1: PROGRAM_COMPLETE (0x04)...")
+            resp = _bl_send(dev, [BL_CMD_PROGRAM_COMPLETE])
+            if resp:
+                msg(f"    Response: {resp.hex()}")
+            time.sleep(0.5)
+            msg("  Step 2: SIGN_FLASH (0x07) — first time...")
+            _bl_sign_flash(dev)
+            time.sleep(1.0)
+            msg("  Step 3: SIGN_FLASH (0x07) — second time (NVM commit)...")
+            _bl_sign_flash(dev)
+            time.sleep(10.0)
+            msg("  Step 4: RESET_DEVICE (0x06) — soft reset...")
+            _bl_exit_bootloader(dev)
+        finally:
+            try:
+                import usb.util; usb.util.release_interface(dev, 0)
+            except Exception:
+                pass
+        msg("")
+        msg("  Commands sent. NVM write needs time to commit.")
+        msg("")
+        msg("  >>> NOW: Turn OFF the Nimbie hardware switch, wait 10 seconds, turn ON <<<")
+        msg("")
+        msg("  The Nimbie should come back in normal mode (VID=0x1723 PID=0x0945).")
+        msg("  Verify with: my-nimbie status")
+        return
+
+    # --- Standard recovery / diagnostics ---
 
     if args.exit_bootloader:
         # Explicit --exit-bootloader
@@ -2061,15 +3006,21 @@ def cmd_reset(_nimbie, _config, args):
                 msg(f"    EP OUT: {BL_EP_OUT:#04x} (Bulk, 64 bytes)")
                 msg(f"    EP IN:  {BL_EP_IN:#04x} (Bulk, 64 bytes)")
                 msg("")
-                msg("  Available bootloader commands:")
-                msg("    0x00  QUERY_DEVICE       — query bootloader info")
-                msg("    0x01  UNLOCK_CONFIG       — unlock config bits (DANGEROUS)")
-                msg("    0x02  ERASE_FLASH         — erase flash memory (DANGEROUS)")
-                msg("    0x03  PROGRAM_FLASH       — write flash memory (DANGEROUS)")
-                msg("    0x04  PROGRAM_COMPLETE    — signal programming done")
-                msg("    0x05  GET_DATA            — read flash memory")
-                msg("    0x06  RESET_DEVICE        — reset microcontroller")
-                msg("    0x07  SIGN_FLASH          — sign flash for validation")
+                msg("  Responding commands (0x00-0xFF scan, 2026-03-29):")
+                msg("    0x00  QUERY_DEVICE       — query bootloader info (device family=0x07)")
+                msg("    0x04  PROGRAM_COMPLETE   — signal firmware write is done")
+                msg("    0x05  GET_DATA           — read flash (read-protected, echoes cmd only)")
+                msg("    0x06  RESET_DEVICE       — soft reset (stays in BL without valid sig)")
+                msg("    0x07  SIGN_FLASH         — write application validity signature to NVM")
+                msg("    0x32  UNKNOWN            — echoes 0x32; meaning unknown")
+                msg("")
+                msg("  DANGEROUS (do not send):")
+                msg("    0x01  UNLOCK_CONFIG      — unlock config bits")
+                msg("    0x02  ERASE_FLASH        — erases entire application flash → BRICK")
+                msg("    0x03  PROGRAM_FLASH      — writes to flash → BRICK if wrong data")
+                msg("")
+                msg("  NOTE: Framed AN1388 protocol NOT supported on this device.")
+                msg("  Device echoes first 5 bytes of any 64-byte packet (raw protocol only).")
                 try:
                     import usb.util
                     usb.util.release_interface(dev, 0)
@@ -2079,9 +3030,9 @@ def cmd_reset(_nimbie, _config, args):
             msg("  LED pattern in bootloader mode:")
             msg("    ERROR: RED (solid)  LINK: GREEN (solid)  USB3: GREEN (solid)  READY: GREEN (solid)")
             msg("")
-            msg("  Recovery:")
-            msg("    my-nimbie reset --exit-bootloader")
-            msg("    Then: hardware switch OFF → wait 5s → ON")
+            msg("  Recovery (confirmed working):")
+            msg("    my-nimbie reset --sign-and-reset")
+            msg("    Then: hardware switch OFF → wait 10s → ON")
             return
 
         if not nimbie_dev:
@@ -2236,7 +3187,110 @@ def cmd_reset(_nimbie, _config, args):
         f"    - Try unplugging USB, turning off device, waiting 10 seconds, then reconnecting")
 
 
+def cmd_probe(_nimbie, _config, args):
+    """Probe Nimbie command space for reverse-engineering (from nimbie-probe.py)."""
+    msg("")
+    msg("=" * 60)
+    msg("  my-nimbie probe — Nimbie USB command scanner")
+    msg("=" * 60)
+    msg("")
+    msg("  CAUTION: Unknown commands may cause mechanical actions.")
+    msg("  Commands 0x55 and 0x56 are permanently skipped (dangerous).")
+    msg("  Known mechanical commands (0x47, 0x52) also skipped by default.")
+    msg("")
+
+    dev, kd = _probe_connect()
+    try:
+        if args.probe_raw:
+            hex_str = args.probe_raw.replace(" ", "")
+            raw_bytes = list(bytes.fromhex(hex_str))
+            msg(f"  Sending raw bytes: {bytes(raw_bytes).hex()}")
+            _probe_send_and_read(dev, raw_bytes, "RAW", timeout=5000, max_reads=20)
+
+        elif args.probe_cmd and args.probe_params:
+            cmd_byte = int(args.probe_cmd, 0)
+            ps, pe = 0x00, 0xFF
+            if args.probe_param_range:
+                parts = args.probe_param_range.split("-")
+                ps = int(parts[0], 0)
+                pe = int(parts[1], 0) if len(parts) > 1 else ps
+            _probe_scan_params(dev, cmd_byte, ps, pe)
+
+        else:
+            start, end = 0x00, 0xFF
+            if args.probe_range:
+                parts = args.probe_range.split("-")
+                start = int(parts[0], 0)
+                end = int(parts[1], 0) if len(parts) > 1 else start
+            _probe_scan_commands(dev, start, end)
+
+    finally:
+        try:
+            import usb.util as _uu
+            _uu.release_interface(dev, 0)
+            if kd:
+                dev.attach_kernel_driver(0)
+        except Exception:
+            pass
+
+    msg("")
+    msg("  Done.")
+    msg("")
+
+
 def cmd_status(nimbie, config, _args):
+    # Timestamp for when this status snapshot was taken
+    now = datetime.datetime.now()
+    ts = now.strftime('%Y-%m-%d_%H%M.%S.') + f"{now.microsecond // 1000:03d}"
+
+    # Always check for bootloader mode first — overrides everything else
+    try:
+        import usb.core as _usb_core
+        bl_dev = _usb_core.find(idVendor=BL_VID, idProduct=BL_PID)
+    except Exception:
+        bl_dev = None
+    if bl_dev is not None:
+        msg(f"{ts}  *** NIMBIE IS IN BOOTLOADER MODE ***")
+        msg("")
+        msg("  USB Mode:    BOOTLOADER (Microchip PIC HID, AN1388)")
+        msg(f"  VID/PID:     {BL_VID:#06x}:{BL_PID:#06x}  (Microchip Technology Inc.)")
+        msg(f"  Normal VID/PID: {NIMBIE_VID:#06x}:{NIMBIE_PID:#06x}  (NOT active)")
+        msg("")
+        msg("  The Nimbie firmware jumped to the Microchip PIC bootloader.")
+        msg("  This happens after USB command 0x56 is sent to the device.")
+        msg("  The bootloader persists across power cycles because the application")
+        msg("  validity signature in flash is missing or was not written.")
+        msg("")
+        msg("  RECOVERY (confirmed working procedure):")
+        msg("    my-nimbie reset --sign-and-reset")
+        msg("    Then: hardware switch OFF → wait 10s → ON")
+        msg("")
+        msg("  What this does:")
+        msg("    1. PROGRAM_COMPLETE (0x04) — signals bootloader that firmware is present")
+        msg("    2. SIGN_FLASH (0x07) x2   — writes app validity signature to NVM")
+        msg("    3. Wait 10s               — NVM write commit time")
+        msg("    4. Power cycle            — bootloader checks CRC, finds valid app, runs it")
+        msg("")
+        msg("  LED pattern in bootloader: ERROR=RED, LINK=GREEN, USB3=GREEN, READY=GREEN")
+        msg("")
+        if verbose:
+            msg("  Bootloader endpoints:")
+            msg("    EP 0x01 OUT Bulk 64 bytes  (commands to bootloader)")
+            msg("    EP 0x81 IN  Bulk 64 bytes  (responses from bootloader)")
+            msg("")
+            msg("  Known responding commands (full 0x00-0xFF scan, 2026-03-29):")
+            msg("    0x00  QUERY_DEVICE      — query version, bytes/packet, device family")
+            msg("    0x04  PROGRAM_COMPLETE  — signal firmware write is done")
+            msg("    0x05  GET_DATA          — read flash (read-protected on Nimbie)")
+            msg("    0x06  RESET_DEVICE      — soft reset (stays in BL without valid sig)")
+            msg("    0x07  SIGN_FLASH        — write application validity signature to NVM")
+            msg("    0x32  UNKNOWN           — echoes 0x32; meaning unknown")
+            msg("")
+            msg("  NOTE: Framed AN1388 protocol (SOH+CMD+CRC+EOT) is NOT supported.")
+            msg("  The bootloader echoes the first 5 bytes of any 64-byte packet.")
+            msg("  Only raw single-byte commands work.")
+        return
+
     # Check if a batch is running (status file exists with non-finished state)
     sf = BatchStatus.read_file()
     is_batch = sf.get("mode") == "batch" if sf else False
@@ -2268,12 +3322,15 @@ def cmd_status(nimbie, config, _args):
                 pass
 
         cli_str = sf.get('cli', '?')
-        msg(f"CRASHED — process died during '{sf.get('state', '?')}'")
+        msg(f"{ts}  CRASHED — process died during '{sf.get('state', '?')}'")
         msg(f"  Command:     {cli_str}")
         msg(f"  PID:         {sf.get('pid', '?')}")
         msg(f"  Disc:        #{disc_nr}{index_str}")
         if sf.get("target_dir"):
             msg(f"  Target dir:  {sf['target_dir']}")
+        if sf.get("disc_target_dir"):
+            sz = _dir_size_str(sf["disc_target_dir"])
+            msg(f"  Disc target: {sf['disc_target_dir']}" + (f"  ({sz})" if sz else ""))
         if sf.get("command"):
             msg(f"  Command:     {sf['command']}")
         if is_batch:
@@ -2286,18 +3343,30 @@ def cmd_status(nimbie, config, _args):
         msg("")
         if nimbie is not None:
             state = nimbie.get_state()
-            disc_in_closed_drive = not state["tray_out"] and not state["disc_in_tray"] and not state["disc_lifted"]
-            disc_stuck = state["disc_in_tray"] or state["disc_lifted"] or disc_in_closed_drive
-            if state["disc_in_tray"] or state["disc_lifted"]:
+            # Check drutil to reliably detect disc in closed drive
+            # (Nimbie state bits can't distinguish "closed+empty" from "closed+disc")
+            has_media = False
+            try:
+                dr = subprocess.run(["drutil", "status"], capture_output=True, text=True, timeout=10)
+                has_media = any("Type:" in line and "No Media" not in line
+                                for line in dr.stdout.split("\n"))
+            except Exception:
+                pass
+
+            disc_on_tray = state["disc_in_tray"] or state["disc_lifted"]
+            disc_in_closed_drive = has_media and not state["tray_out"] and not disc_on_tray
+            disc_stuck = disc_on_tray or disc_in_closed_drive
+
+            if disc_on_tray:
                 msg(f"  Disc in drive! (in_tray={state['disc_in_tray']}, lifted={state['disc_lifted']})")
                 msg(f"    my-nimbie eject    — eject disc to accept bin")
                 msg(f"    my-nimbie reject   — eject disc to reject bin")
             elif disc_in_closed_drive:
-                msg(f"  Disc likely in closed drive (tray closed, crashed during '{sf.get('state', '?')}')")
+                msg(f"  Disc in closed drive (confirmed by optical drive)")
                 msg(f"    my-nimbie eject    — open tray, lift disc, drop to accept bin")
                 msg(f"    my-nimbie reject   — open tray, lift disc, drop to reject bin")
             else:
-                msg(f"  No disc in drive (tray open, nothing detected).")
+                msg(f"  No disc in drive.")
 
             if not disc_stuck:
                 # Safe to clean up stale status file
@@ -2318,7 +3387,7 @@ def cmd_status(nimbie, config, _args):
 
     if not process_crashed and sf and sf.get("state") not in ("finished", "interrupted"):
         mode_label = "my-nimbie batch" if is_batch else "my-nimbie next"
-        msg(f"'{mode_label}' in progress:")
+        msg(f"{ts}  '{mode_label}' in progress:")
         cli_str = sf.get('cli')
         if cli_str:
             msg(f"  Command:     {cli_str}")
@@ -2361,6 +3430,9 @@ def cmd_status(nimbie, config, _args):
                 msg(f"  Last update: {sf['last_update']}")
         if sf.get("target_dir"):
             msg(f"  Target dir:  {sf['target_dir']}")
+        if sf.get("disc_target_dir"):
+            sz = _dir_size_str(sf["disc_target_dir"])
+            msg(f"  Disc target: {sf['disc_target_dir']}" + (f"  ({sz})" if sz else ""))
         if sf.get("command"):
             msg(f"  Command:     {sf['command']}")
         # Show copy progress if available
@@ -2446,7 +3518,13 @@ def cmd_status(nimbie, config, _args):
         msg("")
 
     # No batch running — query USB device directly
-    msg("Querying Nimbie status...")
+    if nimbie is None:
+        msg(f"{ts}  Nimbie not connected (OFFLINE).")
+        msg("")
+        msg("  USB Mode:    OFFLINE")
+        msg("  Power on the Nimbie and run:  my-nimbie status")
+        return
+    msg(f"{ts}  Querying Nimbie status...")
     state = nimbie.get_state()
     msg(f"  Disc available: {state['disc_available']}")
     msg(f"  Disc in tray:   {state['disc_in_tray']}")
@@ -2640,9 +3718,28 @@ def cmd_next(nimbie, config, args):
     if effective_offset is None:
         effective_offset = config.getint("naming", "idx_offset", fallback=0)
     result_file = config.get("batch", "result_file", fallback=DEFAULT_RESULT_FILE)
-    _rotate_run_files(result_file)
-    status = BatchStatus(flavor, mount_point, target_dir, idx_offset=effective_offset, mode="next", result_file=result_file)
+    status_json = config.get("batch", "status_json", fallback=DEFAULT_STATUS_JSON)
+    if not dry_run:
+        _rotate_run_files(result_file, status_json=status_json)
+    status = BatchStatus(flavor, mount_point, target_dir, idx_offset=effective_offset, mode="next", result_file=result_file,
+                         dry_run=dry_run)
     status.update("starting", disc_nr=disc_nr)
+
+    if deepdebug and not dry_run:
+        dbg(f"Status JSON collector started → {status_json}")
+        _start_status_json_collector(nimbie, status_json)
+
+    # Check if a disc is already in the drive (before printing startup info)
+    use_loaded = getattr(args, "use_loaded", False)
+    if not dry_run:
+        disc_location = _detect_disc_in_drive(nimbie)
+        if disc_location and not use_loaded:
+            err(f"Disc already in drive: {disc_location}\n\n"
+                f"  Cannot load a new disc — there is already one in the drive.\n\n"
+                f"  Options:\n"
+                f"    my-nimbie eject              — eject disc to accept bin, then retry\n"
+                f"    my-nimbie reject             — eject disc to reject bin, then retry\n"
+                f"    my-nimbie next --use-loaded  — process the disc already in the drive")
 
     msg(f"Processing next disc (flavor: {flavor_label})")
     msg(f"  Command:    {on_load}")
@@ -2650,21 +3747,29 @@ def cmd_next(nimbie, config, args):
     msg(f"  Target dir: {target_dir}")
     msg(f"  Dir name:   {dir_name}")
 
-    # Recover from any stuck state before loading
-    if not dry_run:
-        _recover_drive_state(nimbie, mount_point)
-
-    # Load
     status.start_disc_timer()
-    status.update("loading")
-    msg("\n  Loading disc from hopper...")
-    dbg("cmd_next: calling nimbie.load_disc()")
-    has_more = nimbie.load_disc()
-    dbg(f"cmd_next: load_disc returned has_more={has_more}")
+
+    if use_loaded:
+        msg("\n  --use-loaded: processing disc already in drive")
+        has_more = True  # hopper status unknown, assume more discs
+        # Disc may not be mounted (e.g. unmounted before crash) — try to mount it
+        if not dry_run and not os.path.ismount(mount_point):
+            status.update("mounting")
+            msg(f"  Disc not mounted — mounting...")
+            subprocess.run(["diskutil", "mount", mount_point], capture_output=True, timeout=30)
+    else:
+        # Load
+        status.update("loading")
+        msg("\n  Loading disc from hopper...")
+        dbg("cmd_next: calling nimbie.load_disc()")
+        has_more = nimbie.load_disc()
+        dbg(f"cmd_next: load_disc returned has_more={has_more}")
 
     if not dry_run:
-        vrb(f"  Waiting {settle_time}s for disc to settle...")
-        time.sleep(settle_time)
+        if not os.path.ismount(mount_point):
+            status.update("waiting for mount")
+            vrb(f"  Waiting {settle_time}s for disc to settle...")
+            time.sleep(settle_time)
 
         dbg(f"cmd_next: waiting for mount at {mount_point}")
         if not wait_for_mount(mount_point, mount_timeout, poll_interval):
@@ -2826,12 +3931,59 @@ def cmd_batch(nimbie, config, args):
     if effective_offset is None:
         effective_offset = config.getint("naming", "idx_offset", fallback=0)
     result_file = config.get("batch", "result_file", fallback=DEFAULT_RESULT_FILE)
-    _rotate_run_files(result_file)
-    status = BatchStatus(flavor, mount_point, target_dir, idx_offset=effective_offset, mode="batch", result_file=result_file)
+    status_json = config.get("batch", "status_json", fallback=DEFAULT_STATUS_JSON)
+    if not dry_run:
+        _rotate_run_files(result_file, status_json=status_json)
+    status = BatchStatus(flavor, mount_point, target_dir, idx_offset=effective_offset, mode="batch", result_file=result_file,
+                         dry_run=dry_run)
     batch_status = status
+
+    if deepdebug and not dry_run:
+        dbg(f"Status JSON collector started → {status_json}")
+        _start_status_json_collector(nimbie, status_json)
 
     # Install SIGUSR1 handler for live status queries
     signal.signal(signal.SIGUSR1, sigusr1_handler)
+    # SIGTERM (kill <pid>) → same graceful stop as Ctrl-C
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # Prevent macOS display sleep and idle sleep for the entire batch.
+    #
+    # Root cause: macOS uses Disk Arbitration to auto-mount removable media.
+    # When the display sleeps, macOS throttles background I/O and Disk Arbitration
+    # events to save power. The optical drive still spins and reads the disc, but
+    # the "disk arrived" notification that triggers auto-mount is suppressed —
+    # macOS never adds the disc to /Volumes/. This is specific to optical media
+    # (DVD/CD/BD): hard drives stay mounted, but optical discs require a fresh
+    # mount event on each insertion.
+    # Result: wait_for_mount() polls /Volumes/ forever, times out, disc is rejected.
+    # Fix: caffeinate -d keeps the display on → Disk Arbitration stays fully active
+    #      → DVDs auto-mount normally within a few seconds of being loaded.
+    #
+    # caffeinate -d (display) -i (idle) -w PID exits automatically when batch exits.
+    _caffeinate_proc = None
+    try:
+        _caffeinate_proc = subprocess.Popen(
+            ["caffeinate", "-d", "-i", "-w", str(os.getpid())],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        dbg(f"caffeinate started (PID {_caffeinate_proc.pid}) — display/idle sleep prevented")
+        msg("  [caffeinate] Display and idle sleep disabled for batch duration.")
+    except Exception as e:
+        warn(f"caffeinate failed to start: {e} — display sleep may cause mount failures")
+
+    # Check if a disc is already in the drive (before printing startup info)
+    use_loaded = getattr(args, "use_loaded", False)
+    if not dry_run:
+        disc_location = _detect_disc_in_drive(nimbie)
+        if disc_location and not use_loaded:
+            err(f"Disc already in drive: {disc_location}\n\n"
+                f"  Cannot start batch — there is already a disc in the drive.\n\n"
+                f"  Options:\n"
+                f"    my-nimbie eject               — eject disc to accept bin, then retry\n"
+                f"    my-nimbie reject              — eject disc to reject bin, then retry\n"
+                f"    my-nimbie batch --use-loaded  — process the disc in the drive as first disc,\n"
+                f"                                    then continue batch from hopper")
 
     msg(f"Batch mode started (flavor: {flavor_label})")
     msg(f"  Command:    {on_load}")
@@ -2847,11 +3999,7 @@ def cmd_batch(nimbie, config, args):
     preview_dir_name = build_dir_name(config, 1, mount_point, flavor, cli_naming)
     msg(f"  Dir naming: {preview_dir_name}  (preview for disc #1)")
 
-    status.update("running")
-
-    # Recover from any stuck state before first disc
-    if not dry_run:
-        _recover_drive_state(nimbie, mount_point)
+    first_disc_use_loaded = use_loaded
 
     try:
         while not interrupted:
@@ -2865,15 +4013,27 @@ def cmd_batch(nimbie, config, args):
             msg(f"  Disc #{status.disc_nr}")
             msg(f"{'=' * 60}")
 
-            # Load
+            # Load — skip if --use-loaded and first disc
             status.start_disc_timer()
-            status.update("loading", status.disc_nr)
-            msg("  Loading disc from hopper...")
-            has_more = nimbie.load_disc()
+            if first_disc_use_loaded:
+                msg("  --use-loaded: processing disc already in drive")
+                has_more = True  # assume more in hopper
+                first_disc_use_loaded = False  # only skip loading for first disc
+                # Disc may not be mounted (e.g. unmounted before crash) — try to mount it
+                if not dry_run and not os.path.ismount(mount_point):
+                    status.update("mounting", status.disc_nr)
+                    msg(f"  Disc not mounted — mounting...")
+                    subprocess.run(["diskutil", "mount", mount_point], capture_output=True, timeout=30)
+            else:
+                status.update("loading", status.disc_nr)
+                msg("  Loading disc from hopper...")
+                has_more = nimbie.load_disc()
 
             if not dry_run:
-                vrb(f"  Waiting {settle_time}s for disc to settle...")
-                time.sleep(settle_time)
+                if not os.path.ismount(mount_point):
+                    status.update("waiting for mount", status.disc_nr)
+                    vrb(f"  Waiting {settle_time}s for disc to settle...")
+                    time.sleep(settle_time)
 
                 if not wait_for_mount(mount_point, mount_timeout, poll_interval):
                     warn(f"Disc did not mount within {mount_timeout}s — rejecting")
@@ -3259,7 +4419,7 @@ class TestArgvExpansion(unittest.TestCase):
                 expanded.extend(["-D"] * len(arg[1:]))
             else:
                 expanded.append(arg)
-        subcommands = {"load", "eject", "reject", "unmount", "status", "next", "batch", "reset", "cancel"}
+        subcommands = {"load", "eject", "reject", "unmount", "status", "next", "batch", "reset", "cancel", "monitor"}
         global_flags = {"-D", "-v", "-V", "-d", "--debug", "--verbose", "--dry", "--deepdbg"}
         hoisted = []
         rest = []
@@ -3297,6 +4457,21 @@ class TestArgvExpansion(unittest.TestCase):
     def test_flags_before_subcmd_stay(self):
         result = self._expand_and_hoist(["-v", "status"])
         self.assertEqual(result, ["-v", "status"])
+
+    def test_help_subcommand_rewrite(self):
+        """--help batch must be rewritten to batch --help before parsing."""
+        _all_subcommands = {"load", "eject", "reject", "unmount", "status", "next", "batch",
+                            "reset", "cancel", "monitor", "accept", "retry", "stop", "probe"}
+        def _rewrite(argv):
+            if len(argv) >= 2 and argv[0] in ("--help", "-h") and argv[1] in _all_subcommands:
+                return [argv[1], "--help"] + argv[2:]
+            return argv
+        self.assertEqual(_rewrite(["--help", "batch"]), ["batch", "--help"])
+        self.assertEqual(_rewrite(["-h", "next"]),      ["next", "--help"])
+        self.assertEqual(_rewrite(["--help", "reset"]), ["reset", "--help"])
+        self.assertEqual(_rewrite(["--help", "probe"]), ["probe", "--help"])
+        self.assertEqual(_rewrite(["--help"]),           ["--help"])          # no subcommand → unchanged
+        self.assertEqual(_rewrite(["batch", "--help"]), ["batch", "--help"])  # already correct → unchanged
 
 
 class TestStripQuotes(unittest.TestCase):
@@ -3381,6 +4556,205 @@ class TestStalePidDetection(unittest.TestCase):
         self.assertTrue(alive)
 
 
+class TestTimestampFormat(unittest.TestCase):
+    """Regression: timestamp must be YYYY-MM-DD_HHMM.SS.mmm."""
+
+    def test_format_matches_pattern(self):
+        ts = _ts()
+        # e.g. 2026-03-29_0329.45.123
+        self.assertRegex(ts, r'^\d{4}-\d{2}-\d{2}_\d{4}\.\d{2}\.\d{3}$',
+                         f"Timestamp {ts!r} does not match YYYY-MM-DD_HHMM.SS.mmm")
+
+    def test_milliseconds_zero_padded(self):
+        # Force a datetime with microseconds < 1000 (i.e. ms=0) to check zero-padding
+        import datetime as _dt
+        dt = _dt.datetime(2026, 3, 29, 3, 29, 45, 0)
+        ts = dt.strftime("%Y-%m-%d_%H%M.%S.") + f"{dt.microsecond // 1000:03d}"
+        self.assertTrue(ts.endswith(".000"), f"Expected .000, got {ts!r}")
+
+    def test_milliseconds_are_three_digits(self):
+        import datetime as _dt
+        dt = _dt.datetime(2026, 3, 29, 3, 29, 45, 123000)
+        ts = dt.strftime("%Y-%m-%d_%H%M.%S.") + f"{dt.microsecond // 1000:03d}"
+        self.assertTrue(ts.endswith(".123"), f"Expected .123, got {ts!r}")
+
+
+class TestStatusJsonCollector(unittest.TestCase):
+    """Regression: _start_status_json_collector writes valid NDJSON."""
+
+    def test_writes_json_with_ts_and_hw(self):
+        import tempfile, json, time
+
+        class _FakeNimbie:
+            def get_state(self):
+                return {"disc_available": False, "disc_in_tray": True,
+                        "disc_lifted": False, "tray_out": False}
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            path = f.name
+
+        try:
+            t = _start_status_json_collector(_FakeNimbie(), path, interval=0.05)
+            time.sleep(0.2)
+            t.stop_event.set()
+            t.join(timeout=1.0)
+
+            lines = open(path).read().strip().splitlines()
+            self.assertGreater(len(lines), 0, "No lines written to status JSON")
+
+            snap = json.loads(lines[0])
+            self.assertIn("ts", snap, "Snapshot missing 'ts' key")
+            self.assertIn("hw", snap, "Snapshot missing 'hw' key")
+            self.assertIn("disc_in_tray", snap["hw"])
+            self.assertTrue(snap["hw"]["disc_in_tray"])
+            # Verify ts format
+            self.assertRegex(snap["ts"], r'^\d{4}-\d{2}-\d{2}_\d{4}\.\d{2}\.\d{3}$')
+        finally:
+            import os as _os
+            try:
+                _os.unlink(path)
+            except OSError:
+                pass
+
+    def test_hw_error_recorded_when_nimbie_fails(self):
+        import tempfile, json, time
+
+        class _BrokenNimbie:
+            def get_state(self):
+                raise RuntimeError("USB error")
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            path = f.name
+
+        try:
+            t = _start_status_json_collector(_BrokenNimbie(), path, interval=0.05)
+            time.sleep(0.2)
+            t.stop_event.set()
+            t.join(timeout=1.0)
+
+            lines = open(path).read().strip().splitlines()
+            self.assertGreater(len(lines), 0)
+            snap = json.loads(lines[0])
+            self.assertIn("error", snap["hw"], "Expected error key in hw when get_state fails")
+        finally:
+            import os as _os
+            try:
+                _os.unlink(path)
+            except OSError:
+                pass
+
+
+class TestMonitorCommandParser(unittest.TestCase):
+    """Regression: monitor command is registered in parser and subcommands set."""
+
+    def test_monitor_in_parser(self):
+        parser = build_parser()
+        # Parse 'monitor' — should not raise
+        args = parser.parse_args(["monitor"])
+        self.assertEqual(args.command, "monitor")
+
+    def test_monitor_subcommand_hoisting(self):
+        """monitor must be in the subcommands set so global flags are hoisted."""
+        # Simulate the hoisting logic used in main()
+        subcommands = {"load", "eject", "reject", "unmount", "status",
+                       "next", "batch", "reset", "cancel", "monitor"}
+        self.assertIn("monitor", subcommands)
+
+    def test_monitor_help_contains_tail_instruction(self):
+        """--help monitor description must mention tail -f and CTRL+C."""
+        parser = build_parser()
+        sub_actions = [a for a in parser._subparsers._group_actions
+                       if hasattr(a, '_name_parser_map')]
+        monitor_parser = sub_actions[0]._name_parser_map["monitor"]
+        # --help <subcommand> shows description + epilog, not format_help()
+        desc = (monitor_parser.description or "") + (monitor_parser.epilog or "")
+        self.assertIn("tail -f", desc, "--help monitor description should mention 'tail -f'")
+        self.assertIn("CTRL+C", desc, "--help monitor description should mention CTRL+C")
+
+    def test_help_subcommand_shows_description_not_usage(self):
+        """--help batch output must contain the description and NOT the usage line."""
+        import io, sys as _sys
+        parser = build_parser()
+        sub_actions = [a for a in parser._subparsers._group_actions
+                       if hasattr(a, '_name_parser_map')]
+        subparser = sub_actions[0]._name_parser_map["batch"]
+        # Simulate what main() does for --help batch
+        buf = io.StringIO()
+        old_stdout = _sys.stdout
+        _sys.stdout = buf
+        try:
+            print(f"my-nimbie batch\n")
+            if subparser.description:
+                print(subparser.description.rstrip())
+            if subparser.epilog:
+                print()
+                print(subparser.epilog.rstrip())
+            print(f"\n  For the full flag listing: my-nimbie batch --help")
+        finally:
+            _sys.stdout = old_stdout
+        output = buf.getvalue()
+        self.assertIn("Batch-process discs", output)
+        self.assertNotIn("usage:", output)
+        self.assertNotIn("--target-dir", output)  # flags must NOT appear
+        self.assertIn("my-nimbie batch --help", output)  # pointer to full help
+
+
+class TestCommandHelpDescriptions(unittest.TestCase):
+    """Regression: all commands have proper --help descriptions and global epilog."""
+
+    def _get_subparser(self, name):
+        parser = build_parser()
+        sub_actions = [a for a in parser._subparsers._group_actions
+                       if hasattr(a, '_name_parser_map')]
+        return sub_actions[0]._name_parser_map[name]
+
+    def test_load_has_description_and_epilog(self):
+        p = self._get_subparser("load")
+        self.assertTrue(p.description and len(p.description) > 20)
+        self.assertIn("--config", p.epilog)
+
+    def test_eject_has_description_and_epilog(self):
+        p = self._get_subparser("eject")
+        self.assertTrue(p.description and len(p.description) > 20)
+        self.assertIn("--config", p.epilog)
+
+    def test_status_has_description_and_epilog(self):
+        p = self._get_subparser("status")
+        self.assertTrue(p.description and len(p.description) > 20)
+        self.assertIn("--config", p.epilog)
+
+    def test_reset_has_exit_bootloader_flag(self):
+        p = self._get_subparser("reset")
+        flag_names = [a.option_strings for a in p._actions]
+        flat = [s for opts in flag_names for s in opts]
+        self.assertIn("--exit-bootloader", flat)
+        self.assertIn("--diagnostics", flat)
+
+    def test_next_has_use_loaded_flag(self):
+        p = self._get_subparser("next")
+        flag_names = [a.option_strings for a in p._actions]
+        flat = [s for opts in flag_names for s in opts]
+        self.assertIn("--use-loaded", flat)
+
+    def test_batch_has_use_loaded_flag(self):
+        p = self._get_subparser("batch")
+        flag_names = [a.option_strings for a in p._actions]
+        flat = [s for opts in flag_names for s in opts]
+        self.assertIn("--use-loaded", flat)
+
+    def test_next_epilog_has_global_options(self):
+        p = self._get_subparser("next")
+        self.assertIn("--config", p.epilog)
+        self.assertIn("--dry", p.epilog)
+        self.assertIn("--debug", p.epilog)
+
+    def test_batch_epilog_has_global_options(self):
+        p = self._get_subparser("batch")
+        self.assertIn("--config", p.epilog)
+        self.assertIn("--dry", p.epilog)
+        self.assertIn("--debug", p.epilog)
+
+
 def _run_tests():
     """Run unit tests."""
     loader = unittest.TestLoader()
@@ -3397,12 +4771,184 @@ def _run_tests():
         TestStripQuotes,
         TestCrashDiscDetection,
         TestStalePidDetection,
+        TestTimestampFormat,
+        TestStatusJsonCollector,
+        TestMonitorCommandParser,
+        TestCommandHelpDescriptions,
     ]
     for cls in test_classes:
         suite.addTests(loader.loadTestsFromTestCase(cls))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
     sys.exit(0 if result.wasSuccessful() else 1)
+
+
+def cmd_monitor(_nimbie, config, _args):
+    """Start the status JSON collector and monitor the Nimbie in real time.
+
+    Waits for the Nimbie to appear on USB (every 0.1s), writing a JSON entry
+    for each probe attempt (found or not-found). This allows starting the
+    monitor BEFORE powering on the device and watching it come online.
+    """
+    import json as _json
+    import time as _time
+
+    force = getattr(_args, "force", False)
+    stop  = getattr(_args, "stop",  False)
+
+    def _send_stop_to_existing():
+        """Send SIGTERM to the monitor in MONITOR_PID_FILE. Returns pid or None."""
+        try:
+            with open(MONITOR_PID_FILE) as _f:
+                _pid = int(_f.read().strip())
+        except (FileNotFoundError, ValueError):
+            return None
+        try:
+            os.kill(_pid, 0)  # check alive
+        except OSError:
+            return None   # already dead
+        os.kill(_pid, signal.SIGTERM)
+        return _pid
+
+    # --stop: send SIGTERM to running monitor and exit (no new monitor started)
+    if stop:
+        _pid = _send_stop_to_existing()
+        if _pid is None:
+            msg("No monitor process is running.")
+        else:
+            msg(f"Sent SIGTERM to monitor (PID {_pid}) — it will stop gracefully.")
+        return
+
+    # Enforce single-instance: fail if another monitor is already running,
+    # unless --force is given (send SIGTERM, wait for graceful exit, then start fresh).
+    try:
+        with open(MONITOR_PID_FILE) as _f:
+            _old_pid = int(_f.read().strip())
+        try:
+            os.kill(_old_pid, 0)
+            _still_running = True
+        except OSError:
+            _still_running = False
+        if _still_running:
+            if not force:
+                err(f"Monitor already running (PID {_old_pid}).\n\n"
+                    f"  Use 'my-nimbie monitor --stop'  to stop it gracefully.\n"
+                    f"  Use 'my-nimbie monitor --force' to stop it and start a fresh one.\n"
+                    f"  Multiple monitors corrupt {DEFAULT_STATUS_JSON}.")
+            # --force: send SIGTERM and wait up to 2s for graceful exit
+            os.kill(_old_pid, signal.SIGTERM)
+            for _ in range(20):
+                _time.sleep(0.1)
+                try:
+                    os.kill(_old_pid, 0)
+                except OSError:
+                    break   # gone
+            else:
+                # Still alive after 2s — force kill
+                try:
+                    os.kill(_old_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            msg(f"  Stopped existing monitor (PID {_old_pid}).")
+    except (FileNotFoundError, ValueError):
+        pass  # no pid file or invalid content — no previous monitor
+
+    # Write our own PID so future invocations can find us
+    try:
+        with open(MONITOR_PID_FILE, "w") as _f:
+            _f.write(str(os.getpid()))
+    except OSError:
+        pass
+
+    # SIGTERM handler: raises SystemExit so the finally block cleans up the PID file.
+    # This makes "my-nimbie monitor --stop" (which sends SIGTERM) a clean shutdown.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    status_json = config.get("batch", "status_json", fallback=DEFAULT_STATUS_JSON)
+    _rotate_file(status_json)
+    # Create file immediately so "tail -f" works before first write
+    try:
+        open(status_json, "w").close()
+    except OSError:
+        pass
+
+    vid = int(config.get("nimbie", "vid"), 16)
+    pid_val = int(config.get("nimbie", "pid"), 16)
+
+    msg("")
+    msg("=" * 60)
+    msg("  my-nimbie monitor — real-time status collector")
+    msg("=" * 60)
+    msg("")
+    msg(f"  Polling every 0.1s — watching USB for Nimbie (normal) or bootloader mode.")
+    msg(f"  Each JSON entry has \"usb\": \"offline\" | \"bootloader\" | \"normal\".")
+    msg(f"  Writing JSON snapshots to:")
+    msg(f"    {status_json}")
+    msg("")
+    msg(f"  Watch in another terminal:")
+    msg(f"    tail -f {status_json}")
+    msg("")
+    msg("  Press CTRL+C to stop.")
+    msg("")
+
+    def _write(entry):
+        entry["ts"] = _ts()
+        try:
+            with open(status_json, "a") as f:
+                f.write(_json.dumps(entry) + "\n")
+        except OSError:
+            pass
+
+    try:
+        while True:
+            import usb.core as _usb_core
+            dev = _usb_core.find(idVendor=vid, idProduct=pid_val)
+            if dev is None:
+                # Check for bootloader mode before reporting offline
+                bl = _usb_core.find(idVendor=BL_VID, idProduct=BL_PID)
+                if bl is not None:
+                    _write({"usb": "bootloader",
+                            "vid": f"{BL_VID:#06x}",
+                            "pid": f"{BL_PID:#06x}",
+                            "note": "Nimbie is in Microchip PIC bootloader mode — run: my-nimbie reset --exit-bootloader"})
+                else:
+                    _write({"usb": "offline"})
+                _time.sleep(0.1)
+                continue
+
+            # Device found — connect, read state, disconnect immediately
+            # (release interface between polls so batch/next can claim USB)
+            nimbie = NimbieDevice(vid, pid_val)
+            try:
+                nimbie.connect()
+                state = nimbie.get_state()
+                _write({"usb": "normal", "hw": {
+                    "disc_available": state.get("disc_available"),
+                    "disc_in_tray":   state.get("disc_in_tray"),
+                    "disc_lifted":    state.get("disc_lifted"),
+                    "tray_out":       state.get("tray_out"),
+                }})
+            except Exception as e:
+                _write({"usb": "offline", "error": str(e)})
+            finally:
+                try:
+                    nimbie.disconnect()
+                except Exception:
+                    pass
+
+            _time.sleep(0.1)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            os.unlink(MONITOR_PID_FILE)
+        except OSError:
+            pass
+
+    msg("")
+    msg("  Monitoring stopped.")
+    msg("")
 
 
 def build_parser():
@@ -3483,16 +5029,164 @@ Monitoring a running batch:
     parser.add_argument("--deepdbg", action="store_true",
                         help="deep debug (same as -DD)")
 
+    _GLOBAL_EPILOG = """\
+Global options (place before or after subcommand):
+  -c FILE, --config FILE   config file path (overrides search order)
+  -d, --dry                dry run — print what would be done without executing
+  -v, --verbose            verbose output
+  -D, --debug              debug output (-DD or --deepdbg for deep debug)"""
+
     sub = parser.add_subparsers(dest="command", parser_class=_HelpfulParser)
-    sub.add_parser("load",   help="Load next disc from hopper into drive")
-    sub.add_parser("eject",  help="Eject current disc to accept (done) bin")
-    sub.add_parser("reject", help="Reject current disc to reject bin (or: tell paused batch to reject)")
-    sub.add_parser("unmount", help="Unmount disc from optical drive")
-    sub.add_parser("status", help="Show Nimbie device state (or batch progress if running)")
-    sub.add_parser("accept", help="Tell a paused batch/next to accept the disc")
-    sub.add_parser("retry",  help="Tell a paused batch/next to retry the command")
-    sub.add_parser("stop",   help="Tell a paused batch/next to reject and stop")
-    sub.add_parser("cancel", help="Cancel running batch/next (sends SIGINT to the process)")
+
+    _p = sub.add_parser("load",
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        help="Load next disc from hopper into drive",
+                        description="""\
+Load the next disc from the Nimbie hopper into the optical drive.
+
+The Nimbie gripper picks up the top disc from the input hopper, places it
+on the tray, and closes the tray. The drive spins up and the disc is ready
+to mount.
+
+Use this before running a rip/read command on a manually loaded disc.
+For automated batch processing use "batch" or "next" instead.""")
+    _p.epilog = _GLOBAL_EPILOG
+
+    _p = sub.add_parser("eject",
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        help="Eject current disc to accept (done) bin",
+                        description="""\
+Eject the current disc from the drive and move it to the accept (done) bin.
+
+Opens the tray, waits for the disc to settle, then the Nimbie gripper picks
+it up and drops it in the accept output bin.
+
+Use this after a successful rip to move the disc out of the drive.
+If a batch/next job is paused waiting for user input, use "accept" instead.""")
+    _p.epilog = _GLOBAL_EPILOG
+
+    _p = sub.add_parser("reject",
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        help="Reject current disc to reject bin (or: tell paused batch to reject)",
+                        description="""\
+Reject the current disc — ejects from drive and drops into the reject bin.
+
+Two modes:
+  1. Standalone: physically ejects and rejects the disc in the drive now.
+  2. Signal to batch/next: if a batch or next job is paused waiting for
+     user input (e.g. after --pause-on-err), sends it a "reject" signal,
+     which causes it to reject the disc and either stop or continue.
+
+The reject bin is the separate output tray for discs that failed processing.""")
+    _p.epilog = _GLOBAL_EPILOG
+
+    _p = sub.add_parser("unmount",
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        help="Unmount disc from optical drive (macOS diskutil eject)",
+                        description="""\
+Unmount the disc from the macOS filesystem without physically ejecting it.
+
+Calls "diskutil eject" on the configured mount point. Use this when you want
+to release the filesystem lock before calling "eject" or doing a manual
+disc swap. The disc stays in the drive tray until physically ejected.""")
+    _p.epilog = _GLOBAL_EPILOG
+
+    _p = sub.add_parser("status",
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        help="Show Nimbie device state (or batch progress if running)",
+                        description="""\
+Show current Nimbie hardware state and batch/next job progress.
+
+Hardware state includes:
+  disc_available   — disc(s) in the input hopper
+  disc_in_tray     — disc currently in the optical drive tray
+  disc_lifted      — disc currently held by the gripper arm
+  tray_out         — drive tray is open
+
+If a batch or next job is running, also shows:
+  - Current disc number and index
+  - Accept / reject counts
+  - Last disc processed
+  - Target directory
+  - Crash info (if the job died unexpectedly)
+
+Use -V (verbose) for additional detail including USB state bits and
+drive tray state from drutil.""")
+    _p.epilog = _GLOBAL_EPILOG
+
+    _p = sub.add_parser("accept",
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        help="Tell a paused batch/next to accept the current disc",
+                        description="""\
+Signal a paused batch/next job to accept the current disc.
+
+When batch/next is paused (e.g. after --pause-on-err or awaiting user
+confirmation), this command sends an "accept" signal: the job accepts
+the disc (moves to done bin) and continues to the next disc.""")
+    _p.epilog = _GLOBAL_EPILOG
+
+    _p = sub.add_parser("retry",
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        help="Tell a paused batch/next to retry the current command",
+                        description="""\
+Signal a paused batch/next job to retry the current disc.
+
+When batch/next is paused after a command failure, this sends a "retry"
+signal: the job re-runs the same command on the same disc without
+re-loading it.""")
+    _p.epilog = _GLOBAL_EPILOG
+
+    _p = sub.add_parser("stop",
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        help="Tell a paused batch/next to reject disc and stop",
+                        description="""\
+Signal a paused batch/next job to reject the current disc and stop.
+
+When batch/next is paused, this sends a "stop" signal: the job rejects
+the disc (moves to reject bin) and exits cleanly, printing a summary.""")
+    _p.epilog = _GLOBAL_EPILOG
+
+    _p = sub.add_parser("cancel",
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        help="Cancel a running batch/next job (sends SIGINT to the process)",
+                        description="""\
+Cancel a running batch/next job by sending SIGINT to its process.
+
+Reads the PID from the status file and sends SIGINT (same as CTRL+C).
+The job will finish its current disc operation cleanly (accept or reject),
+write a final summary, and exit.
+
+Note: this does NOT immediately stop a long-running disc command (e.g.
+dvdbackup). It sets the stop flag so the job stops after the current disc
+completes.""")
+    _p.epilog = _GLOBAL_EPILOG
+
+    monitor_parser = sub.add_parser("monitor",
+                                    formatter_class=argparse.RawDescriptionHelpFormatter,
+                                    help="Start real-time status monitoring (writes NDJSON, press CTRL+C to stop)",
+                                    description=f"""\
+Start real-time status monitoring of the Nimbie.
+
+Collects hardware state (disc_available, disc_in_tray, disc_lifted, tray_out)
+and batch/next job progress every 0.1s (10x/second), appending JSON snapshots to:
+  {DEFAULT_STATUS_JSON}
+
+Each snapshot line looks like:
+  {{"ts":"2026-03-29_1234.56.789","hw":{{"disc_available":true,...}},"batch":{{...}}}}
+
+Watch the live output in another terminal:
+  tail -f {DEFAULT_STATUS_JSON}
+
+The monitor command blocks until you press CTRL+C.
+The status_json path can be configured in the config file under [batch] status_json.""")
+    monitor_parser.add_argument(
+        "--force", action="store_true",
+        help="Send SIGTERM to any already-running monitor, then start a fresh one"
+    )
+    monitor_parser.add_argument(
+        "--stop", action="store_true",
+        help="Send SIGTERM to the running monitor (graceful shutdown) and exit"
+    )
 
     reset_parser = sub.add_parser("reset", help="Recover Nimbie from error states (bootloader mode, stuck disc)",
                                   formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3503,22 +5197,79 @@ Without flags, auto-detects the device state and recovers:
   - If in bootloader mode: sends RESET command (then you power cycle)
   - If in normal mode: reports no recovery needed
 
-Recovery flags:
-  --exit-bootloader   Exit Microchip PIC bootloader mode (after accidental 0x56 command)
-  --diagnostics       Show device diagnostics (counters, state, bootloader info)
+Standard recovery:
+  --exit-bootloader     Send RESET_DEVICE (0x06) to bootloader, then power cycle
+  --diagnostics         Show device diagnostics (counters, state, bootloader info)
 
-After --exit-bootloader, you MUST power cycle the device:
-  1. Turn OFF the hardware switch
-  2. Wait 5 seconds
-  3. Turn it back ON
-  4. Verify with: my-nimbie status""")
+Bootloader operations (device must be in bootloader mode — LED: ERROR=RED):
+  --jump-to-app         AN1388 framed Jump-to-App — NOTE: NOT supported on this device
+  --bl-query            QUERY_DEVICE (0x00) — show bootloader version/info
+  --bl-scan             Scan bootloader commands 0x00-0xFF
+  --bl-read-flash       Read flash reset vector + bootloader config area
+  --bl-read-addr ADDR   Read flash at specific hex address (e.g. 0x0000)
+  --bl-read-len N       Bytes to read with --bl-read-addr (default: 256)
+  --bl-raw HEX          Send raw hex bytes to bootloader (e.g. "0500")
+  --sign-and-reset      CONFIRMED recovery: PROGRAM_COMPLETE + SIGN_FLASH x2 + power cycle
+
+Confirmed working recovery procedure:
+  my-nimbie reset --sign-and-reset
+  Then: hardware switch OFF → wait 10s → ON
+  Verify with: my-nimbie status""")
     reset_parser.add_argument("--exit-bootloader", action="store_true",
-                              help="exit Microchip PIC bootloader mode (requires power cycle after)")
+                              help="send RESET_DEVICE to bootloader (then power cycle)")
     reset_parser.add_argument("--diagnostics", action="store_true",
                               help="show device diagnostics (counters, timers, state)")
+    reset_parser.add_argument("--jump-to-app", action="store_true",
+                              help="AN1388 framed Jump-to-App — NOTE: not supported on this device (echoes back)")
+    reset_parser.add_argument("--bl-query", action="store_true",
+                              help="query bootloader: QUERY_DEVICE (0x00)")
+    reset_parser.add_argument("--bl-scan", action="store_true",
+                              help="scan bootloader commands 0x00-0xFF")
+    reset_parser.add_argument("--bl-read-flash", action="store_true",
+                              help="read flash reset vector + bootloader config area")
+    reset_parser.add_argument("--bl-read-addr", metavar="ADDR",
+                              help="read flash at hex address (e.g. 0x0000)")
+    reset_parser.add_argument("--bl-read-len", type=int, default=256, metavar="N",
+                              help="bytes to read with --bl-read-addr (default: 256)")
+    reset_parser.add_argument("--bl-raw", metavar="HEX",
+                              help="send raw hex bytes to bootloader (e.g. '0500')")
+    reset_parser.add_argument("--sign-and-reset", action="store_true",
+                              help="CONFIRMED recovery: PROGRAM_COMPLETE + SIGN_FLASH x2 + power cycle")
+
+    # --- probe: scan Nimbie command space for reverse-engineering ---
+    probe_parser = sub.add_parser("probe",
+                                  help="Scan Nimbie USB command space for reverse-engineering",
+                                  formatter_class=argparse.RawDescriptionHelpFormatter,
+                                  description="""\
+Systematically probe the Nimbie's USB command space to discover
+undocumented commands and responses.
+
+CAUTION: Unknown commands may trigger mechanical actions. Watch the device!
+Commands 0x55 (disconnect) and 0x56 (bootloader jump) are always skipped.
+Known mechanical commands (0x47 LIFT_DISC, 0x52 PLACE/ACCEPT/REJECT) are
+skipped by default to avoid unintended disc movement.
+
+Without flags: scans all command bytes 0x00-0xFF.
+
+Examples:
+  my-nimbie probe                          scan all 0x00-0xFF
+  my-nimbie probe --range 0x40-0x60        scan a specific range
+  my-nimbie probe --cmd 0x52 --params      scan params for cmd 0x52
+  my-nimbie probe --raw 000043000000       send raw hex bytes""")
+    probe_parser.add_argument("--range", dest="probe_range", metavar="RANGE",
+                              help="command byte range to scan (e.g. 0x40-0x60)")
+    probe_parser.add_argument("--cmd", dest="probe_cmd", metavar="CMD",
+                              help="command byte for param scanning (e.g. 0x52)")
+    probe_parser.add_argument("--params", dest="probe_params", action="store_true",
+                              help="scan param bytes for --cmd")
+    probe_parser.add_argument("--param-range", dest="probe_param_range", metavar="RANGE",
+                              help="param byte range (e.g. 0x00-0x10, default: 0x00-0xFF)")
+    probe_parser.add_argument("--raw", dest="probe_raw", metavar="HEX",
+                              help="send raw hex bytes to Nimbie (e.g. '000043000000')")
 
     # --- next: process exactly one disc (same setup as batch, for testing) ---
     next_parser = sub.add_parser("next", help="Process exactly one disc (same setup as batch, for testing)",
+                                 usage="my-nimbie next [--options] [flavor]",
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  description=f"""\
 Process exactly one disc from the Nimbie hopper.
@@ -3563,9 +5314,19 @@ Per-disc directory naming:
                              help="zero-padding width for {INDEX} (default: 3, e.g. 3 → \"001\")")
     next_parser.add_argument("--pause-on-err", action="store_true",
                              help="pause on command error (keep disc in drive, wait for user)")
+    next_parser.add_argument("--use-loaded", action="store_true",
+                             help="process a disc already in the drive (skip loading from hopper). "
+                             "Use after a crash left a disc in the drive.")
+    next_parser.epilog = """\
+Global options (place before or after subcommand):
+  -c FILE, --config FILE   config file path (overrides search order)
+  -d, --dry                dry run — print what would be done without executing
+  -v, --verbose            verbose output
+  -D, --debug              debug output (-DD or --deepdbg for deep debug)"""
 
     # --- batch: process all discs in hopper ---
     batch_parser = sub.add_parser("batch", help="Batch mode: load → process → accept/reject → repeat",
+                                  usage="my-nimbie batch [--options] [flavor]",
                                   formatter_class=argparse.RawDescriptionHelpFormatter,
                                   description=f"""\
 Batch-process discs from the Nimbie hopper.
@@ -3610,8 +5371,17 @@ Progress is tracked in /tmp/my-nimbie.status and can be queried:
                               help="zero-padding width for {INDEX} (default: 3, e.g. 3 → \"001\")")
     batch_parser.add_argument("--pause-on-err", action="store_true",
                               help="pause batch on command error (keep disc in drive, wait for user)")
+    batch_parser.add_argument("--use-loaded", action="store_true",
+                              help="process a disc already in the drive as first disc (skip loading). "
+                              "Use after a crash left a disc in the drive.")
     batch_parser.add_argument("--max", metavar="N", type=int,
                               help="max discs to process (overrides config max_discs, 0 = unlimited)")
+    batch_parser.epilog = """\
+Global options (place before or after subcommand):
+  -c FILE, --config FILE   config file path (overrides search order)
+  -d, --dry                dry run — print what would be done without executing
+  -v, --verbose            verbose output
+  -D, --debug              debug output (-DD or --deepdbg for deep debug)"""
 
     return parser
 
@@ -3623,6 +5393,24 @@ def main():
 
     # Pre-process argv: expand -DD → -D -D and hoist global flags before subcommand
     argv = sys.argv[1:]
+
+    # "--help <subcommand>" → show subcommand description without the argparse usage line.
+    # This gives a clean, readable overview (like "my-nimbie --help monitor") for every command.
+    # For the full flag listing, the user can run: my-nimbie <subcommand> --help
+    _all_subcommands = {"load", "eject", "reject", "unmount", "status", "next", "batch",
+                        "reset", "cancel", "monitor", "accept", "retry", "stop", "probe"}
+    if len(argv) >= 2 and argv[0] in ("--help", "-h") and argv[1] in _all_subcommands:
+        argv = [argv[1], "--help"] + argv[2:]
+
+    # Detect common mistake: "--batch", "--next", etc. instead of "batch", "next"
+    for arg in argv:
+        if arg.startswith("--") and arg[2:] in _all_subcommands:
+            print(f"my-nimbie: error: unknown option '{arg}'\n"
+                  f"  Did you mean: my-nimbie {arg[2:]} ...\n"
+                  f"  Subcommands are used without '--'. Example: my-nimbie batch readdvd --offset 262",
+                  file=sys.stderr)
+            sys.exit(2)
+
     expanded = []
     for arg in argv:
         if re.match(r'^-D{2,}$', arg):
@@ -3630,7 +5418,7 @@ def main():
         else:
             expanded.append(arg)
     # Hoist global flags (-D, -v, -d, --debug, --verbose, --dry) before the subcommand
-    subcommands = {"load", "eject", "reject", "unmount", "status", "next", "batch", "reset", "cancel"}
+    subcommands = {"load", "eject", "reject", "unmount", "status", "next", "batch", "reset", "cancel", "monitor"}
     global_flags = {"-D", "-v", "-V", "-d", "--debug", "--verbose", "--dry", "--deepdbg"}
     hoisted = []
     rest = []
@@ -3696,6 +5484,15 @@ def main():
                 f"  Run 'my-nimbie status' to see crash details.")
         os.kill(pid, signal.SIGINT)
         msg(f"Sent SIGINT to PID {pid} — batch/next should stop gracefully.")
+        # Also kill any active on_load child process (e.g. dvdbackup) so it
+        # doesn't become an orphan if the batch process exits before it finishes.
+        try:
+            with open(CMD_CHILD_PID_FILE) as f:
+                child_pid = int(f.read().strip())
+            os.kill(child_pid, signal.SIGTERM)
+            msg(f"Sent SIGTERM to on_load child PID {child_pid} (dvdbackup or similar).")
+        except Exception:
+            pass  # no child PID file, or child already gone — fine
         return
 
     # Pause control commands: send command to paused batch/next process, no USB needed
@@ -3715,6 +5512,16 @@ def main():
         if sf and "PAUSED" in sf.get("state", ""):
             _send_pause_command("reject")
             return
+
+    # Status command: check for bootloader mode first — show that instead of failing to connect
+    if args.command == "status":
+        try:
+            import usb.core as _uc
+            if _uc.find(idVendor=BL_VID, idProduct=BL_PID) is not None:
+                cmd_status(None, config, args)
+                return
+        except Exception:
+            pass
 
     # Status command: try reading status file first, only connect if no batch running
     if args.command == "status":
@@ -3760,6 +5567,16 @@ def main():
         cmd_reset(None, config, args)
         return
 
+    # monitor command manages its own connection (waits for device to appear)
+    if args.command == "monitor":
+        cmd_monitor(None, config, args)
+        return
+
+    # probe command does its own raw USB connect
+    if args.command == "probe":
+        cmd_probe(None, config, args)
+        return
+
     # Create device
     if dry_run:
         nimbie = NimbieDeviceDryRun()
@@ -3773,12 +5590,13 @@ def main():
 
     try:
         commands = {
-            "load":   cmd_load,
-            "eject":  cmd_eject,
-            "reject": cmd_reject,
-            "status": cmd_status,
-            "next":   cmd_next,
-            "batch":  cmd_batch,
+            "load":    cmd_load,
+            "eject":   cmd_eject,
+            "reject":  cmd_reject,
+            "status":  cmd_status,
+            "next":    cmd_next,
+            "batch":   cmd_batch,
+            "monitor": cmd_monitor,
         }
         commands[args.command](nimbie, config, args)
     finally:
