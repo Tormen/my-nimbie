@@ -2280,30 +2280,35 @@ def cmd_status(nimbie, config, _args):
 
         # Query hardware to check if disc is stuck
         msg("")
-        state = nimbie.get_state()
-        disc_in_closed_drive = not state["tray_out"] and not state["disc_in_tray"] and not state["disc_lifted"]
-        disc_stuck = state["disc_in_tray"] or state["disc_lifted"] or disc_in_closed_drive
-        if state["disc_in_tray"] or state["disc_lifted"]:
-            msg(f"  Disc in drive! (in_tray={state['disc_in_tray']}, lifted={state['disc_lifted']})")
-            msg(f"    my-nimbie eject    — eject disc to accept bin")
-            msg(f"    my-nimbie reject   — eject disc to reject bin")
-        elif disc_in_closed_drive:
-            msg(f"  Disc likely in closed drive (tray closed, crashed during '{sf.get('state', '?')}')")
-            msg(f"    my-nimbie eject    — open tray, lift disc, drop to accept bin")
-            msg(f"    my-nimbie reject   — open tray, lift disc, drop to reject bin")
-        else:
-            msg(f"  No disc in drive (tray open, nothing detected).")
+        if nimbie is not None:
+            state = nimbie.get_state()
+            disc_in_closed_drive = not state["tray_out"] and not state["disc_in_tray"] and not state["disc_lifted"]
+            disc_stuck = state["disc_in_tray"] or state["disc_lifted"] or disc_in_closed_drive
+            if state["disc_in_tray"] or state["disc_lifted"]:
+                msg(f"  Disc in drive! (in_tray={state['disc_in_tray']}, lifted={state['disc_lifted']})")
+                msg(f"    my-nimbie eject    — eject disc to accept bin")
+                msg(f"    my-nimbie reject   — eject disc to reject bin")
+            elif disc_in_closed_drive:
+                msg(f"  Disc likely in closed drive (tray closed, crashed during '{sf.get('state', '?')}')")
+                msg(f"    my-nimbie eject    — open tray, lift disc, drop to accept bin")
+                msg(f"    my-nimbie reject   — open tray, lift disc, drop to reject bin")
+            else:
+                msg(f"  No disc in drive (tray open, nothing detected).")
 
-        if not disc_stuck:
-            # Safe to clean up stale status file
-            try:
-                os.unlink(STATUS_FILE)
-            except OSError:
-                pass
-            try:
-                os.unlink(PROGRESS_FILE)
-            except OSError:
-                pass
+            if not disc_stuck:
+                # Safe to clean up stale status file
+                try:
+                    os.unlink(STATUS_FILE)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(PROGRESS_FILE)
+                except OSError:
+                    pass
+        else:
+            msg(f"  Cannot check hardware — Nimbie not connected.")
+            msg(f"  Power cycle the Nimbie (switch off, wait 10s, switch on), then run:")
+            msg(f"    my-nimbie status   — check device state and disc position")
         return
         # Don't fall through — we already queried hardware above
 
@@ -3729,7 +3734,14 @@ def main():
                 vid = int(config.get("nimbie", "vid"), 16)
                 pid = int(config.get("nimbie", "pid"), 16)
                 nimbie = NimbieDevice(vid, pid)
-                nimbie.connect()
+                # Suppress err() output during probe
+                _old_stderr = sys.stderr
+                sys.stderr = open(os.devnull, "w")
+                try:
+                    nimbie.connect()
+                finally:
+                    sys.stderr.close()
+                    sys.stderr = _old_stderr
                 try:
                     cmd_status(nimbie, config, args)
                 finally:
