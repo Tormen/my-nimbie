@@ -2367,26 +2367,48 @@ def cmd_status(nimbie, config, _args):
             msg(f"  Last disc:   {sf['last_disc']}")
 
         # Verbose: show hardware diagnostics even during active job
-        if verbose and nimbie is not None:
-            msg("")
-            msg("  Hardware diagnostics (CMD 0x49):")
-            diag_resps = nimbie._send_and_read((0x49,), "DIAGNOSTICS", timeout=3000)
-            if diag_resps:
-                pairs = [r for r in diag_resps if r not in ("OK", "AT+O")]
-                for i in range(0, len(pairs) - 1, 2):
-                    name = pairs[i]
-                    value = pairs[i + 1] if i + 1 < len(pairs) else "?"
-                    try:
-                        msg(f"    {name:12s} = {int(value):,d}")
-                    except ValueError:
-                        msg(f"    {name:12s} = {value}")
+        if verbose:
+            _nimbie = nimbie
+            if _nimbie is None:
+                # Try to connect briefly for diagnostics (another process may hold USB)
+                try:
+                    import configparser as _cp
+                    _vid = int(config.get("nimbie", "vid"), 16)
+                    _pid = int(config.get("nimbie", "pid"), 16)
+                    _nimbie = NimbieDevice(_vid, _pid)
+                    _nimbie.connect()
+                except Exception:
+                    _nimbie = None
+            if _nimbie is not None:
+                try:
+                    msg("")
+                    msg("  Hardware diagnostics (CMD 0x49):")
+                    diag_resps = _nimbie._send_and_read((0x49,), "DIAGNOSTICS", timeout=3000)
+                    if diag_resps:
+                        pairs = [r for r in diag_resps if r not in ("OK", "AT+O")]
+                        for i in range(0, len(pairs) - 1, 2):
+                            name = pairs[i]
+                            value = pairs[i + 1] if i + 1 < len(pairs) else "?"
+                            try:
+                                msg(f"    {name:12s} = {int(value):,d}")
+                            except ValueError:
+                                msg(f"    {name:12s} = {value}")
 
-            msg("")
-            state = nimbie.get_state()
-            msg(f"  Disc available: {state['disc_available']}")
-            msg(f"  Disc in tray:   {state['disc_in_tray']}")
-            msg(f"  Disc lifted:    {state['disc_lifted']}")
-            msg(f"  Tray out:       {state['tray_out']}")
+                    msg("")
+                    state = _nimbie.get_state()
+                    msg(f"  Disc available: {state['disc_available']}")
+                    msg(f"  Disc in tray:   {state['disc_in_tray']}")
+                    msg(f"  Disc lifted:    {state['disc_lifted']}")
+                    msg(f"  Tray out:       {state['tray_out']}")
+                finally:
+                    if _nimbie is not nimbie:
+                        try:
+                            _nimbie.disconnect()
+                        except Exception:
+                            pass
+            else:
+                msg("")
+                msg("  Hardware diagnostics: unavailable (USB held by running process)")
 
         if verbose:
             msg("")
