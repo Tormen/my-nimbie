@@ -3464,12 +3464,12 @@ def _probe_send_and_read(dev, pkt_bytes, label="", timeout=3000, max_reads=10):
 def _probe_init_scan(dev):
     """Scan unexplored command bytes with a long timeout, looking for AT+I (init/home) responses.
 
-    Scans:
-      0x40-0x46, 0x48, 0x4B-0x51, 0x53-0x54, 0x57-0x60  (all unexplored, safe range)
+    Pass 1: unexplored single-byte commands 0x40-0x54 + 0x57-0x60 with param=0x00
+    Pass 2: same commands with param=0x01 (many init commands need a non-zero trigger)
+    Pass 3: 0x47,XX params 0x02-0x98,0x9A-0xFF (the LIFT_DISC/CAM_LOWER family)
     Uses 10s timeout per command — enough for a homing spin to complete.
-    Skips 0x47/0x52 (known mechanical), 0x55/0x56 (dangerous/forbidden).
+    Skips 0x47,0x01 (LIFT_DISC), 0x47,0x99 (CAM_LOWER), 0x55/0x56 (dangerous).
     """
-    # Unexplored ranges: below known commands, gaps between, and just above 0x56
     candidates = (
         list(range(0x40, 0x43))   +  # 0x40-0x42
         list(range(0x44, 0x47))   +  # 0x44-0x46
@@ -3478,39 +3478,59 @@ def _probe_init_scan(dev):
         [0x53, 0x54]              +  # 0x53-0x54
         list(range(0x57, 0x61))      # 0x57-0x60
     )
+    # 0x47 params: skip 0x01 (LIFT_DISC) and 0x99 (CAM_LOWER)
+    params_47 = [p for p in range(0x00, 0x100) if p not in (0x01, 0x99)]
+
+    total = len(candidates) * 2 + len(params_47)
+    msg(f"  Init-scan: {total} probes total, 10s timeout each (~{total * 2 // 60 + 1} min)")
+    msg(f"  Pass 1: {len(candidates)} unexplored commands with param=0x00")
+    msg(f"  Pass 2: {len(candidates)} unexplored commands with param=0x01")
+    msg(f"  Pass 3: {len(params_47)} params for cmd=0x47 (LIFT_DISC/CAM_LOWER family)")
+    msg(f"  Watch the cam wheels — they should spin if the init command is found.")
+    msg("")
+
     found_init = []
     found_other = []
-    msg(f"  Init-scan: {len(candidates)} unexplored command bytes, 10s timeout each")
-    msg(f"  Looking for AT+I (initialization/homing) and any other new responses.")
-    msg(f"  Watch the cam wheels — they should spin if the init command is found.")
-    msg(f"  (This will take ~{len(candidates) * 2 // 60 + 1} minutes)")
-    msg("")
-    for cmd in candidates:
-        label = f"0x{cmd:02X}"
-        resps = _probe_send_and_read(dev, [0x00, 0x00, cmd, 0x00], label,
+
+    def _try(cmd, param, label):
+        resps = _probe_send_and_read(dev, [0x00, 0x00, cmd, param], label,
                                      timeout=10000, max_reads=20)
         resp_str = " | ".join(resps) if resps else "(no response)"
-        has_init = any(r.startswith("AT+I") for r in resps)
-        if has_init:
-            msg(f"  *** INIT RESPONSE: 0x{cmd:02X} → {resp_str}  ← CANDIDATE HOMING COMMAND ***")
-            found_init.append((cmd, resp_str))
-        elif resps and resp_str != "(no response)":
-            found_other.append((cmd, resp_str))
+        if any(r.startswith("AT+I") for r in resps):
+            msg(f"  *** INIT RESPONSE: {label} → {resp_str}  ← CANDIDATE HOMING COMMAND ***")
+            found_init.append((label, resp_str))
+        elif resps and resp_str not in ("(no response)",):
+            found_other.append((label, resp_str))
         time.sleep(0.3)
+
+    msg("  --- Pass 1: param=0x00 ---")
+    for cmd in candidates:
+        _try(cmd, 0x00, f"0x{cmd:02X},0x00")
+
+    msg("")
+    msg("  --- Pass 2: param=0x01 ---")
+    for cmd in candidates:
+        _try(cmd, 0x01, f"0x{cmd:02X},0x01")
+
+    msg("")
+    msg("  --- Pass 3: cmd=0x47 params ---")
+    for param in params_47:
+        _try(0x47, param, f"0x47,0x{param:02X}")
+
     msg("")
     msg("  === INIT-SCAN SUMMARY ===")
     if found_init:
         msg("  AT+I responses (homing/init candidates):")
-        for cmd, resp in found_init:
-            msg(f"    0x{cmd:02X}: {resp}")
+        for label, resp in found_init:
+            msg(f"    {label}: {resp}")
     else:
         msg("  No AT+I responses found.")
     if found_other:
-        msg("  Other new responses (potential recovery commands):")
-        for cmd, resp in found_other:
-            msg(f"    0x{cmd:02X}: {resp}")
+        msg("  Other unexpected responses (potential recovery commands):")
+        for label, resp in found_other:
+            msg(f"    {label}: {resp}")
     if not found_init and not found_other:
-        msg("  Nothing new found. Init command may need a non-zero param or different packet layout.")
+        msg("  Nothing new. Try: my-nimbie reset --usb-reset (USB re-enumeration may trigger init).")
 
 
 def _probe_scan_commands(dev, start, end):
@@ -3783,6 +3803,31 @@ def cmd_reset(_nimbie, _config, args):
         msg("")
         msg("  After power cycle, the Nimbie should return to normal operation.")
         msg("  Verify with: my-nimbie status")
+        return
+
+    if args.usb_reset:
+        # USB device reset — causes the device to re-enumerate.
+        # The firmware may run its power-on init sequence (cam wheel homing spin) on re-enumeration.
+        import usb.core as _ucore
+        dev = _ucore.find(idVendor=NIMBIE_VID, idProduct=NIMBIE_PID)
+        if not dev:
+            err("Nimbie not found in normal mode.")
+        msg("Sending USB device reset (re-enumeration)...")
+        msg("  Watch the cam wheels — if firmware runs power-on init they should spin now.")
+        try:
+            dev.reset()
+        except Exception as e:
+            # reset() raises after the reset is sent — that's expected
+            msg(f"  (reset sent, device re-enumerating: {e})")
+        msg("")
+        msg("  Waiting 3 seconds for device to come back...")
+        time.sleep(3)
+        dev2 = _ucore.find(idVendor=NIMBIE_VID, idProduct=NIMBIE_PID)
+        if dev2:
+            msg("  Device re-enumerated successfully.")
+            msg("  Verify with: my-nimbie status")
+        else:
+            msg("  Device not yet visible — may still be enumerating. Try: my-nimbie status")
         return
 
     if args.diagnostics:
@@ -6891,6 +6936,7 @@ Without flags, auto-detects the device state and recovers:
 
 Standard recovery:
   --exit-bootloader     Send RESET_DEVICE (0x06) to bootloader, then power cycle
+  --usb-reset           USB device reset — re-enumerate; may trigger power-on cam wheel homing
   --diagnostics         Show device diagnostics (counters, state, bootloader info)
 
 Bootloader operations (device must be in bootloader mode — LED: ERROR=RED):
@@ -6908,6 +6954,8 @@ Confirmed working recovery procedure (NO power disconnect needed):
   my-nimbie status      # device self-resets, verify normal mode""")
     reset_parser.add_argument("--exit-bootloader", action="store_true",
                               help="send RESET_DEVICE to bootloader (use --sign-and-reset instead)")
+    reset_parser.add_argument("--usb-reset", dest="usb_reset", action="store_true",
+                              help="USB device reset — re-enumerate; may trigger power-on cam wheel homing spin")
     reset_parser.add_argument("--diagnostics", action="store_true",
                               help="show device diagnostics (counters, timers, state)")
     reset_parser.add_argument("--jump-to-app", action="store_true",
