@@ -865,6 +865,17 @@ def err(text, code=1):
 def warn(text):
     print(f"  WARNING: {text}", file=sys.stderr)
 
+def _write_result_recovery_note(note):
+    """Append a one-line recovery comment to the active result file (if any)."""
+    global batch_status
+    try:
+        rf = batch_status.result_file if batch_status else DEFAULT_RESULT_FILE
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(rf, "a") as f:
+            f.write(f"# {ts}  RECOVERY NEEDED: {note}\n")
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Log tee: capture all stdout + stderr (including subprocesses) to a file
@@ -1701,8 +1712,13 @@ class NimbieDevice:
         except Exception as e:
             warn(f"drutil tray close failed: {e}")
 
-        # Poll until tray is closed
+        # Poll until tray sensor reports closed.
+        # IMPORTANT: tray_out flips False almost immediately (firmware reports the command
+        # receipt, not physical completion). The tray motor takes ~4s to fully seat.
+        # Without this extra wait, a subsequent PLACE_DISC can drop a disc into the
+        # still-moving tray — confirmed cause of double-load incident 2026-03-30.
         self._poll_state(lambda s: not s["tray_out"], "tray to close", timeout=15)
+        time.sleep(4)  # wait for tray to physically seat (motor takes ~4s after sensor flip)
 
     # -- Autoloader mechanism commands --
 
@@ -1880,6 +1896,14 @@ class NimbieDevice:
                 "       my-nimbie batch readdvd --offset <last_completed>\n"
             )
 
+        _write_result_recovery_note(
+            "disc did not land on tray (sensor glitch?); "
+            "power cycle Nimbie → my-nimbie reset → restart batch"
+        )
+        _write_result_recovery_note(
+            "disc stuck in cam wheels after 3 attempts; "
+            "run my-nimbie reset (ACCEPT to eject stuck disc) → restart batch"
+        )
         err(
             "place_disc: disc failed to land on tray after 3 attempts.\n"
             "\n"
