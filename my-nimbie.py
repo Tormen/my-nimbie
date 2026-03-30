@@ -5,6 +5,10 @@ Controls the Nimbie loader/unloader mechanism via USB HID and orchestrates
 batch disc processing with configurable commands (e.g. my-handbrake).
 """
 
+__version__ = "1.0.0"
+__copyleft__ = "Copyleft (ↄ) 2026 Tormen <tormen@mail.ch>"
+__license__ = "All rights reversed."
+
 # ---------------------------------------------------------------------------
 # Venv bootstrap: ensure we run inside a venv with pyusb installed.
 # If not, create the venv, install deps, and re-exec ourselves in it.
@@ -102,6 +106,9 @@ _my-nimbie() {
         'accept:Tell paused batch/next to accept the disc'
         'retry:Tell paused batch/next to retry the command'
         'stop:Tell paused batch/next to reject and stop'
+        'pause:Pause running batch/next (suspends command, stops before next disc)'
+        'unpause:Resume a paused batch/next'
+        'continue:Resume a paused batch/next (alias for unpause)'
         'unmount:Unmount disc from optical drive'
         'cancel:Cancel running batch/next (sends SIGINT to the process)'
         'reset:Recover Nimbie from error states (bootloader, stuck disc)'
@@ -113,10 +120,12 @@ _my-nimbie() {
     global_opts=(
         '(-c --config)'{-c,--config}'[Config file path]:file:_files'
         '--create-config[Create example config file]::path:_files'
-        '(-d --dry)'{-d,--dry}'[Dry run — print what would be done]'
-        '(-v -V --verbose)'{-v,-V,--verbose}'[Verbose output]'
+        '(-v --version)'{-v,--version}'[Print version and copyleft, then exit]'
+        '--dry[Dry run — print what would be done]'
+        '(-V --verbose)'{-V,--verbose}'[Verbose output]'
         '(-D --debug)'{-D,--debug}'[Debug output; -DD for deep debug]'
         '--deepdbg[Deep debug (same as -DD)]'
+        '(-L --log)'{-L,--log}'[Tee all output to log file (default: /tmp/my-nimbie.log; auto with -D)]::file:_files'
         '(-h --help)'{-h,--help}'[Show help message]'
         '1:command:->cmd'
         '*::arg:->args'
@@ -315,6 +324,7 @@ DEFAULT_CONFIG = {
         "poll_interval":   "2",
         "result_file":     "/tmp/my-nimbie.result",
         "status_json":     "/tmp/my-nimbie.status-log.json",
+        "log_file":        "/tmp/my-nimbie.log",
     },
 }
 
@@ -331,6 +341,8 @@ PROGRESS_FILE = "/tmp/my-nimbie.progress"
 COMMAND_FILE = "/tmp/my-nimbie.command"
 CMD_CHILD_PID_FILE = "/tmp/my-nimbie.cmd-child.pid"  # PID of active on_load subprocess
 MONITOR_PID_FILE = "/tmp/my-nimbie.monitor.pid"      # PID of running monitor process
+PAUSE_FILE = "/tmp/my-nimbie.pause"                  # Pause flag: exists → batch/next paused
+DEFAULT_LOGFILE = "/tmp/my-nimbie.log"               # Default log file for -L / --log
 DEFAULT_RESULT_FILE = "/tmp/my-nimbie.result"
 DEFAULT_STATUS_JSON = "/tmp/my-nimbie.status-log.json"
 
@@ -347,14 +359,13 @@ _active_cmd_proc = None  # subprocess.Popen of the currently running on_load com
 
 
 # ---------------------------------------------------------------------------
-# Status JSON collector (started in -DD / --deepdbg mode)
+# Status JSON collector (always started by batch/next unless --dry-run)
 # ---------------------------------------------------------------------------
 def _start_status_json_collector(nimbie, status_json_path, interval=0.1):
     """Start a background thread that writes a live status JSON every `interval` seconds.
 
-    Collects the same data as 'my-nimbie status -V' (hardware state + batch progress)
-    and appends each snapshot as a JSON object to status_json_path (one per line, NDJSON).
-    Only started when deepdebug is True (-DD flag).
+    Collects hardware state + batch progress and appends each snapshot as a JSON
+    object to status_json_path (one per line, NDJSON).  Read with: my-nimbie monitor
     """
     import threading
     import json
@@ -499,11 +510,12 @@ class BatchStatus:
             return 0.0
         return time.time() - self.disc_load_start
 
-    def record_disc(self, index, dir_name, source_size, elapsed, rc, result, total_elapsed=None):
+    def record_disc(self, index, dir_name, source_size, elapsed, rc, result, total_elapsed=None, fail_reason=""):
         """Record a completed disc result.
 
         elapsed:       command runtime only (seconds)
         total_elapsed: total processing time including loading (seconds), defaults to elapsed
+        fail_reason:   optional human-readable reason for failure (e.g. from _verify_disc_read)
         """
         entry = {
             "index": index,
@@ -513,6 +525,7 @@ class BatchStatus:
             "total_elapsed": total_elapsed if total_elapsed is not None else elapsed,
             "rc": rc,
             "result": result,
+            "fail_reason": fail_reason,
             "timestamp": self._ts(datetime.datetime.now()),
         }
         self.disc_results.append(entry)
@@ -526,10 +539,12 @@ class BatchStatus:
             self.record_disc(index, dir_name, source_size, elapsed, 0, "successful", total_elapsed=total_elapsed)
         self.update("accepted")
 
-    def record_reject(self, index=None, dir_name=None, source_size=0, elapsed=0.0, rc=1, total_elapsed=None):
+    def record_reject(self, index=None, dir_name=None, source_size=0, elapsed=0.0, rc=1,
+                      total_elapsed=None, fail_reason="", result="FAILED"):
         self.rejected += 1
         if index is not None:
-            self.record_disc(index, dir_name, source_size, elapsed, rc, "rejected", total_elapsed=total_elapsed)
+            self.record_disc(index, dir_name, source_size, elapsed, rc, result,
+                             total_elapsed=total_elapsed, fail_reason=fail_reason)
         self.update("rejected")
 
     def finish(self, final_state="finished"):
@@ -560,6 +575,33 @@ class BatchStatus:
             return f"{hours}h {mins:02d}m {s:02d}s"
         return f"{mins}m {s:02d}s"
 
+    def write_result_header(self):
+        """Write a run-start comment header to the result file (always appended, never rotated)."""
+        if self.dry_run:
+            return
+        try:
+            ts = self._ts(datetime.datetime.now())
+            line = f"# {os.getpid()}  {ts}  {self.cli}"
+            with open(self.result_file, "a") as f:
+                f.write(line + "\n")
+        except OSError as e:
+            dbg(f"Failed to write result file header: {e}")
+
+    def write_result_trailer(self, state):
+        """Write a run-end comment to the result file.
+
+        state: e.g. 'FINISHED', 'ABORTED', 'INTERRUPTED'
+        """
+        if self.dry_run:
+            return
+        try:
+            ts = self._ts(datetime.datetime.now())
+            line = f"# {os.getpid()}  {ts}  {state.upper()}"
+            with open(self.result_file, "a") as f:
+                f.write(line + "\n")
+        except OSError as e:
+            dbg(f"Failed to write result file trailer: {e}")
+
     def _append_result_file(self, entry):
         """Append a disc result line to the result file. Skipped in dry-run mode."""
         if self.dry_run:
@@ -568,14 +610,17 @@ class BatchStatus:
             size_str = _format_size(entry["size"]) if entry["size"] else "?"
             cmd_str = self._fmt_elapsed(entry["elapsed"])
             total_str = self._fmt_elapsed(entry["total_elapsed"])
-            line = (f"{entry['timestamp']}  "
+            fail_str = f"  [{entry['fail_reason']}]" if entry.get("fail_reason") else ""
+            line = (f"{os.getpid()}  "
+                    f"{entry['timestamp']}  "
                     f"#{entry['index']:>3}  "
-                    f"{entry['result']:<8}  "
+                    f"{entry['result']:<10}  "
                     f"rc={entry['rc']}  "
                     f"cmd={cmd_str:>10}  "
                     f"total={total_str:>10}  "
                     f"{size_str:>8}  "
-                    f"{entry['dir_name']}")
+                    f"{entry['dir_name']}"
+                    f"{fail_str}")
             with open(self.result_file, "a") as f:
                 f.write(line + "\n")
         except OSError as e:
@@ -723,6 +768,74 @@ def _wait_for_pause_command(status):
             continue
 
 
+def _wait_if_paused(status):
+    """If PAUSE_FILE exists, block until it is removed (unpause/continue).
+
+    Called at the start of each disc loop iteration in cmd_batch/cmd_next so
+    that 'my-nimbie pause' takes effect between discs.  The running command
+    child process is suspended separately via SIGSTOP by cmd_pause().
+    """
+    if not os.path.exists(PAUSE_FILE):
+        return
+    msg(f"\n  *** BATCH PAUSED *** — use 'my-nimbie unpause' to resume.")
+    if status:
+        status.update("paused — waiting for unpause")
+    while os.path.exists(PAUSE_FILE):
+        time.sleep(1)
+    msg("  Resumed.")
+    if status:
+        status.update("resuming")
+
+
+def cmd_pause(nimbie, config, args):
+    """Pause a running batch/next: suspend the active command and stop before next disc."""
+    if os.path.exists(PAUSE_FILE):
+        msg("  Already paused.")
+        return
+    # Set pause flag so the batch/next loop stops before loading the next disc
+    try:
+        with open(PAUSE_FILE, "w") as f:
+            f.write(str(os.getpid()) + "\n")
+    except OSError as e:
+        err(f"Could not create pause file: {e}")
+        return
+    msg("  Pause flag set.")
+    # Try to SIGSTOP the running on_load child process immediately
+    try:
+        with open(CMD_CHILD_PID_FILE) as f:
+            child_pid = int(f.read().strip())
+        os.kill(child_pid, signal.SIGSTOP)
+        msg(f"  Running command (PID {child_pid}) suspended (SIGSTOP).")
+    except FileNotFoundError:
+        msg("  No active command process found — batch will pause before next disc.")
+    except (ValueError, ProcessLookupError, OSError) as e:
+        msg(f"  Could not suspend command process: {e}")
+    msg("  Use 'my-nimbie unpause' to resume.")
+
+
+def cmd_unpause(nimbie, config, args):
+    """Resume a paused batch/next."""
+    if not os.path.exists(PAUSE_FILE):
+        msg("  Not currently paused.")
+        return
+    # Resume the suspended on_load child process first
+    try:
+        with open(CMD_CHILD_PID_FILE) as f:
+            child_pid = int(f.read().strip())
+        os.kill(child_pid, signal.SIGCONT)
+        msg(f"  Running command (PID {child_pid}) resumed (SIGCONT).")
+    except FileNotFoundError:
+        pass  # No active child — that's fine
+    except (ValueError, ProcessLookupError, OSError) as e:
+        msg(f"  Could not resume command process: {e}")
+    # Remove pause flag — the batch/next loop will wake up from _wait_if_paused()
+    try:
+        os.unlink(PAUSE_FILE)
+    except OSError:
+        pass
+    msg("  Batch/next resumed.")
+
+
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
@@ -751,6 +864,70 @@ def err(text, code=1):
 
 def warn(text):
     print(f"  WARNING: {text}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Log tee: capture all stdout + stderr (including subprocesses) to a file
+# ---------------------------------------------------------------------------
+def _setup_log_tee(logpath):
+    """Redirect stdout and stderr so all output is tee'd to logpath AND the terminal.
+
+    Works at the OS file-descriptor level (not just Python's sys.stdout/sys.stderr),
+    so subprocess output — dvdbackup, cdparanoia, diskutil, etc. — is also captured.
+
+    Implementation: starts a 'tee -a <logpath>' child process, then redirects
+    fd 1 (stdout) and fd 2 (stderr) of this process to tee's stdin.  Tee writes
+    every byte it reads to both <logpath> (append) and its own stdout (the
+    original terminal).
+
+    After this call 'tail -f <logpath>' from another terminal shows live output.
+    """
+    import atexit
+
+    try:
+        # Save a dup of the original terminal stdout before we redirect it.
+        orig_stdout_fd = os.dup(1)
+
+        # Launch tee: reads from its stdin (our pipe), writes to log + terminal.
+        tee_proc = subprocess.Popen(
+            ["tee", "-a", logpath],
+            stdin=subprocess.PIPE,
+            stdout=orig_stdout_fd,   # tee's stdout → original terminal
+            close_fds=True,
+        )
+        os.close(orig_stdout_fd)
+
+        # Point fd 1 and fd 2 of this process at tee's stdin pipe.
+        # From now on every write to stdout or stderr (Python or subprocess)
+        # flows through tee, which fans it out to the log file and terminal.
+        tee_in_fd = tee_proc.stdin.fileno()
+        os.dup2(tee_in_fd, 1)
+        os.dup2(tee_in_fd, 2)
+        tee_proc.stdin.close()   # Python ref closed; fd 1/2 are independent dups
+
+        # Re-wrap Python's text stream objects to write through the new fd 1/2.
+        sys.stdout = open(1, 'w', buffering=1, closefd=False, errors='replace')
+        sys.stderr = open(2, 'w', buffering=1, closefd=False, errors='replace')
+
+        # Write a session header to the log.
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cli = "my-nimbie " + " ".join(sys.argv[1:])
+        sys.stdout.write(f"# {os.getpid()}  {now}  {cli}\n")
+        sys.stdout.flush()
+
+        def _cleanup():
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+                tee_proc.wait(timeout=5)
+            except Exception:
+                pass
+        atexit.register(_cleanup)
+
+        msg(f"  Log: {logpath}  (tail -f to watch)")
+
+    except Exception as e:
+        warn(f"Could not start log tee to {logpath}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -931,6 +1108,10 @@ def generate_example_config():
     # Each entry contains hardware state, batch progress, and progress info
     # Read with: tail -f /tmp/my-nimbie.status-log.json | python3 -m json.tool
     status_json = /tmp/my-nimbie.status-log.json
+
+    # Log file for -L / --log (tee of all stdout+stderr including subprocess output)
+    # Auto-enabled with -D / -DD.  Watch with: tail -f /tmp/my-nimbie.log
+    log_file = /tmp/my-nimbie.log
 """
 
 
@@ -1669,8 +1850,56 @@ class NimbieDevice:
                 self.open_tray()
                 time.sleep(1)
                 continue
-            warn(f"place_disc: disc_in_tray still False after 120s (attempt {attempt + 1}/3) — retrying...")
-            time.sleep(3)
+            # disc_lifted=False + disc_in_tray=False after 120s: the disc transited the
+            # cam wheels (they released it — disc_lifted went False) but got stuck in the
+            # chute between the cam wheels and the closed tray.
+            #
+            # Push-through recovery: close the tray, then send PLACE_DISC raw (no
+            # open_tray) so the next disc from the hopper pushes the stuck disc down
+            # through the closed-tray slot into the output bin. The physical separator on
+            # the Nimbie determines whether both discs fall to the accept or reject bin.
+            #
+            # IMPORTANT: the caller/operator must pre-position the physical separator to
+            # the desired output bin BEFORE the batch runs. USB CMD_REJECT/ACCEPT only
+            # act on a disc already in the cam wheels (disc_lifted=True) and cannot
+            # pre-position the separator for a falling disc.
+            warn(f"place_disc: disc stuck in transit chute (disc_lifted=False, "
+                 f"disc_in_tray=False) — attempt {attempt + 1}/3.")
+            warn("  Push-through recovery: closing tray, then sending next disc as pusher.")
+            warn("  Both discs (stuck + pusher) will fall to the output bin.")
+            warn("  Ensure the physical separator is set to the correct bin first.")
+            self.close_tray()
+            time.sleep(1)
+
+            state_pre = self.get_state(fatal=False)
+            if not state_pre or not state_pre.get("disc_available"):
+                warn("  No disc in hopper to use as pusher — manual intervention needed.")
+                warn("  Remove the stuck disc from the chute, then reload.")
+                self.open_tray()
+                time.sleep(1)
+                continue
+
+            warn("  Sending PLACE_DISC (tray stays CLOSED — pusher disc falls through chute)...")
+            # Send raw PLACE_DISC without open_tray() — tray must stay closed
+            # so both discs fall through the closed-tray slot to the output bin.
+            self._send_command(CMD_PLACE_DISC, "PLACE_DISC (push-through)")
+            time.sleep(10)  # wait for both discs to clear the mechanism
+
+            state_after = self.get_state(fatal=False)
+            if state_after and state_after.get("disc_in_tray"):
+                # Disc landed on tray unexpectedly (mechanism may have opened tray)
+                warn("  Push-through: disc on tray — proceeding with it.")
+                time.sleep(0.8)
+                return True
+            warn("  Push-through complete — stuck disc cleared.")
+            self.open_tray()
+            time.sleep(1)
+            # State after push-through: one disc was consumed (pusher).
+            # If hopper still has discs, retry normally.
+            if state_after and state_after.get("disc_available"):
+                continue
+            # Hopper empty after push-through
+            return False
 
         err(
             "place_disc: disc failed to land on tray after 3 attempts.\n"
@@ -1715,17 +1944,23 @@ class NimbieDevice:
                 warn("No disc in tray to lift")
                 return False
             elif at == AT_DROPPER_ERR:
-                # AT+S03 = "mechanism stuck or disc already lifted"
-                # Check actual state — if disc_lifted is True, the gripper already
-                # has the disc (common after a previous partial lift); treat as success.
+                # AT+S03 = "disc already in gripper" in the context of LIFT_DISC.
+                # (In the context of PLACE_DISC, AT+S03 means "already placing" — but we're
+                # not in place_disc() here.)  The disc IS physically in the cam wheels.
+                # Check the state bit first; if it confirms disc_lifted=True, return True.
+                # If the bit says False (sensor unreliable at top-clamp position, common
+                # after a USB crash/reconnect), still return True — AT+S03 is authoritative.
+                # Worst case: caller sends CMD_ACCEPT with nothing there → wheels turn briefly,
+                # firmware returns AT+S03, nothing is damaged.
                 time.sleep(1)
                 state = self.get_state()
                 if state.get("disc_lifted"):
-                    dbg("LIFT_DISC got AT+S03 but disc_lifted=True — disc already in gripper, proceeding")
+                    dbg("LIFT_DISC got AT+S03 and disc_lifted=True — disc already in gripper, proceeding")
                     return True
-                warn(f"LIFT_DISC got AT+S03 (attempt {attempt + 1}/3) — waiting 3s and retrying...")
-                time.sleep(3)
-                continue
+                warn("LIFT_DISC got AT+S03 but disc_lifted sensor=False — "
+                     "sensor may be lagging after crash/reconnect. "
+                     "Treating disc as in gripper and proceeding to accept/reject.")
+                return True
             elif "E09" in str(at):
                 # E09 = transient hardware error — retry after delay
                 warn(f"LIFT_DISC got E09 (attempt {attempt + 1}/3) — waiting 3s and retrying...")
@@ -1785,6 +2020,31 @@ class NimbieDevice:
 
     def load_disc(self):
         """Load next disc from hopper into drive. Returns False if hopper empty."""
+        # Pre-load check: detect disc stuck in cam wheel clamps with sensor lie.
+        # If we open the tray and send PLACE_DISC while a disc is physically in the
+        # clamps, the mechanism would jam. Probe with LIFT_DISC (tray must be closed):
+        #   AT+S03 → firmware confirms disc in gripper → auto-eject to accept bin first
+        #   AT+S00 or other → clear, proceed normally
+        pre_state = self.get_state(fatal=False)
+        if (pre_state and not pre_state.get("disc_lifted")
+                and not pre_state.get("disc_in_tray")
+                and not pre_state.get("tray_out")):
+            try:
+                probe_resps = self._send_and_read(CMD_LIFT_DISC, "LIFT_DISC probe (pre-load)",
+                                                  timeout=5000, max_reads=5, wait_for_at=False)
+                probe_at = self._find_at_response(probe_resps)
+                if probe_at == AT_DROPPER_ERR:
+                    warn("load_disc: disc detected in cam wheel clamps before loading "
+                         "(disc_lifted sensor=False, AT+S03 = sensor lie).")
+                    warn("  Auto-ejecting stuck disc to accept bin before loading next...")
+                    self.close_tray()
+                    time.sleep(1)
+                    self.accept_disc()
+                    time.sleep(2)
+                    warn("  Stuck disc cleared — proceeding with load.")
+            except Exception as _probe_ex:
+                dbg(f"load_disc: pre-load probe failed (non-fatal): {_probe_ex}")
+
         vrb("  Opening tray...")
         self.open_tray()
 
@@ -1972,9 +2232,14 @@ def _rotate_file(path):
             dbg(f"Failed to rotate {path}: {e}")
 
 
-def _rotate_run_files(result_file, status_json=None):
-    """Rotate all run files (.status, .progress, .result, .status-log.json) to .OLD before a new run."""
-    for path in (STATUS_FILE, PROGRESS_FILE, result_file):
+def _rotate_run_files(status_json=None):
+    """Rotate run files (.status, .progress, .status-log.json) to .OLD before a new run.
+
+    NOTE: result file is intentionally NOT rotated — it is always appended to so that
+    the file accumulates all runs as a continuous log.  Each run writes a
+    '# PID TIMESTAMP CLI' header line before its disc entries.
+    """
+    for path in (STATUS_FILE, PROGRESS_FILE):
         _rotate_file(path)
     if status_json:
         _rotate_file(status_json)
@@ -2123,6 +2388,129 @@ def _get_dir_size(path):
     except OSError:
         pass
     return total
+
+
+def _verify_disc_read(mount_point, dir_name, source_size, strict=False):
+    """Verify that the on_load command wrote all expected bytes to dir_name.
+
+    Called after run_command returns rc=0, while the disc is still mounted,
+    to catch silent failures where the command exits 0 but didn't write everything.
+
+    Args:
+        mount_point: where the disc is currently mounted (used for apples-to-apples
+                     comparison: walk both sides with _get_dir_size)
+        dir_name:    output directory written by the on_load command
+        source_size: disc size in bytes from _get_mount_size (statvfs fallback)
+        strict:      True for mirror reads (readdvd/dvdbackup): written bytes must
+                     be ≥99% of disc bytes.  False for transcoding flavors: only
+                     verifies that output is non-empty.
+
+    Returns (ok: bool, reason: str)
+        ok=True  → read considered complete
+        ok=False → read incomplete; reason describes what is missing
+    """
+    if not dir_name or not os.path.isdir(dir_name):
+        return False, f"Output directory does not exist: {dir_name}"
+
+    written = _get_dir_size(dir_name)
+    if written == 0:
+        return False, "Output directory is empty — nothing was written"
+
+    if not strict:
+        return True, ""   # for transcoding flavors: non-empty output is sufficient
+
+    # Strict (mirror read): compare written bytes to disc bytes using the same
+    # measurement method on both sides (walk + getsize) — should be exactly equal.
+    if mount_point and os.path.ismount(mount_point):
+        disc_actual = _get_dir_size(mount_point)
+        if disc_actual > 0:
+            if written >= disc_actual:
+                return True, ""
+            pct = written / disc_actual * 100
+            missing = disc_actual - written
+            return False, (f"Incomplete read: {pct:.1f}% written "
+                           f"({_format_size(written)} of {_format_size(disc_actual)}, "
+                           f"missing {_format_size(missing)})")
+
+    # Fallback: compare against source_size (from statvfs — slightly larger than
+    # actual file bytes due to filesystem metadata, so use 97% threshold)
+    if source_size > 0:
+        ratio = written / source_size
+        if ratio >= 0.97:
+            return True, ""
+        pct = ratio * 100
+        missing = source_size - written
+        return False, (f"Incomplete read: {pct:.1f}% written "
+                       f"({_format_size(written)} of ~{_format_size(source_size)}, "
+                       f"missing ~{_format_size(missing)})")
+
+    return True, ""   # disc size unknown — cannot verify, pass
+
+
+def _check_existing_dir(dir_name, source_size, force=False, mount_point=None):
+    """Check whether the target directory for a disc already exists and decide what to do.
+
+    Called before running the on_load command so we can skip or overwrite a disc
+    that was already read in a previous batch run.
+
+    Args:
+        dir_name:    Full path of the disc's output directory (e.g. /Volumes/ext-data/351 - DVD)
+        source_size: Byte count of the mounted disc content (from _get_mount_size / statvfs).
+                     0 means "unknown".
+        force:       True if --force was passed to next/batch.
+        mount_point: If provided and currently mounted, use _get_dir_size(mount_point) for an
+                     apples-to-apples comparison (both sides walk+getsize).  This is the only
+                     reliable way to confirm 100% of bytes were written — statvfs (source_size)
+                     includes filesystem overhead and will never exactly equal dir bytes.
+
+    Returns tuple (action, reason):
+        ("ok",        "")       — dir doesn't exist; proceed normally
+        ("skip",      reason)   — dir exists with complete byte count; skip re-read
+        ("overwrite", reason)   — dir exists but bytes are missing (or --force); delete and re-read
+    """
+    if not dir_name or not os.path.isdir(dir_name):
+        return ("ok", "")
+
+    existing_size = _get_dir_size(dir_name)
+
+    if force:
+        return ("overwrite",
+                f"  Target dir exists ({_format_size(existing_size)}) — --force: deleting and re-reading.")
+
+    # Apples-to-apples: compare walk-based bytes on both sides.
+    # source_size (statvfs) is NOT used here — it includes filesystem overhead
+    # and will always differ from the written file bytes for a fully-read disc.
+    if mount_point and os.path.ismount(mount_point):
+        disc_dir_size = _get_dir_size(mount_point)
+        if disc_dir_size > 0:
+            if existing_size >= disc_dir_size:
+                return ("skip",
+                        f"  Target dir already exists and is complete "
+                        f"({_format_size(existing_size)} written = {_format_size(disc_dir_size)} on disc) — "
+                        f"disc appears already read.\n"
+                        f"  Skipping re-read. Use --force to overwrite.")
+            why = (f"disc={_format_size(disc_dir_size)}, dir={_format_size(existing_size)} — "
+                   f"sizes differ (partial read?)")
+            return ("overwrite",
+                    f"  Target dir exists ({_format_size(existing_size)}) but {why}. "
+                    f"Deleting and re-reading.")
+
+    # Fallback: no mount_point available (e.g. dry-run or pre-check) — use source_size.
+    # source_size is statvfs-based so comparison is approximate; any mismatch → overwrite.
+    if source_size > 0 and existing_size >= source_size * 0.97:
+        return ("skip",
+                f"  Target dir already exists ({_format_size(existing_size)} ≥ 97% of "
+                f"~{_format_size(source_size)} disc size) — disc appears already read.\n"
+                f"  Skipping re-read. Use --force to overwrite.")
+
+    # Sizes differ (partial read, wrong disc, or unknown source size) → overwrite
+    if source_size == 0:
+        why = "disc size unknown — cannot verify"
+    else:
+        why = f"disc≈{_format_size(source_size)}, dir={_format_size(existing_size)} — sizes differ"
+    return ("overwrite",
+            f"  Target dir exists ({_format_size(existing_size)}) but {why}. "
+            f"Deleting and re-reading.")
 
 
 def _get_mount_size(mount_point):
@@ -2538,7 +2926,7 @@ def cmd_unmount(_nimbie, config, _args):
             f"  The disc may be in use by another process.\n"
             f"  Try: diskutil unmount force {mount_point}")
 
-def cmd_eject(nimbie, config, _args):
+def cmd_eject(nimbie, config, args):
     mount_point = config.get("nimbie", "mount_point")
     if os.path.ismount(mount_point):
         msg(f"Unmounting {mount_point}...")
@@ -2546,10 +2934,17 @@ def cmd_eject(nimbie, config, _args):
             err(f"Cannot unmount {mount_point} — disc may be in use\n\n"
                 f"  Try: diskutil unmount force {mount_point}\n"
                 f"  Then: my-nimbie eject")
-    msg("Accepting disc (eject to done bin)...")
-    nimbie.eject_accept()
+    if getattr(args, "force", False):
+        msg("Force-eject: closing tray then sending CMD_ACCEPT directly...")
+        msg("  (Skipping disc_lifted sensor check — use when disc is stuck in cam wheel clamps.)")
+        nimbie.close_tray()
+        time.sleep(1)
+        nimbie.accept_disc()
+    else:
+        msg("Accepting disc (eject to done bin)...")
+        nimbie.eject_accept()
 
-def cmd_reject(nimbie, config, _args):
+def cmd_reject(nimbie, config, args):
     mount_point = config.get("nimbie", "mount_point")
     if os.path.ismount(mount_point):
         msg(f"Unmounting {mount_point}...")
@@ -2557,8 +2952,15 @@ def cmd_reject(nimbie, config, _args):
             err(f"Cannot unmount {mount_point} — disc may be in use\n\n"
                 f"  Try: diskutil unmount force {mount_point}\n"
                 f"  Then: my-nimbie reject")
-    msg("Rejecting disc (eject to reject bin)...")
-    nimbie.eject_reject()
+    if getattr(args, "force", False):
+        msg("Force-reject: closing tray then sending CMD_REJECT directly...")
+        msg("  (Skipping disc_lifted sensor check — use when disc is stuck in cam wheel clamps.)")
+        nimbie.close_tray()
+        time.sleep(1)
+        nimbie.reject_disc()
+    else:
+        msg("Rejecting disc (eject to reject bin)...")
+        nimbie.eject_reject()
 
 
 # ---------------------------------------------------------------------------
@@ -3560,7 +3962,36 @@ def cmd_status(nimbie, config, _args):
                 msg(f"    my-nimbie eject    — open tray, lift disc, drop to accept bin")
                 msg(f"    my-nimbie reject   — open tray, lift disc, drop to reject bin")
             else:
-                msg(f"  No disc in drive.")
+                # disc_lifted=False, disc_in_tray=False, no optical media.
+                # BUT the sensor may be lying: disc can be physically in the cam wheel
+                # clamps while disc_lifted=False (unreliable at top-clamp position, common
+                # after a USB crash/reconnect). Probe with LIFT_DISC to detect this:
+                #   AT+S03 → firmware says "already lifted" → sensor lie → disc in clamps
+                #   AT+S00 → firmware says "no disc in tray" → truly idle
+                # Only probe when tray is closed (tray_out=False); if tray is open,
+                # LIFT_DISC could inadvertently lift a disc on the tray.
+                clamp_stuck = False
+                if not state.get("tray_out"):
+                    try:
+                        probe_resps = nimbie._send_and_read(CMD_LIFT_DISC, "LIFT_DISC probe",
+                                                            timeout=5000, max_reads=5,
+                                                            wait_for_at=False)
+                        probe_at = nimbie._find_at_response(probe_resps)
+                        if probe_at == AT_DROPPER_ERR:
+                            clamp_stuck = True
+                    except Exception:
+                        pass
+                if clamp_stuck:
+                    msg(f"  *** DISC STUCK IN CAM WHEEL CLAMPS (sensor lie) ***")
+                    msg(f"  disc_lifted sensor=False, but firmware reports AT+S03 (disc already in gripper).")
+                    msg(f"  This happens when the batch crashes mid-eject after successfully lifting the disc.")
+                    msg(f"  The disc is physically held by the cam wheels above the tray.")
+                    msg(f"")
+                    msg(f"  Recovery: run 'eject' (handles sensor lie automatically):")
+                    msg(f"    my-nimbie eject    — close tray + CMD_ACCEPT → disc drops to accept bin")
+                    msg(f"    my-nimbie reject   — close tray + CMD_REJECT → disc drops to reject bin")
+                else:
+                    msg(f"  No disc in drive.")
                 if state["disc_available"] and sf.get("current") == "loading":
                     msg("")
                     msg("  *** RETAINER WHEEL / CAM RING MAY BE STUCK — ERROR LED LIKELY LIT ***")
@@ -3791,13 +4222,38 @@ def cmd_status(nimbie, config, _args):
                   "    my-nimbie eject    — open tray, lift disc, drop to accept bin\n"
                   "    my-nimbie reject   — open tray, lift disc, drop to reject bin")
     elif not tray_out and not in_tray and not lifted:
-        stage = "0/5  Idle — no disc in drive"
-        if avail:
-            advice = ("  Actions:\n"
-                      "    my-nimbie next <flavor>    — load and process one disc\n"
-                      "    my-nimbie batch <flavor>   — batch process all discs in hopper")
+        # Sensor shows idle, but the disc_lifted sensor is unreliable at the top clamp
+        # position. Probe with LIFT_DISC to detect the "disc stuck in clamps, sensor lie"
+        # situation (AT+S03 = firmware says already lifted, disc IS physically in clamps).
+        _clamp_stuck = False
+        try:
+            _probe_resps = nimbie._send_and_read(CMD_LIFT_DISC, "LIFT_DISC probe",
+                                                 timeout=5000, max_reads=5,
+                                                 wait_for_at=False)
+            _probe_at = nimbie._find_at_response(_probe_resps)
+            if _probe_at == AT_DROPPER_ERR:
+                _clamp_stuck = True
+        except Exception:
+            pass
+
+        if _clamp_stuck:
+            stage = "4.5  Disc stuck in cam wheel clamps — sensor lie (disc_lifted=False, AT+S03)"
+            advice = ("  *** DISC IN CAM WHEEL CLAMPS — SENSOR LYING ***\n"
+                      "  disc_lifted sensor reports False, but firmware confirms disc is in gripper\n"
+                      "  (AT+S03 = 'already lifted'). Disc is physically held above the tray.\n"
+                      "  This happens when a batch/next crashed mid-eject after successfully lifting.\n"
+                      "\n"
+                      "  Recovery (eject handles sensor lie automatically):\n"
+                      "    my-nimbie eject    — close tray + CMD_ACCEPT → disc drops to accept bin\n"
+                      "    my-nimbie reject   — close tray + CMD_REJECT → disc drops to reject bin")
         else:
-            advice = "  Load discs into the hopper to begin processing."
+            stage = "0/5  Idle — no disc in drive"
+            if avail:
+                advice = ("  Actions:\n"
+                          "    my-nimbie next <flavor>    — load and process one disc\n"
+                          "    my-nimbie batch <flavor>   — batch process all discs in hopper")
+            else:
+                advice = "  Load discs into the hopper to begin processing."
     else:
         stage = "?    Unknown state combination"
         advice = "  Try: my-nimbie reset --diagnostics"
@@ -3843,6 +4299,28 @@ def cmd_status(nimbie, config, _args):
     3. Close tray — drive reads/rips the disc
     4. Open tray, lift disc (gripper picks it up)
     5. Drop disc to accept (done) or reject bin""")
+
+    # Show last few status-log.json entries — same data as monitor, but just once.
+    # This makes status a complete one-shot view without needing to open monitor.
+    try:
+        import json as _json
+        _status_json_path = DEFAULT_STATUS_JSON
+        with open(_status_json_path) as _f:
+            _lines = [l.strip() for l in _f.readlines() if l.strip()]
+        _recent = _lines[-8:]
+        if _recent:
+            msg(f"\n  Recent status-log entries (last {len(_recent)}):")
+            msg(f"  Keys: T=disc_in_tray  A=disc_avail  L=disc_lifted  O=tray_out   ■=yes  □=no")
+            msg("  " + "─" * 70)
+            for _line in _recent:
+                try:
+                    msg("  " + _fmt_status_json_line(_json.loads(_line)))
+                except _json.JSONDecodeError:
+                    pass
+            msg("  " + "─" * 70)
+            msg(f"  (for continuous updates: my-nimbie monitor)")
+    except (FileNotFoundError, OSError):
+        pass
 
     # Verbose: show hardware diagnostics (same as reset --diagnostics)
     if verbose:
@@ -3944,13 +4422,14 @@ def cmd_next(nimbie, config, args):
     result_file = config.get("batch", "result_file", fallback=DEFAULT_RESULT_FILE)
     status_json = config.get("batch", "status_json", fallback=DEFAULT_STATUS_JSON)
     if not dry_run:
-        _rotate_run_files(result_file, status_json=status_json)
+        _rotate_run_files(status_json=status_json)
     status = BatchStatus(flavor, mount_point, target_dir, idx_offset=effective_offset, mode="next", result_file=result_file,
                          dry_run=dry_run)
+    status.write_result_header()
     status.update("starting", disc_nr=disc_nr)
 
-    if deepdebug and not dry_run:
-        dbg(f"Status JSON collector started → {status_json}")
+    if not dry_run:
+        msg(f"  Status log: {status_json}  (tail -f to watch)")
         _start_status_json_collector(nimbie, status_json)
 
     # Check if a disc is already in the drive (before printing startup info)
@@ -4002,6 +4481,21 @@ def cmd_next(nimbie, config, args):
         has_more = nimbie.load_disc()
         dbg(f"cmd_next: load_disc returned has_more={has_more}")
 
+        # Same load-failed guard as cmd_batch: if no disc landed, don't try to mount.
+        if not dry_run and not has_more:
+            _chk = nimbie.get_state(fatal=False)
+            if _chk and not _chk["disc_in_tray"]:
+                err("Load failed: disc did not reach the tray.\n\n"
+                    "  The disc is stuck in the cam wheel clamps between the hopper and tray.\n"
+                    "\n"
+                    "  Recovery options:\n"
+                    "    my-nimbie eject   — close tray + CMD_ACCEPT → disc drops to accept bin\n"
+                    "    my-nimbie reject  — close tray + CMD_REJECT → disc drops to reject bin\n"
+                    "    my-nimbie reset   — full hardware reset + auto-recovery\n"
+                    "\n"
+                    "  After recovery, reload and retry:\n"
+                    "    my-nimbie next --use-loaded   (if disc is now seated on tray)")
+
     if not dry_run:
         if not os.path.ismount(mount_point):
             status.update("waiting for mount")
@@ -4027,6 +4521,27 @@ def cmd_next(nimbie, config, args):
 
     # Get source size before running command (for result tracking)
     source_size = _get_mount_size(mount_point)
+
+    # Duplicate check: if the target dir already exists with the same byte count,
+    # the disc was already read. Skip re-reading unless --force is set.
+    force_flag = getattr(args, "force", False)
+    exist_action, exist_reason = _check_existing_dir(dir_name, source_size, force_flag, mount_point=mount_point)
+    if exist_action == "skip":
+        warn(f"Disc #{disc_nr + (effective_offset or 0)}: already read — {exist_reason}")
+        if not dry_run:
+            unmount_disc(mount_point)
+            nimbie.eject_accept()
+        status.record_accept(index=disc_nr + (effective_offset or 0), dir_name=dir_name,
+                             source_size=source_size, elapsed=0.0,
+                             total_elapsed=status.get_disc_total_elapsed())
+        status.finish()
+        return
+    elif exist_action == "overwrite":
+        warn(f"Disc #{disc_nr + (effective_offset or 0)}: {exist_reason}")
+        if not dry_run and os.path.isdir(dir_name):
+            import shutil as _shutil
+            _shutil.rmtree(dir_name)
+            dbg(f"cmd_next: deleted existing dir {dir_name}")
 
     # Check if command is "pause" — skip command, go straight to pause loop
     if on_load.strip().lower() == "pause":
@@ -4074,6 +4589,17 @@ def cmd_next(nimbie, config, args):
             warn(f"Unknown pause command: '{answer}' (expected: accept/reject/retry)")
             continue
 
+    # Verify read completeness (before unmount, while disc is still accessible)
+    verify_fail_reason = ""
+    if rc == 0 and not dry_run:
+        strict = (flavor == "readdvd")
+        ok, reason = _verify_disc_read(mount_point, dir_name, source_size, strict=strict)
+        if not ok:
+            warn(f"\n  *** READ VERIFICATION FAILED: {reason} ***")
+            warn(f"  Disc #{disc_nr + (effective_offset or 0)} will be REJECTED.")
+            rc = 2
+            verify_fail_reason = reason
+
     dbg(f"cmd_next: unmounting disc before eject")
     unmount_disc(mount_point)
 
@@ -4089,11 +4615,19 @@ def cmd_next(nimbie, config, args):
         status.record_accept(index=index_val, dir_name=dir_name, source_size=source_size,
                              elapsed=elapsed, total_elapsed=total_elapsed)
     else:
-        msg(f"  REJECTING disc #{index_val} (command failed with exit code {rc})")
+        if verify_fail_reason:
+            msg(f"  REJECTING disc #{index_val} (read incomplete: {verify_fail_reason})")
+            fail_result = "INCOMPLETE"
+            fail_reason = verify_fail_reason
+        else:
+            msg(f"  REJECTING disc #{index_val} (command failed with exit code {rc})")
+            fail_result = "FAILED"
+            fail_reason = f"command exit code {rc}"
         status.update("ejecting — rejecting")
         nimbie.eject_reject()
         status.record_reject(index=index_val, dir_name=dir_name, source_size=source_size,
-                             elapsed=elapsed, rc=rc, total_elapsed=total_elapsed)
+                             elapsed=elapsed, rc=rc, total_elapsed=total_elapsed,
+                             fail_reason=fail_reason, result=fail_result)
 
     if has_more:
         msg("  Hopper has more discs available.")
@@ -4101,6 +4635,7 @@ def cmd_next(nimbie, config, args):
         msg("  Hopper is empty — that was the last disc.")
 
     status.finish()
+    status.write_result_trailer("FINISHED")
     try:
         os.unlink(PROGRESS_FILE)
     except OSError:
@@ -4170,13 +4705,14 @@ def cmd_batch(nimbie, config, args):
     result_file = config.get("batch", "result_file", fallback=DEFAULT_RESULT_FILE)
     status_json = config.get("batch", "status_json", fallback=DEFAULT_STATUS_JSON)
     if not dry_run:
-        _rotate_run_files(result_file, status_json=status_json)
+        _rotate_run_files(status_json=status_json)
     status = BatchStatus(flavor, mount_point, target_dir, idx_offset=effective_offset, mode="batch", result_file=result_file,
                          dry_run=dry_run)
+    status.write_result_header()
     batch_status = status
 
-    if deepdebug and not dry_run:
-        dbg(f"Status JSON collector started → {status_json}")
+    if not dry_run:
+        msg(f"  Status log: {status_json}  (tail -f to watch)")
         _start_status_json_collector(nimbie, status_json)
 
     # Install SIGUSR1 handler for live status queries
@@ -4240,7 +4776,12 @@ def cmd_batch(nimbie, config, args):
 
     try:
         while not interrupted:
+            _wait_if_paused(status)
+            if interrupted:
+                break
+
             status.disc_nr += 1
+            index_val = status.disc_nr + (effective_offset or 0)
 
             if max_discs > 0 and status.disc_nr > max_discs:
                 msg(f"\n  Reached max_discs limit ({max_discs}). Stopping.")
@@ -4266,6 +4807,23 @@ def cmd_batch(nimbie, config, args):
                 msg("  Loading disc from hopper...")
                 has_more = nimbie.load_disc()
 
+                # Verify a disc actually landed on the tray. place_disc() can return False
+                # when the hopper appears empty AND no disc reached the tray (e.g. disc
+                # fell into the transit chute and automatic recovery couldn't seat it).
+                # In that case, skip wait_for_mount — there's nothing to mount.
+                if not dry_run and not has_more:
+                    _chk = nimbie.get_state(fatal=False)
+                    if _chk and not _chk["disc_in_tray"]:
+                        warn("  Load failed: disc did not reach the tray — stuck in cam wheel clamps.\n"
+                             "  Use 'my-nimbie eject' or 'my-nimbie reject' to release it, then reload.")
+                        status.update("load-failed", status.disc_nr)
+                        total_elapsed = status.get_disc_total_elapsed()
+                        status.record_reject(index=index_val, dir_name="", source_size=0,
+                                             elapsed=0.0, rc=1, total_elapsed=total_elapsed,
+                                             result="ABORTED", fail_reason="load failed — disc did not reach tray")
+                        msg("  Stopping batch — cannot continue without a disc in drive.")
+                        break
+
             if not dry_run:
                 if not os.path.ismount(mount_point):
                     status.update("waiting for mount", status.disc_nr)
@@ -4275,7 +4833,10 @@ def cmd_batch(nimbie, config, args):
                 if not wait_for_mount(mount_point, mount_timeout, poll_interval):
                     warn(f"Disc did not mount within {mount_timeout}s — rejecting")
                     nimbie.eject_reject()
-                    status.record_reject()
+                    total_elapsed = status.get_disc_total_elapsed()
+                    status.record_reject(index=index_val, dir_name="", source_size=0,
+                                         elapsed=0.0, rc=1, total_elapsed=total_elapsed,
+                                         result="FAILED", fail_reason="mount timeout")
                     if not has_more:
                         msg("  Hopper empty. Stopping.")
                         break
@@ -4292,9 +4853,31 @@ def cmd_batch(nimbie, config, args):
                 dir_name = dir_name_part
             msg(f"  Dir name:   {dir_name}")
 
-            # Get source size + index for result tracking
+            # Get source size for result tracking (index_val already computed at top of loop)
             source_size = _get_mount_size(mount_point)
-            index_val = status.disc_nr + (effective_offset or 0)
+
+            # Duplicate check: if the target dir already exists with the same byte count,
+            # the disc was already read. Skip re-reading unless --force is set.
+            force_flag = getattr(args, "force", False)
+            exist_action, exist_reason = _check_existing_dir(dir_name, source_size, force_flag, mount_point=mount_point)
+            if exist_action == "skip":
+                warn(f"  Disc #{index_val}: already read —{exist_reason}")
+                if not dry_run:
+                    unmount_disc(mount_point)
+                    nimbie.eject_accept()
+                status.record_accept(index=index_val, dir_name=dir_name,
+                                     source_size=source_size, elapsed=0.0,
+                                     total_elapsed=status.get_disc_total_elapsed())
+                if not has_more:
+                    msg("  Hopper empty. Stopping.")
+                    break
+                continue
+            elif exist_action == "overwrite":
+                warn(f"  Disc #{index_val}:{exist_reason}")
+                if not dry_run and os.path.isdir(dir_name):
+                    import shutil as _shutil
+                    _shutil.rmtree(dir_name)
+                    dbg(f"cmd_batch: deleted existing dir {dir_name}")
 
             # Check if command is "pause"
             is_pause_cmd = on_load.strip().lower() == "pause"
@@ -4334,7 +4917,8 @@ def cmd_batch(nimbie, config, args):
                     nimbie.eject_reject()
                     total_elapsed = status.get_disc_total_elapsed()
                     status.record_reject(index=index_val, dir_name=dir_name, source_size=source_size,
-                                         elapsed=elapsed, rc=rc, total_elapsed=total_elapsed)
+                                         elapsed=elapsed, rc=rc, total_elapsed=total_elapsed,
+                                         result="STOPPED", fail_reason="user stop")
                     stop_batch = True
                     break
                 elif answer == "reject":
@@ -4345,6 +4929,17 @@ def cmd_batch(nimbie, config, args):
                     continue
             if stop_batch:
                 break
+
+            # Verify read completeness (before unmount, while disc is still accessible)
+            verify_fail_reason = ""
+            if rc == 0 and not dry_run:
+                strict = (flavor == "readdvd")
+                ok, reason = _verify_disc_read(mount_point, dir_name, source_size, strict=strict)
+                if not ok:
+                    warn(f"\n  *** READ VERIFICATION FAILED: {reason} ***")
+                    warn(f"  Disc #{index_val} will be REJECTED.")
+                    rc = 2
+                    verify_fail_reason = reason
 
             unmount_disc(mount_point)
 
@@ -4358,10 +4953,18 @@ def cmd_batch(nimbie, config, args):
                 status.record_accept(index=index_val, dir_name=dir_name, source_size=source_size,
                                      elapsed=elapsed, total_elapsed=total_elapsed)
             else:
-                msg(f"  Disc #{status.disc_nr}: REJECTING (command failed with exit code {rc})")
+                if verify_fail_reason:
+                    msg(f"  Disc #{status.disc_nr}: REJECTING (read incomplete: {verify_fail_reason})")
+                    batch_fail_result = "INCOMPLETE"
+                    batch_fail_reason = verify_fail_reason
+                else:
+                    msg(f"  Disc #{status.disc_nr}: REJECTING (command failed with exit code {rc})")
+                    batch_fail_result = "FAILED"
+                    batch_fail_reason = f"command exit code {rc}"
                 nimbie.eject_reject()
                 status.record_reject(index=index_val, dir_name=dir_name, source_size=source_size,
-                                     elapsed=elapsed, rc=rc, total_elapsed=total_elapsed)
+                                     elapsed=elapsed, rc=rc, total_elapsed=total_elapsed,
+                                     fail_reason=batch_fail_reason, result=batch_fail_result)
 
             if not has_more:
                 msg("  Hopper empty. Stopping.")
@@ -4370,6 +4973,7 @@ def cmd_batch(nimbie, config, args):
         # Summary
         final_state = "interrupted" if interrupted else "finished"
         status.finish(final_state)
+        status.write_result_trailer("INTERRUPTED" if interrupted else "FINISHED")
 
         msg(f"\n{'=' * 60}")
         msg(f"  Batch {final_state} (flavor: {flavor_label})")
@@ -4394,6 +4998,35 @@ NAMING_VARS_HELP = """\
   {DVD_TITLE}   — volume name of the disc (lazy: only read when referenced)
   {FLAVOR}      — batch flavor name ("default", "ripdvd", "ripaudio", "readdvd")
   {DATE}        — current date as YYYY-MM-DD"""
+
+
+class _NimbieFormatter(argparse.RawDescriptionHelpFormatter):
+    """Custom formatter: short options same cyan as long options; command names green in description."""
+
+    def _set_color(self, color):
+        super()._set_color(color)
+        import dataclasses
+        self._theme = dataclasses.replace(
+            self._theme,
+            short_option=self._theme.long_option,
+            summary_short_option=self._theme.summary_long_option,
+        )
+
+    def _format_text(self, text):
+        result = super()._format_text(text)
+        t = self._theme
+        if not t.action:
+            return result
+        # Colorize non-indented section headings (lines containing ':') with heading color
+        result = re.sub(
+            r'^([^\s][^:\n]*:[^\n]*)',
+            lambda m: t.heading + m.group(1) + t.reset,
+            result, flags=re.MULTILINE,
+        )
+        # Colorize command names: 4-space indent + lowercase command name (green)
+        def _color_cmd(m):
+            return m.group(1) + t.action + m.group(2) + t.reset + m.group(3)
+        return re.sub(r'^(    )([a-z][a-z-]*)(\s+)', _color_cmd, result, flags=re.MULTILINE)
 
 
 class _HelpfulParser(argparse.ArgumentParser):
@@ -4657,7 +5290,7 @@ class TestArgvExpansion(unittest.TestCase):
             else:
                 expanded.append(arg)
         subcommands = {"load", "eject", "reject", "unmount", "status", "next", "batch", "reset", "cancel", "monitor"}
-        global_flags = {"-D", "-v", "-V", "-d", "--debug", "--verbose", "--dry", "--deepdbg"}
+        global_flags = {"-D", "-v", "-V", "--debug", "--verbose", "--version", "--dry", "--deepdbg"}
         hoisted = []
         rest = []
         found_subcmd = False
@@ -4698,7 +5331,8 @@ class TestArgvExpansion(unittest.TestCase):
     def test_help_subcommand_rewrite(self):
         """--help batch must be rewritten to batch --help before parsing."""
         _all_subcommands = {"load", "eject", "reject", "unmount", "status", "next", "batch",
-                            "reset", "cancel", "monitor", "accept", "retry", "stop", "probe"}
+                            "reset", "cancel", "monitor", "accept", "retry", "stop", "probe",
+                            "pause", "unpause", "continue"}
         def _rewrite(argv):
             if len(argv) >= 2 and argv[0] in ("--help", "-h") and argv[1] in _all_subcommands:
                 return [argv[1], "--help"] + argv[2:]
@@ -4709,6 +5343,124 @@ class TestArgvExpansion(unittest.TestCase):
         self.assertEqual(_rewrite(["--help", "probe"]), ["probe", "--help"])
         self.assertEqual(_rewrite(["--help"]),           ["--help"])          # no subcommand → unchanged
         self.assertEqual(_rewrite(["batch", "--help"]), ["batch", "--help"])  # already correct → unchanged
+
+
+class TestArgvPreprocessing(unittest.TestCase):
+    """Tests for the new pre-processing logic in main():
+    command-flag normalisation, --help position-0 conversion, --<cmd> → cmd.
+    """
+
+    _all_subcommands = {
+        "load", "eject", "reject", "unmount", "status", "next", "batch",
+        "reset", "cancel", "monitor", "accept", "retry", "stop", "probe",
+        "pause", "unpause", "continue", "config", "create-config",
+        "version", "help", "test",
+    }
+
+    def _preprocess(self, argv):
+        """Minimal replica of main()'s argv pre-processing (steps 1a, 1b, 2, 3)."""
+        argv = list(argv)
+        all_subcommands = self._all_subcommands
+
+        # 1a. --help/-h at position 0 → "help"
+        if argv and argv[0] in ("--help", "-h"):
+            argv = ["help"] + argv[1:]
+
+        # 1b. command-flags before first subcommand
+        _flag_to_cmd = {
+            "--version": "version", "-v": "version",
+            "--test": "test",
+            "--create-config": "create-config",
+        }
+        new_argv = []
+        seen = False
+        for arg in argv:
+            if not seen and arg in all_subcommands:
+                seen = True
+            if not seen and arg in _flag_to_cmd:
+                new_argv.append(_flag_to_cmd[arg])
+            else:
+                new_argv.append(arg)
+        argv = new_argv
+
+        # 2. "help --config" → "help config"
+        if len(argv) >= 2 and argv[0] == "help" and argv[1] == "--config":
+            argv = ["help", "config"] + argv[2:]
+
+        # 3. --<subcommand> → <subcommand> before first subcommand (not --config)
+        _skip = {"config"}
+        new_argv = []
+        seen = False
+        for arg in argv:
+            if not seen and arg in all_subcommands:
+                seen = True
+            if (not seen and arg.startswith("--") and arg[2:] in all_subcommands
+                    and arg[2:] not in _skip):
+                new_argv.append(arg[2:])
+            else:
+                new_argv.append(arg)
+        return new_argv
+
+    def test_help_at_position_0_becomes_help_command(self):
+        self.assertEqual(self._preprocess(["--help"]), ["help"])
+
+    def test_h_at_position_0_becomes_help_command(self):
+        self.assertEqual(self._preprocess(["-h"]), ["help"])
+
+    def test_help_with_topic(self):
+        self.assertEqual(self._preprocess(["--help", "batch"]), ["help", "batch"])
+
+    def test_help_dash_config_becomes_help_config(self):
+        """--help --config must resolve to: show config subcommand help."""
+        self.assertEqual(self._preprocess(["--help", "--config"]), ["help", "config"])
+
+    def test_subcommand_internal_help_not_converted(self):
+        """batch --help: the --help after a subcommand stays, for argparse auto-help."""
+        result = self._preprocess(["batch", "--help"])
+        self.assertEqual(result, ["batch", "--help"])
+
+    def test_create_config_internal_help_not_converted(self):
+        """create-config --help: --help after subcommand stays for argparse."""
+        result = self._preprocess(["create-config", "--help"])
+        self.assertEqual(result, ["create-config", "--help"])
+
+    def test_version_flag_becomes_version_command(self):
+        self.assertEqual(self._preprocess(["--version"]), ["version"])
+
+    def test_v_flag_becomes_version_command(self):
+        self.assertEqual(self._preprocess(["-v"]), ["version"])
+
+    def test_test_flag_becomes_test_command(self):
+        self.assertEqual(self._preprocess(["--test"]), ["test"])
+
+    def test_create_config_flag_becomes_subcommand(self):
+        self.assertEqual(self._preprocess(["--create-config"]), ["create-config"])
+
+    def test_create_config_flag_with_path(self):
+        self.assertEqual(self._preprocess(["--create-config", "/my/path"]),
+                         ["create-config", "/my/path"])
+
+    def test_dash_batch_becomes_batch(self):
+        """--batch → batch (user typed wrong form)."""
+        self.assertEqual(self._preprocess(["--batch", "readdvd"]), ["batch", "readdvd"])
+
+    def test_dash_pause_becomes_pause(self):
+        self.assertEqual(self._preprocess(["--pause"]), ["pause"])
+
+    def test_config_flag_not_converted_to_subcommand(self):
+        """--config FILE must NOT be converted to 'config FILE' subcommand."""
+        result = self._preprocess(["--config", "/my/file", "batch"])
+        self.assertEqual(result, ["--config", "/my/file", "batch"])
+
+    def test_version_after_global_flags_converted(self):
+        """--version after global flags (but before subcommand) is converted."""
+        result = self._preprocess(["--dry", "--version"])
+        self.assertEqual(result, ["--dry", "version"])
+
+    def test_version_after_subcommand_not_converted(self):
+        """--version after a subcommand is not converted (stays as unknown flag)."""
+        result = self._preprocess(["batch", "--version"])
+        self.assertEqual(result, ["batch", "--version"])
 
 
 class TestStripQuotes(unittest.TestCase):
@@ -4897,16 +5649,16 @@ class TestMonitorCommandParser(unittest.TestCase):
                        "next", "batch", "reset", "cancel", "monitor"}
         self.assertIn("monitor", subcommands)
 
-    def test_monitor_help_contains_tail_instruction(self):
-        """--help monitor description must mention tail -f and CTRL+C."""
+    def test_monitor_help_content(self):
+        """monitor --help description must mention the status-log file, CTRL+C, and no-USB guarantee."""
         parser = build_parser()
         sub_actions = [a for a in parser._subparsers._group_actions
                        if hasattr(a, '_name_parser_map')]
         monitor_parser = sub_actions[0]._name_parser_map["monitor"]
-        # --help <subcommand> shows description + epilog, not format_help()
         desc = (monitor_parser.description or "") + (monitor_parser.epilog or "")
-        self.assertIn("tail -f", desc, "--help monitor description should mention 'tail -f'")
-        self.assertIn("CTRL+C", desc, "--help monitor description should mention CTRL+C")
+        self.assertIn("status-log.json", desc, "description should name the status log file")
+        self.assertIn("CTRL+C", desc, "description should mention CTRL+C to stop")
+        self.assertIn("no USB", desc, "description should mention no USB calls (safe to run alongside batch)")
 
     def test_help_subcommand_shows_description_not_usage(self):
         """--help batch output must contain the description and NOT the usage line."""
@@ -4991,6 +5743,248 @@ class TestCommandHelpDescriptions(unittest.TestCase):
         self.assertIn("--dry", p.epilog)
         self.assertIn("--debug", p.epilog)
 
+    def test_eject_has_force_flag(self):
+        p = self._get_subparser("eject")
+        flag_names = [s for a in p._actions for s in a.option_strings]
+        self.assertIn("--force", flag_names)
+
+    def test_reject_has_force_flag(self):
+        p = self._get_subparser("reject")
+        flag_names = [s for a in p._actions for s in a.option_strings]
+        self.assertIn("--force", flag_names)
+
+    def test_eject_description_mentions_force_recovery(self):
+        """eject --help must explain the --force flag for cam-wheel clamp recovery."""
+        p = self._get_subparser("eject")
+        self.assertIn("--force", p.description)
+        self.assertIn("cam wheel", p.description)
+
+    def test_reject_description_mentions_force_recovery(self):
+        """reject --help must explain the --force flag for cam-wheel clamp recovery."""
+        p = self._get_subparser("reject")
+        self.assertIn("--force", p.description)
+        self.assertIn("cam wheel", p.description)
+
+
+class TestLiftDiscAt_S03Recovery(unittest.TestCase):
+    """lift_disc() must return True when firmware says AT+S03 (disc already in gripper),
+    even if the disc_lifted sensor bit reads False (sensor lies at top clamp position)."""
+
+    def _make_nimbie_with_responses(self, send_responses, state_disc_lifted=False):
+        """Build a NimbieDevice with faked _send_and_read and get_state."""
+        import types
+
+        nimbie = object.__new__(NimbieDevice)
+        nimbie._usb_lock = threading.Lock()
+        nimbie.dev = object()   # non-None so _send_command doesn't abort
+
+        call_count = {"n": 0}
+        resp_list = list(send_responses)
+
+        def fake_send_and_read(_self, _cmd, _label, **_kw):
+            idx = call_count["n"]
+            call_count["n"] += 1
+            if idx < len(resp_list):
+                return resp_list[idx]
+            return []
+
+        def fake_get_state(_self, fatal=True):  # noqa: ARG001
+            return {"disc_lifted": state_disc_lifted, "disc_in_tray": False,
+                    "disc_available": False, "tray_out": False}
+
+        nimbie._send_and_read = types.MethodType(fake_send_and_read, nimbie)
+        nimbie.get_state      = types.MethodType(fake_get_state, nimbie)
+        return nimbie
+
+    def test_at_s03_with_disc_lifted_true_returns_true(self):
+        """AT+S03 + disc_lifted=True → True (already in gripper, normal case)."""
+        nimbie = self._make_nimbie_with_responses([[AT_DROPPER_ERR]], state_disc_lifted=True)
+        result = NimbieDevice.lift_disc(nimbie)
+        self.assertTrue(result)
+
+    def test_at_s03_with_disc_lifted_false_returns_true(self):
+        """AT+S03 + disc_lifted=False → True (sensor lie after crash — treat as in gripper)."""
+        nimbie = self._make_nimbie_with_responses([[AT_DROPPER_ERR]], state_disc_lifted=False)
+        result = NimbieDevice.lift_disc(nimbie)
+        self.assertTrue(result)
+
+    def test_at_ok_returns_true(self):
+        """AT+O (success) path still works."""
+        nimbie = self._make_nimbie_with_responses([[AT_OK]])
+        # _poll_state must exist; stub it to do nothing
+        import types
+        nimbie._poll_state = types.MethodType(lambda s, fn, label, timeout=10: None, nimbie)
+        result = NimbieDevice.lift_disc(nimbie)
+        self.assertTrue(result)
+
+    def test_at_no_disc_returns_false(self):
+        """AT+S00 (no disc in tray) → False."""
+        nimbie = self._make_nimbie_with_responses([[AT_NO_DISC]])
+        result = NimbieDevice.lift_disc(nimbie)
+        self.assertFalse(result)
+
+
+class TestCheckExistingDir(unittest.TestCase):
+    """_check_existing_dir() must correctly classify ok / skip / overwrite."""
+
+    def _make_dir(self, tmpdir, files):
+        """Create files in tmpdir with given sizes (dict name→bytes). Returns path."""
+        import tempfile, os
+        d = tempfile.mkdtemp(dir=tmpdir)
+        for name, size in files.items():
+            with open(os.path.join(d, name), "wb") as f:
+                f.write(b"\x00" * size)
+        return d
+
+    def test_dir_does_not_exist(self):
+        """Non-existent dir → ok (proceed normally)."""
+        action, _ = _check_existing_dir("/tmp/__nimbie_nonexistent_12345__", 1000)
+        self.assertEqual(action, "ok")
+
+    def test_same_size_no_force_skip(self):
+        """Dir exists with same byte count and no --force → skip."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._make_dir(tmp, {"VIDEO_TS": 5000, "AUDIO_TS": 200})
+            total = 5000 + 200
+            action, reason = _check_existing_dir(d, total, force=False)
+            self.assertEqual(action, "skip")
+            self.assertIn("already read", reason)
+
+    def test_same_size_with_force_overwrite(self):
+        """Dir exists with same byte count but --force → overwrite."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._make_dir(tmp, {"file.vob": 3000})
+            action, reason = _check_existing_dir(d, 3000, force=True)
+            self.assertEqual(action, "overwrite")
+            self.assertIn("--force", reason)
+
+    def test_different_size_no_force_overwrite(self):
+        """Dir exists but sizes differ (partial read) → overwrite without --force."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._make_dir(tmp, {"file.vob": 1000})
+            action, reason = _check_existing_dir(d, 9000, force=False)
+            self.assertEqual(action, "overwrite")
+            self.assertIn("sizes differ", reason)
+
+    def test_source_size_zero_overwrite(self):
+        """Source size unknown (0) → cannot verify → overwrite."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._make_dir(tmp, {"file.vob": 1000})
+            action, reason = _check_existing_dir(d, 0, force=False)
+            self.assertEqual(action, "overwrite")
+            self.assertIn("unknown", reason)
+
+    def test_skip_reason_mentions_force(self):
+        """Skip reason must tell user how to force overwrite."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._make_dir(tmp, {"a": 42})
+            _, reason = _check_existing_dir(d, 42, force=False)
+            self.assertIn("--force", reason)
+
+
+class TestVerifyDiscRead(unittest.TestCase):
+    """_verify_disc_read() must correctly detect complete vs incomplete reads."""
+
+    def _make_dir(self, tmpdir, files):
+        """Create files in tmpdir with given sizes (dict name→bytes). Returns path."""
+        import tempfile
+        d = tempfile.mkdtemp(dir=tmpdir)
+        for name, size in files.items():
+            with open(os.path.join(d, name), "wb") as f:
+                f.write(b"\x00" * size)
+        return d
+
+    def test_nonexistent_dir_fails(self):
+        ok, reason = _verify_disc_read("/mnt/DVD", "/tmp/__nimbie_nonexistent__", 0)
+        self.assertFalse(ok)
+        self.assertIn("does not exist", reason)
+
+    def test_empty_dir_fails(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, "emptydir")
+            os.makedirs(d)
+            ok, reason = _verify_disc_read(None, d, 0)
+            self.assertFalse(ok)
+            self.assertIn("empty", reason)
+
+    def test_non_strict_nonempty_passes(self):
+        """Non-strict (transcoding): non-empty output dir is sufficient."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._make_dir(tmp, {"output.mkv": 5000})
+            ok, _ = _verify_disc_read(None, d, 10000, strict=False)
+            self.assertTrue(ok)
+
+    def test_strict_no_mount_complete_by_source_size(self):
+        """Strict, no mount: written >= 97% of source_size → pass."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._make_dir(tmp, {"VIDEO_TS": 9800})
+            ok, _ = _verify_disc_read(None, d, 10000, strict=True)
+            self.assertTrue(ok)
+
+    def test_strict_no_mount_incomplete_by_source_size(self):
+        """Strict, no mount: written < 97% of source_size → fail."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._make_dir(tmp, {"VIDEO_TS": 5000})
+            ok, reason = _verify_disc_read(None, d, 10000, strict=True)
+            self.assertFalse(ok)
+            self.assertIn("Incomplete", reason)
+
+    def test_strict_no_source_size_passes(self):
+        """Strict, no mount, source_size=0 (unknown) → pass (cannot verify)."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._make_dir(tmp, {"file.vob": 100})
+            ok, _ = _verify_disc_read(None, d, 0, strict=True)
+            self.assertTrue(ok)
+
+    def test_result_file_has_pid_column(self):
+        """Result file lines must start with PID as first field."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".result", delete=False) as tf:
+            rf = tf.name
+        try:
+            status = BatchStatus(flavor="readdvd", mount_point="/Volumes/DVD",
+                                 target_dir="/out", result_file=rf)
+            status.write_result_header()
+            status.record_disc(210, "/out/210", 1000, 10.0, 0, "successful")
+            with open(rf) as f:
+                lines = [l.strip() for l in f.readlines() if l.strip()]
+            # Header line starts with #
+            self.assertTrue(lines[0].startswith("#"))
+            # Header contains PID
+            self.assertIn(str(os.getpid()), lines[0])
+            # Data line first field is PID
+            data_line = lines[1]
+            first_field = data_line.split()[0]
+            self.assertEqual(first_field, str(os.getpid()))
+        finally:
+            os.unlink(rf)
+
+    def test_result_file_fail_reason_appended(self):
+        """Failed disc entries must include fail_reason in brackets."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".result", delete=False) as tf:
+            rf = tf.name
+        try:
+            status = BatchStatus(flavor="readdvd", mount_point="/Volumes/DVD",
+                                 target_dir="/out", result_file=rf)
+            status.record_disc(210, "/out/210", 1000, 10.0, 2, "rejected",
+                               fail_reason="Incomplete read: 50.0% written")
+            with open(rf) as f:
+                line = f.read()
+            self.assertIn("[Incomplete read", line)
+        finally:
+            os.unlink(rf)
+
 
 def _run_tests():
     """Run unit tests."""
@@ -5005,6 +5999,7 @@ def _run_tests():
         TestBatchStatusRecordDisc,
         TestOffsetIndex,
         TestArgvExpansion,
+        TestArgvPreprocessing,
         TestStripQuotes,
         TestCrashDiscDetection,
         TestStalePidDetection,
@@ -5012,6 +6007,9 @@ def _run_tests():
         TestStatusJsonCollector,
         TestMonitorCommandParser,
         TestCommandHelpDescriptions,
+        TestLiftDiscAt_S03Recovery,
+        TestCheckExistingDir,
+        TestVerifyDiscRead,
     ]
     for cls in test_classes:
         suite.addTests(loader.loadTestsFromTestCase(cls))
@@ -5020,271 +6018,365 @@ def _run_tests():
     sys.exit(0 if result.wasSuccessful() else 1)
 
 
-def cmd_monitor(_nimbie, config, _args):
-    """Start the status JSON collector and monitor the Nimbie in real time.
+def _fmt_status_json_line(entry):
+    """Format one status-log.json entry as a compact human-readable line.
 
-    Waits for the Nimbie to appear on USB (every 0.1s), writing a JSON entry
-    for each probe attempt (found or not-found). This allows starting the
-    monitor BEFORE powering on the device and watching it come online.
+    Shared by cmd_monitor (live stream) and cmd_status (tail section).
+    Format: HH:MM:SS.mm  T ■ A ■ L □ O □   phase      #disc   progress...
+    """
+    ts_raw = entry.get("ts", "?")
+    try:
+        t_part = ts_raw.split("_")[1]
+        hhmm   = t_part[:4]
+        sec    = t_part[5:10]
+        ts_str = f"{hhmm[:2]}:{hhmm[2:]}:{sec}"
+    except Exception:
+        ts_str = ts_raw
+
+    def _b(v):
+        return "■" if v else "□"
+
+    hw = entry.get("hw", {})
+    err_str = hw.get("error", "")
+    if err_str:
+        hw_str = "T ? A ? L ? O ?" if "transient" in err_str else f"ERR: {err_str[:40]}"
+    else:
+        hw_str = (f"T {_b(hw.get('disc_in_tray'))} "
+                  f"A {_b(hw.get('disc_available'))} "
+                  f"L {_b(hw.get('disc_lifted'))} "
+                  f"O {_b(hw.get('tray_out'))}")
+
+    batch = entry.get("batch", {})
+    if batch:
+        phase = batch.get("phase", "")
+        disc  = batch.get("disc_nr", "")
+        b_str = f"{phase:<10} #{disc}" if disc else f"{phase:<10}"
+    else:
+        b_str = ""
+
+    prog = entry.get("progress", "").strip()
+    if len(prog) > 60:
+        prog = prog[:57] + "..."
+
+    parts = [f"{ts_str}  {hw_str:<20}"]
+    if b_str:
+        parts.append(f"  {b_str}")
+    if prog:
+        parts.append(f"  {prog}")
+    return "".join(parts)
+
+
+def cmd_monitor(_nimbie, _config, args):
+    """Read the status-log.json written by batch/next and display it in real time.
+
+    No USB calls — reads the file the batch collector thread already writes.
+    Safe to run at any time; cannot interfere with a running batch.
     """
     import json as _json
     import time as _time
 
-    force = getattr(_args, "force", False)
-    stop  = getattr(_args, "stop",  False)
+    status_json = DEFAULT_STATUS_JSON
 
-    def _send_stop_to_existing():
-        """Send SIGTERM to the monitor in MONITOR_PID_FILE. Returns pid or None."""
-        try:
-            with open(MONITOR_PID_FILE) as _f:
-                _pid = int(_f.read().strip())
-        except (FileNotFoundError, ValueError):
-            return None
-        try:
-            os.kill(_pid, 0)  # check alive
-        except OSError:
-            return None   # already dead
-        os.kill(_pid, signal.SIGTERM)
-        return _pid
+    # ── header ───────────────────────────────────────────────────────────────
+    msg("")
+    msg("  my-nimbie monitor")
+    msg(f"  File : {status_json}")
+    msg(f"  Keys : T=tray_in  A=disc_avail  L=disc_lifted  O=tray_out   ■=yes  □=no")
+    msg(f"  Cols : TIME        T A L O   PHASE #DISC   PROGRESS")
+    msg("  " + "─" * 70)
+    msg("")
 
-    # --stop: send SIGTERM to running monitor and exit (no new monitor started)
-    if stop:
-        _pid = _send_stop_to_existing()
-        if _pid is None:
-            msg("No monitor process is running.")
-        else:
-            msg(f"Sent SIGTERM to monitor (PID {_pid}) — it will stop gracefully.")
-        return
+    _fmt = _fmt_status_json_line   # use module-level formatter
 
-    # Enforce single-instance: fail if another monitor is already running,
-    # unless --force is given (send SIGTERM, wait for graceful exit, then start fresh).
+    # ── wait for file ─────────────────────────────────────────────────────────
+    waited = 0
+    while not os.path.exists(status_json):
+        if waited == 0:
+            msg(f"  Waiting for {status_json} ...")
+        _time.sleep(0.5)
+        waited += 0.5
+        if waited > 60:
+            err(f"Status log not found after 60s: {status_json}\n\n"
+                f"  Start a batch first:  my-nimbie batch readdvd\n"
+                f"  The collector writes to this file automatically.")
+
+    # ── show last few lines for context, then follow ──────────────────────────
+    CONTEXT_LINES = 5
     try:
-        with open(MONITOR_PID_FILE) as _f:
-            _old_pid = int(_f.read().strip())
-        try:
-            os.kill(_old_pid, 0)
-            _still_running = True
-        except OSError:
-            _still_running = False
-        if _still_running:
-            if not force:
-                err(f"Monitor already running (PID {_old_pid}).\n\n"
-                    f"  Use 'my-nimbie monitor --stop'  to stop it gracefully.\n"
-                    f"  Use 'my-nimbie monitor --force' to stop it and start a fresh one.\n"
-                    f"  Multiple monitors corrupt {DEFAULT_STATUS_JSON}.")
-            # --force: send SIGTERM and wait up to 2s for graceful exit
-            os.kill(_old_pid, signal.SIGTERM)
-            for _ in range(20):
-                _time.sleep(0.1)
+        with open(status_json) as _f:
+            all_lines = _f.readlines()
+        recent = [l.strip() for l in all_lines[-CONTEXT_LINES:] if l.strip()]
+        if recent:
+            msg(f"  (last {len(recent)} entries from existing log)")
+            for line in recent:
                 try:
-                    os.kill(_old_pid, 0)
-                except OSError:
-                    break   # gone
-            else:
-                # Still alive after 2s — force kill
-                try:
-                    os.kill(_old_pid, signal.SIGKILL)
-                except OSError:
+                    msg("  " + _fmt(_json.loads(line)))
+                except _json.JSONDecodeError:
                     pass
-            msg(f"  Stopped existing monitor (PID {_old_pid}).")
-    except (FileNotFoundError, ValueError):
-        pass  # no pid file or invalid content — no previous monitor
-
-    # Write our own PID so future invocations can find us
-    try:
-        with open(MONITOR_PID_FILE, "w") as _f:
-            _f.write(str(os.getpid()))
+            msg("  " + "─" * 70)
     except OSError:
         pass
 
-    # SIGTERM handler: raises SystemExit so the finally block cleans up the PID file.
-    # This makes "my-nimbie monitor --stop" (which sends SIGTERM) a clean shutdown.
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-
-    status_json = config.get("batch", "status_json", fallback=DEFAULT_STATUS_JSON)
-    _rotate_file(status_json)
-    # Create file immediately so "tail -f" works before first write
-    try:
-        open(status_json, "w").close()
-    except OSError:
-        pass
-
-    vid = int(config.get("nimbie", "vid"), 16)
-    pid_val = int(config.get("nimbie", "pid"), 16)
-
-    msg("")
-    msg("=" * 60)
-    msg("  my-nimbie monitor — real-time status collector")
-    msg("=" * 60)
-    msg("")
-    msg(f"  Polling every 0.1s — watching USB for Nimbie (normal) or bootloader mode.")
-    msg(f"  Each JSON entry has \"usb\": \"offline\" | \"bootloader\" | \"normal\".")
-    msg(f"  Writing JSON snapshots to:")
-    msg(f"    {status_json}")
-    msg("")
-    msg(f"  Watch in another terminal:")
-    msg(f"    tail -f {status_json}")
-    msg("")
-    msg("  Press CTRL+C to stop.")
-    msg("")
-
-    def _write(entry):
-        entry["ts"] = _ts()
+    # ── status block helper ───────────────────────────────────────────────────
+    def _print_status_block():
+        """Print a compact status summary from the BatchStatus file."""
+        sf = BatchStatus.read_file()
+        if not sf:
+            return
+        disc_nr   = sf.get("disc_nr", "?")
+        idx_offset = sf.get("idx_offset") or 0
         try:
-            with open(status_json, "a") as f:
-                f.write(_json.dumps(entry) + "\n")
-        except OSError:
+            index_val = f"index {int(disc_nr) + int(idx_offset)}"
+        except (ValueError, TypeError):
+            index_val = ""
+        state     = sf.get("current") or sf.get("state", "?")
+        accepted  = sf.get("accepted", 0)
+        rejected  = sf.get("rejected", 0)
+        cli       = sf.get("cli", "")
+        disc_tgt  = sf.get("disc_target_dir", "")
+
+        msg(f"  {'─' * 70}")
+        msg(f"  BATCH STATUS  disc #{disc_nr}" + (f"  ({index_val})" if index_val else "")
+            + f"   phase={state}"
+            + f"   ✓ accepted={accepted}  ✗ rejected={rejected}")
+        if cli:
+            msg(f"    cmd: {cli}")
+        if disc_tgt:
+            sz = _dir_size_str(disc_tgt)
+            msg(f"    dir: {disc_tgt}" + (f"  ({sz})" if sz else ""))
+        # Show current progress line from progress file
+        try:
+            with open(PROGRESS_FILE) as _pf:
+                prog = _pf.read().strip()
+            if prog:
+                msg(f"    prg: {prog}")
+        except (FileNotFoundError, OSError):
             pass
+        msg(f"  {'─' * 70}")
 
+    # ── follow new entries ────────────────────────────────────────────────────
+    _prev_phase = None
+    _prev_disc_nr = None
+    _print_status_block()   # show current status before live stream begins
     try:
-        while True:
-            import usb.core as _usb_core
-            dev = _usb_core.find(idVendor=vid, idProduct=pid_val)
-            if dev is None:
-                # Check for bootloader mode before reporting offline
-                bl = _usb_core.find(idVendor=BL_VID, idProduct=BL_PID)
-                if bl is not None:
-                    _write({"usb": "bootloader",
-                            "vid": f"{BL_VID:#06x}",
-                            "pid": f"{BL_PID:#06x}",
-                            "note": "Nimbie is in Microchip PIC bootloader mode — run: my-nimbie reset --exit-bootloader"})
+        with open(status_json) as _f:
+            _f.seek(0, 2)  # seek to end
+            while True:
+                line = _f.readline()
+                if line:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entry = _json.loads(line)
+                            batch = entry.get("batch", {})
+                            phase = batch.get("phase", "") if batch else ""
+                            disc_nr = batch.get("disc_nr") if batch else None
+
+                            # Print status block when disc_nr changes (new disc started)
+                            if disc_nr is not None and disc_nr != _prev_disc_nr:
+                                if _prev_disc_nr is not None:
+                                    _print_status_block()
+                                _prev_disc_nr = disc_nr
+
+                            # Print blank separator when phase changes within same disc
+                            if phase and phase != _prev_phase:
+                                if _prev_phase is not None and disc_nr == _prev_disc_nr:
+                                    msg("")
+                                _prev_phase = phase
+
+                            msg(_fmt(entry))
+                        except _json.JSONDecodeError:
+                            msg(f"  (unparseable: {line[:80]})")
                 else:
-                    _write({"usb": "offline"})
-                _time.sleep(0.1)
-                continue
-
-            # Device found — connect, read state, disconnect immediately
-            # (release interface between polls so batch/next can claim USB)
-            nimbie = NimbieDevice(vid, pid_val)
-            try:
-                nimbie.connect()
-                state = nimbie.get_state()
-                _write({"usb": "normal", "hw": {
-                    "disc_available": state.get("disc_available"),
-                    "disc_in_tray":   state.get("disc_in_tray"),
-                    "disc_lifted":    state.get("disc_lifted"),
-                    "tray_out":       state.get("tray_out"),
-                }})
-            except (Exception, SystemExit) as e:
-                # SystemExit can be raised by connect() → claim_interface() → err()
-                # (e.g. USB not yet claimable after power cycle). Treat as transient
-                # offline — write error entry and keep polling.
-                # BUT: if CTRL+C was pressed (interrupted=True), re-raise so the
-                # outer except KeyboardInterrupt / finally can clean up and exit.
-                if interrupted:
-                    raise
-                _write({"usb": "offline", "error": str(e)})
-            finally:
-                try:
-                    nimbie.disconnect()
-                except Exception:
-                    pass
-
-            _time.sleep(0.1)
-
+                    _time.sleep(0.1)
     except (KeyboardInterrupt, SystemExit):
         pass
-    finally:
-        try:
-            os.unlink(MONITOR_PID_FILE)
-        except OSError:
-            pass
 
     msg("")
-    msg("  Monitoring stopped.")
+    msg("  Monitor stopped.")
     msg("")
 
 
-def build_parser():
-    parser = _HelpfulParser(
-        prog="my-nimbie",
-        description="CLI controller for Nimbie USB Plus NB21 disc autoloader.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"""\
-Examples:
-  my-nimbie load                          Load next disc from hopper
-  my-nimbie eject                         Eject disc to accept (done) bin
-  my-nimbie reject                        Eject disc to reject bin
-  my-nimbie status                        Show device state or batch progress
+CONFIG_VARS_HELP = f"""\
+Config file locations (searched in order):
+  1. {CONFIG_SEARCH_PATHS[0]}
+  2. {CONFIG_SEARCH_PATHS[1]}
+  3. {CONFIG_SEARCH_PATHS[2]}
 
-  my-nimbie batch                         List available flavors (or run DEFAULT if set)
-  my-nimbie batch ripdvd                  Batch process using on_load_RIP_DVD command
-  my-nimbie batch ripaudio                Batch process using on_load_RIP_AUDIOCD command
-  my-nimbie batch readdvd                 Batch process using on_load_READ_DVD command
-  my-nimbie batch --target-dir /out ripdvd   Override output directory for this run
+Create a template:
+  my-nimbie create-config               → {DEFAULT_CONFIG_PATH}
+  my-nimbie create-config /custom/path  → /custom/path
 
-  my-nimbie batch --prefix "{{DVD_TITLE}}" --name "" ripdvd
-  my-nimbie batch --offset 50 ripaudio     Continue numbering from 51 (after 50 previous discs)
-  my-nimbie batch --name " - {{DVD_TITLE}} ({{MEDIA_TYPE}})" readdvd
+Config sections:
+  [nimbie]      device settings (mount_point, usb_vendor_id, ...)
+  [commands]    per-flavor commands (on_load_RIP_DVD, on_load_READ_DVD, ...)
+  [target_dirs] output directories   (rip_dvd, rip_audiocd, read_dvd)
+  [naming]      per-disc name pattern (name_prefix, name, name_postfix)
+  [batch]       batch settings        (max_discs, mount_timeout, result_file, ...)
 
-  my-nimbie --dry batch ripdvd            Dry-run: show what would happen
-  my-nimbie --config ~/test.conf batch    Use a specific config file
-  my-nimbie --create-config               Create example config at ~/.my-nimbie.conf
-  my-nimbie --create-config /LINKS/default/my-nimbie   Create example config at given path
-
-Config file search order:
-  1. ~/.my-nimbie.conf
-  2. /etc/my-nimbie.conf
-  3. /LINKS/default/my-nimbie
-
-Batch flavors and their config keys:
-  ripdvd      → [commands] on_load_RIP_DVD      [target_dirs] rip_dvd
-  ripaudio    → [commands] on_load_RIP_AUDIOCD   [target_dirs] rip_audiocd
-  readdvd     → [commands] on_load_READ_DVD     [target_dirs] read_dvd
-
-  Each flavor runs a different command from the config file.
-  Optional: set on_load_DEFAULT to allow "batch" without a flavor.
-  The target directory can be set per flavor in [target_dirs] or overridden
-  with --target-dir on the CLI.
-
-Available variables in [commands] ($VAR or ${{VAR}} syntax):
+Variables in [commands] ($VAR or ${{VAR}} syntax):
   $MOUNT_POINT  — disc mount point (from [nimbie] mount_point)
   $TARGET_DIR   — base output directory (from [target_dirs] or --target-dir)
   $DIR_NAME     — full per-disc output path: TARGET_DIR / <name from [naming]>
   $DISC_NR      — sequential disc number (1, 2, 3, ...)
   $DEVICE       — raw device path (e.g. /dev/disk4), resolved from mount_point
 
-Per-disc directory naming ({{VAR}} syntax in --prefix, --name, --postfix):
+Variables in [naming] ({{VAR}} syntax in --prefix, --name, --postfix):
   DIR_NAME = TARGET_DIR / {{NAME_PREFIX}}{{NAME}}{{NAME_POSTFIX}}
-  Defaults: --prefix "{{INDEX}}" --name " - {{MEDIA_TYPE}}" --postfix ""
-  Supported variables:
-{NAMING_VARS_HELP}
+  Defaults:  --prefix "{{INDEX}}" --name " - {{MEDIA_TYPE}}" --postfix ""
+  Example result: "/out/001 - DVD"
 
-Monitoring a running batch:
-  my-nimbie status              Show batch progress (reads /tmp/my-nimbie.status)
-  kill -USR1 <pid>              Print live status to the batch process stderr
-  cat /tmp/my-nimbie.status     Machine-readable status file
+  {{INDEX}}       — disc index: DISC_NR + idx_offset (default offset 0 → starts at 1)
+                    E.g. --offset 50 → first disc is 051, then 052, ...
+  {{DISC_NR}}     — raw disc number (1, 2, 3, ...) without padding or offset
+  {{MEDIA_TYPE}}  — "DVD" or "CD" (auto-detected from disc content)
+  {{DVD_TITLE}}   — volume name of the disc (lazy: only read when referenced)
+  {{FLAVOR}}      — batch flavor name ("default", "ripdvd", "ripaudio", "readdvd")
+  {{DATE}}        — current date as YYYY-MM-DD"""
+
+
+def cmd_config(nimbie, config, args):
+    """Show config file documentation and variable reference."""
+    config_path = find_config_file(getattr(args, "config", None))
+    if config_path:
+        msg(f"  Active config: {config_path}\n")
+    else:
+        msg(f"  Active config: (none found — using built-in defaults)\n"
+            f"  Create one:   my-nimbie create-config\n")
+    msg(CONFIG_VARS_HELP)
+
+
+def cmd_help(nimbie, config, args):
+    """Show help — main help or help for a specific command."""
+    topic = getattr(args, "topic", None)
+    if topic:
+        parser = build_parser()
+        for action in parser._subparsers._group_actions:
+            if hasattr(action, "_name_parser_map") and topic in action._name_parser_map:
+                action._name_parser_map[topic].print_help()
+                return
+        # Unknown topic — show main help
+        parser.print_help()
+    else:
+        build_parser().print_help()
+
+
+def build_parser():
+    parser = _HelpfulParser(
+        prog="my-nimbie",
+        add_help=False,
+        formatter_class=_NimbieFormatter,
+        description="""\
+CLI controller for Nimbie USB Plus NB21 disc autoloader.
+
+COMMANDS: (can also be used as --command)
+  Config & setup:
+    config        Show config file documentation and available variables
+    create-config Create example config file
+    version       Print version and copyleft
+    help          Show help (equivalent to --help [command])
+
+  Batch processing:
+    batch         Batch mode: load → process → accept/reject → repeat
+    next          Process exactly one disc (same setup as batch, for testing)
+
+  Status & monitoring:
+    status        One-time hardware + batch progress snapshot
+    monitor       Continuous live stream of batch progress
+
+  Disc handling:
+    load          Load next disc from hopper into drive
+    eject         Eject disc to accept (done) bin
+    reject        Eject disc to reject bin
+    unmount       Unmount disc (macOS diskutil eject)
+
+  Running batch control:
+    pause         Pause running batch/next (suspends active command)
+    unpause       Resume a paused batch/next (alias: continue)
+    cancel        Cancel running batch/next (SIGINT to process)
+
+  Paused batch response:
+    accept        Tell paused batch to accept disc and continue
+    retry         Tell paused batch to retry the current disc
+    stop          Tell paused batch to reject disc and stop
+
+  Hardware:
+    reset         Recover Nimbie from error states (bootloader, stuck disc)
+    probe         Scan USB command space (for reverse-engineering)
+""",
+        epilog=f"""\
+EXAMPLES:
+  my-nimbie load                          Load next disc from hopper
+  my-nimbie eject                         Eject disc to accept (done) bin
+  my-nimbie status                        Show device state or batch progress
+
+  my-nimbie batch                         List available flavors /or/ run DEFAULT command if set in config file!
+  my-nimbie batch readdvd --offset 349    Read DVDs, numbering from 350
+  my-nimbie batch --target-dir /out ripdvd   Override output directory
+  my-nimbie --dry batch ripdvd            Dry-run: show what would happen
+  my-nimbie --config ~/test.conf batch    Use a specific config file
+  my-nimbie create-config                 Create example config at {DEFAULT_CONFIG_PATH}
+
+CONFIG FILE SEARCH ORDER:
+  1. {CONFIG_SEARCH_PATHS[0]}
+  2. {CONFIG_SEARCH_PATHS[1]}
+  3. {CONFIG_SEARCH_PATHS[2]}
+
+BATCH FLAVORS:
+  ripdvd      → [commands] on_load_RIP_DVD      [target_dirs] rip_dvd
+  ripaudio    → [commands] on_load_RIP_AUDIOCD   [target_dirs] rip_audiocd
+  readdvd     → [commands] on_load_READ_DVD     [target_dirs] read_dvd
+
+  Optional: set on_load_DEFAULT to allow "batch" without a flavor.
+
+MONITORING A RUNNING BATCH:
+  my-nimbie status              One-time hardware + batch status snapshot
+  my-nimbie monitor             Ongoing status (device state + {DEFAULT_STATUS_JSON})
+  Logfile:    tail -f {DEFAULT_LOGFILE}   (log created with -D/-DD or -L)
+  kill -USR1 <pid_of_running_my-nimbie>   Print live status to batch process stderr
+
+DETAILED HELP:
+  my-nimbie <COMMAND> --help
+  my-nimbie --help <COMMAND>
 """,
     )
 
+    parser._optionals.title = "OPTIONS"
     parser.add_argument("--config", "-c", metavar="FILE",
-                        help="config file path (overrides search order)")
-    parser.add_argument("--create-config", nargs="?", const="", metavar="PATH",
-                        dest="create_config_path",
-                        help="create example config file (default: ~/.my-nimbie.conf, or specify PATH)")
-    parser.add_argument("--test", action="store_true",
-                        help="run unit tests (no hardware needed)")
-    parser.add_argument("--dry", "-d", action="store_true",
+                        help='config file path (takes precedence; see "Config file search order:"; '
+                             'call --help config to see available variables for config file)')
+    parser.add_argument("--dry", action="store_true",
                         help="dry run — print what would be done without executing")
-    parser.add_argument("--verbose", "-v", "-V", action="store_true",
+    parser.add_argument("--verbose", "-V", action="store_true",
                         help="verbose output")
     parser.add_argument("--debug", "-D", action="count", default=0,
                         help="debug output; -DD/--deepdbg for deep debug (implies --verbose)")
-    parser.add_argument("--deepdbg", action="store_true",
+    parser.add_argument("--deepdbg", "-DD", action="store_true",
                         help="deep debug (same as -DD)")
+    parser.add_argument("--log", "-L", nargs="?", const="", metavar="FILE",
+                        help="tee all output (stdout+stderr, incl. subprocesses) to FILE "
+                             f"(default: log_file from config, usually {DEFAULT_LOGFILE}). "
+                             "Auto-enabled with -D / -DD. Watch with: tail -f FILE")
 
     _GLOBAL_EPILOG = """\
-Global options (place before or after subcommand):
-  -c FILE, --config FILE   config file path (overrides search order)
-  -d, --dry                dry run — print what would be done without executing
-  -v, --verbose            verbose output
-  -D, --debug              debug output (-DD or --deepdbg for deep debug)"""
+GLOBAL OPTIONS (place before or after subcommand):
+  -c FILE, --config FILE   config file path (takes precedence; see CONFIG FILE SEARCH ORDER: in --help)
+  --dry                    dry run — print what would be done without executing
+  -V, --verbose            verbose output
+  -D, --debug              debug output (-DD or --deepdbg for deep debug)
+  -L [FILE], --log [FILE]  tee all output to FILE (default: /tmp/my-nimbie.log); auto with -D"""
 
-    sub = parser.add_subparsers(dest="command", parser_class=_HelpfulParser)
+    sub = parser.add_subparsers(dest="command", title="commands",
+                                metavar="<command>", parser_class=_HelpfulParser)
+    # Hide the subparsers group from help: description already has the grouped table.
+    try:
+        parser._action_groups.remove(parser._subparsers)
+    except (ValueError, AttributeError):
+        pass
 
     _p = sub.add_parser("load",
-                        formatter_class=argparse.RawDescriptionHelpFormatter,
-                        help="Load next disc from hopper into drive",
+                        formatter_class=_NimbieFormatter,
+                        help=argparse.SUPPRESS,
                         description="""\
 Load the next disc from the Nimbie hopper into the optical drive.
 
@@ -5297,8 +6389,8 @@ For automated batch processing use "batch" or "next" instead.""")
     _p.epilog = _GLOBAL_EPILOG
 
     _p = sub.add_parser("eject",
-                        formatter_class=argparse.RawDescriptionHelpFormatter,
-                        help="Eject current disc to accept (done) bin",
+                        formatter_class=_NimbieFormatter,
+                        help=argparse.SUPPRESS,
                         description="""\
 Eject the current disc from the drive and move it to the accept (done) bin.
 
@@ -5306,12 +6398,20 @@ Opens the tray, waits for the disc to settle, then the Nimbie gripper picks
 it up and drops it in the accept output bin.
 
 Use this after a successful rip to move the disc out of the drive.
-If a batch/next job is paused waiting for user input, use "accept" instead.""")
+If a batch/next job is paused waiting for user input, use "accept" instead.
+
+Recovery: if the disc is already held in the cam wheel clamps (disc_lifted sensor
+shows False but disc is physically up — common after a crash mid-eject), use
+--force to skip the tray-open/lift sequence and send CMD_ACCEPT directly.""")
+    _p.add_argument("--force", action="store_true",
+                    help="Force-eject: close tray and send CMD_ACCEPT directly, "
+                         "skipping disc_lifted sensor check. Use when disc is stuck "
+                         "in cam wheel clamps after a crash (disc_lifted=False sensor lie).")
     _p.epilog = _GLOBAL_EPILOG
 
     _p = sub.add_parser("reject",
-                        formatter_class=argparse.RawDescriptionHelpFormatter,
-                        help="Reject current disc to reject bin (or: tell paused batch to reject)",
+                        formatter_class=_NimbieFormatter,
+                        help=argparse.SUPPRESS,
                         description="""\
 Reject the current disc — ejects from drive and drops into the reject bin.
 
@@ -5321,12 +6421,20 @@ Two modes:
      user input (e.g. after --pause-on-err), sends it a "reject" signal,
      which causes it to reject the disc and either stop or continue.
 
-The reject bin is the separate output tray for discs that failed processing.""")
+The reject bin is the separate output tray for discs that failed processing.
+
+Recovery: if the disc is already held in the cam wheel clamps (disc_lifted sensor
+shows False but disc is physically up — common after a crash mid-eject), use
+--force to skip the tray-open/lift sequence and send CMD_REJECT directly.""")
+    _p.add_argument("--force", action="store_true",
+                    help="Force-reject: close tray and send CMD_REJECT directly, "
+                         "skipping disc_lifted sensor check. Use when disc is stuck "
+                         "in cam wheel clamps after a crash (disc_lifted=False sensor lie).")
     _p.epilog = _GLOBAL_EPILOG
 
     _p = sub.add_parser("unmount",
-                        formatter_class=argparse.RawDescriptionHelpFormatter,
-                        help="Unmount disc from optical drive (macOS diskutil eject)",
+                        formatter_class=_NimbieFormatter,
+                        help=argparse.SUPPRESS,
                         description="""\
 Unmount the disc from the macOS filesystem without physically ejecting it.
 
@@ -5336,12 +6444,16 @@ disc swap. The disc stays in the drive tray until physically ejected.""")
     _p.epilog = _GLOBAL_EPILOG
 
     _p = sub.add_parser("status",
-                        formatter_class=argparse.RawDescriptionHelpFormatter,
-                        help="Show Nimbie device state (or batch progress if running)",
+                        formatter_class=_NimbieFormatter,
+                        help=argparse.SUPPRESS,
                         description="""\
-Show current Nimbie hardware state and batch/next job progress.
+One-time snapshot of hardware state, batch progress, and the last few
+status-log entries. Run it once from any terminal to see what is happening.
 
-Hardware state includes:
+  status   — one-time snapshot (call it repeatedly yourself)
+  monitor  — continuous live stream, auto-updating (run once, leave open)
+
+Hardware state:
   disc_available   — disc(s) in the input hopper
   disc_in_tray     — disc currently in the optical drive tray
   disc_lifted      — disc currently held by the gripper arm
@@ -5350,8 +6462,9 @@ Hardware state includes:
 If a batch or next job is running, also shows:
   - Current disc number and index
   - Accept / reject counts
-  - Last disc processed
-  - Target directory
+  - Target directory and current disc output dir (with size)
+  - Command progress
+  - Last N lines from the status-log.json (same data monitor shows)
   - Crash info (if the job died unexpectedly)
 
 Use -V (verbose) for additional detail including USB state bits and
@@ -5359,8 +6472,8 @@ drive tray state from drutil.""")
     _p.epilog = _GLOBAL_EPILOG
 
     _p = sub.add_parser("accept",
-                        formatter_class=argparse.RawDescriptionHelpFormatter,
-                        help="Tell a paused batch/next to accept the current disc",
+                        formatter_class=_NimbieFormatter,
+                        help=argparse.SUPPRESS,
                         description="""\
 Signal a paused batch/next job to accept the current disc.
 
@@ -5370,8 +6483,8 @@ the disc (moves to done bin) and continues to the next disc.""")
     _p.epilog = _GLOBAL_EPILOG
 
     _p = sub.add_parser("retry",
-                        formatter_class=argparse.RawDescriptionHelpFormatter,
-                        help="Tell a paused batch/next to retry the current command",
+                        formatter_class=_NimbieFormatter,
+                        help=argparse.SUPPRESS,
                         description="""\
 Signal a paused batch/next job to retry the current disc.
 
@@ -5381,8 +6494,8 @@ re-loading it.""")
     _p.epilog = _GLOBAL_EPILOG
 
     _p = sub.add_parser("stop",
-                        formatter_class=argparse.RawDescriptionHelpFormatter,
-                        help="Tell a paused batch/next to reject disc and stop",
+                        formatter_class=_NimbieFormatter,
+                        help=argparse.SUPPRESS,
                         description="""\
 Signal a paused batch/next job to reject the current disc and stop.
 
@@ -5390,9 +6503,41 @@ When batch/next is paused, this sends a "stop" signal: the job rejects
 the disc (moves to reject bin) and exits cleanly, printing a summary.""")
     _p.epilog = _GLOBAL_EPILOG
 
+    _p = sub.add_parser("pause",
+                        formatter_class=_NimbieFormatter,
+                        help=argparse.SUPPRESS,
+                        description="""\
+Pause a running batch/next job at any moment.
+
+Two effects:
+  1. If a disc command (e.g. dvdbackup) is actively running, it is
+     immediately suspended with SIGSTOP — it freezes in place.
+  2. A pause flag is set so that when the command resumes and finishes,
+     the batch stops before loading the next disc.
+
+Use 'my-nimbie unpause' to resume.""")
+    _p.epilog = _GLOBAL_EPILOG
+
+    _p = sub.add_parser("unpause",
+                        formatter_class=_NimbieFormatter,
+                        help=argparse.SUPPRESS,
+                        description="""\
+Resume a batch/next job that was paused with 'my-nimbie pause'.
+
+Sends SIGCONT to the suspended command (if any) and clears the pause flag
+so the batch continues from where it left off.""")
+    _p.epilog = _GLOBAL_EPILOG
+
+    _p = sub.add_parser("continue",
+                        formatter_class=_NimbieFormatter,
+                        help=argparse.SUPPRESS,
+                        description="""\
+Alias for 'my-nimbie unpause'. Resume a batch/next paused with 'my-nimbie pause'.""")
+    _p.epilog = _GLOBAL_EPILOG
+
     _p = sub.add_parser("cancel",
-                        formatter_class=argparse.RawDescriptionHelpFormatter,
-                        help="Cancel a running batch/next job (sends SIGINT to the process)",
+                        formatter_class=_NimbieFormatter,
+                        help=argparse.SUPPRESS,
                         description="""\
 Cancel a running batch/next job by sending SIGINT to its process.
 
@@ -5405,35 +6550,34 @@ dvdbackup). It sets the stop flag so the job stops after the current disc
 completes.""")
     _p.epilog = _GLOBAL_EPILOG
 
-    monitor_parser = sub.add_parser("monitor",
-                                    formatter_class=argparse.RawDescriptionHelpFormatter,
-                                    help="Start real-time status monitoring (writes NDJSON, press CTRL+C to stop)",
-                                    description=f"""\
-Start real-time status monitoring of the Nimbie.
+    sub.add_parser("monitor",
+                   formatter_class=_NimbieFormatter,
+                   help=argparse.SUPPRESS,
+                   description=f"""\
+Continuous live stream of batch/next progress — no USB calls, leave open.
 
-Collects hardware state (disc_available, disc_in_tray, disc_lifted, tray_out)
-and batch/next job progress every 0.1s (10x/second), appending JSON snapshots to:
+  status   — one-time snapshot (call it repeatedly yourself)
+  monitor  — continuous live stream, auto-updating (run once, leave open)
+
+batch and next automatically write the status-JSON file:
   {DEFAULT_STATUS_JSON}
+This command simply reads that file — no USB connection required.
 
-Each snapshot line looks like:
-  {{"ts":"2026-03-29_1234.56.789","hw":{{"disc_available":true,...}},"batch":{{...}}}}
+Shows the last 5 entries for context, then follows new entries as they arrive.
+Prints a STATUS block at the start and every time a new disc begins.
+Press CTRL+C to stop.
 
-Watch the live output in another terminal:
-  tail -f {DEFAULT_STATUS_JSON}
+Logfile (when batch was started with -D/-DD or -L):
+  tail -f {DEFAULT_LOGFILE}
 
-The monitor command blocks until you press CTRL+C.
+Column legend:
+  T=disc_in_tray  A=disc_available  L=disc_lifted  O=tray_out   ■=yes  □=no
+
 The status_json path can be configured in the config file under [batch] status_json.""")
-    monitor_parser.add_argument(
-        "--force", action="store_true",
-        help="Send SIGTERM to any already-running monitor, then start a fresh one"
-    )
-    monitor_parser.add_argument(
-        "--stop", action="store_true",
-        help="Send SIGTERM to the running monitor (graceful shutdown) and exit"
-    )
 
-    reset_parser = sub.add_parser("reset", help="Recover Nimbie from error states (bootloader mode, stuck disc)",
-                                  formatter_class=argparse.RawDescriptionHelpFormatter,
+    reset_parser = sub.add_parser("reset",
+                                  help=argparse.SUPPRESS,
+                                  formatter_class=_NimbieFormatter,
                                   description="""\
 Detect and recover the Nimbie from various error states.
 
@@ -5482,8 +6626,8 @@ Confirmed working recovery procedure:
 
     # --- probe: scan Nimbie command space for reverse-engineering ---
     probe_parser = sub.add_parser("probe",
-                                  help="Scan Nimbie USB command space for reverse-engineering",
-                                  formatter_class=argparse.RawDescriptionHelpFormatter,
+                                  help=argparse.SUPPRESS,
+                                  formatter_class=_NimbieFormatter,
                                   description="""\
 Systematically probe the Nimbie's USB command space to discover
 undocumented commands and responses.
@@ -5512,10 +6656,11 @@ Examples:
                               help="send raw hex bytes to Nimbie (e.g. '000043000000')")
 
     # --- next: process exactly one disc (same setup as batch, for testing) ---
-    next_parser = sub.add_parser("next", help="Process exactly one disc (same setup as batch, for testing)",
+    next_parser = sub.add_parser("next",
+                                 help=argparse.SUPPRESS,
                                  usage="my-nimbie next [--options] [flavor]",
-                                 formatter_class=argparse.RawDescriptionHelpFormatter,
-                                 description=f"""\
+                                 formatter_class=_NimbieFormatter,
+                                 description="""\
 Process exactly one disc from the Nimbie hopper.
 
 Uses the same pre-flight checks, flavors, and naming as "batch", but stops
@@ -5533,12 +6678,11 @@ Flavors select which command from the config file to run:
   (none)      run [commands] on_load_DEFAULT     (optional, allows "next" without flavor)
 
 Per-disc directory naming:
-  DIR_NAME = TARGET_DIR / {{NAME_PREFIX}}{{NAME}}{{NAME_POSTFIX}}
-  Defaults: --prefix "{{INDEX}}" --name " - {{MEDIA_TYPE}}" --postfix ""
+  DIR_NAME = TARGET_DIR / {NAME_PREFIX}{NAME}{NAME_POSTFIX}
+  Defaults: --prefix "{INDEX}" --name " - {MEDIA_TYPE}" --postfix ""
   Example result: "/out/001 - DVD"
 
-  Supported {{VARIABLE}} placeholders:
-{NAMING_VARS_HELP}""")
+  For supported {VARIABLE} placeholders: my-nimbie config --help""")
     next_parser.add_argument("flavor", nargs="?", default=None,
                              choices=list(BATCH_FLAVORS.keys()),
                              help="processing flavor (omit to list available or use on_load_DEFAULT)")
@@ -5561,18 +6705,18 @@ Per-disc directory naming:
     next_parser.add_argument("--use-loaded", action="store_true",
                              help="process a disc already in the drive (skip loading from hopper). "
                              "Use after a crash left a disc in the drive.")
-    next_parser.epilog = """\
-Global options (place before or after subcommand):
-  -c FILE, --config FILE   config file path (overrides search order)
-  -d, --dry                dry run — print what would be done without executing
-  -v, --verbose            verbose output
-  -D, --debug              debug output (-DD or --deepdbg for deep debug)"""
+    next_parser.add_argument("--force", action="store_true",
+                             help="overwrite the target directory even if it already exists with "
+                             "the same size (disc was already read). Without --force, same-size "
+                             "directories are skipped; different-size directories are always overwritten.")
+    next_parser.epilog = _GLOBAL_EPILOG
 
     # --- batch: process all discs in hopper ---
-    batch_parser = sub.add_parser("batch", help="Batch mode: load → process → accept/reject → repeat",
+    batch_parser = sub.add_parser("batch",
+                                  help=argparse.SUPPRESS,
                                   usage="my-nimbie batch [--options] [flavor]",
-                                  formatter_class=argparse.RawDescriptionHelpFormatter,
-                                  description=f"""\
+                                  formatter_class=_NimbieFormatter,
+                                  description="""\
 Batch-process discs from the Nimbie hopper.
 
 Loads a disc, runs the configured command, and accepts or rejects the disc
@@ -5586,16 +6730,15 @@ Flavors select which command from the config file to run:
   (none)      run [commands] on_load_DEFAULT     (optional, allows "batch" without flavor)
 
 Per-disc directory naming:
-  DIR_NAME = TARGET_DIR / {{NAME_PREFIX}}{{NAME}}{{NAME_POSTFIX}}
-  Defaults: --prefix "{{INDEX}}" --name " - {{MEDIA_TYPE}}" --postfix ""
+  DIR_NAME = TARGET_DIR / {NAME_PREFIX}{NAME}{NAME_POSTFIX}
+  Defaults: --prefix "{INDEX}" --name " - {MEDIA_TYPE}" --postfix ""
   Example result: "/out/001 - DVD"
 
-  Supported {{VARIABLE}} placeholders:
-{NAMING_VARS_HELP}
+  For supported {VARIABLE} placeholders: my-nimbie config --help
 
 Progress is tracked in /tmp/my-nimbie.status and can be queried:
   my-nimbie status              from another terminal
-  kill -USR1 <pid>              prints live status to stderr of the batch""")
+  kill -USR1 <pid_of_running_my-nimbie>   prints live status to stderr of the batch""")
     batch_parser.add_argument("flavor", nargs="?", default=None,
                               choices=list(BATCH_FLAVORS.keys()),
                               help="processing flavor (omit to list available or use on_load_DEFAULT)")
@@ -5618,14 +6761,81 @@ Progress is tracked in /tmp/my-nimbie.status and can be queried:
     batch_parser.add_argument("--use-loaded", action="store_true",
                               help="process a disc already in the drive as first disc (skip loading). "
                               "Use after a crash left a disc in the drive.")
+    batch_parser.add_argument("--force", action="store_true",
+                              help="overwrite target directories that already exist with the same size "
+                              "(discs already read). Without --force, same-size directories are skipped "
+                              "(disc ejected to accept bin, batch continues); different-size directories "
+                              "are always overwritten (partial reads are re-read automatically).")
     batch_parser.add_argument("--max", metavar="N", type=int,
                               help="max discs to process (overrides config max_discs, 0 = unlimited)")
-    batch_parser.epilog = """\
-Global options (place before or after subcommand):
-  -c FILE, --config FILE   config file path (overrides search order)
-  -d, --dry                dry run — print what would be done without executing
-  -v, --verbose            verbose output
-  -D, --debug              debug output (-DD or --deepdbg for deep debug)"""
+    batch_parser.epilog = _GLOBAL_EPILOG
+
+    # --- config: show config file documentation ---
+    _p = sub.add_parser("config",
+                        formatter_class=_NimbieFormatter,
+                        help=argparse.SUPPRESS,
+                        description=f"""\
+Config file documentation and variable reference.
+
+{CONFIG_VARS_HELP}
+
+Create a config file: my-nimbie create-config --help""")
+    _p.epilog = _GLOBAL_EPILOG
+
+    # --- create-config: create example config file ---
+    _p = sub.add_parser("create-config",
+                        formatter_class=_NimbieFormatter,
+                        help=argparse.SUPPRESS,
+                        description=f"""\
+Create an example config file at the default or specified path.
+
+  my-nimbie create-config                    → {DEFAULT_CONFIG_PATH}
+  my-nimbie create-config /custom/path       → /custom/path
+
+The example config includes all sections with commented explanations.
+Edit it to match your setup, then run: my-nimbie batch
+
+Also accessible as: my-nimbie --create-config [PATH]
+
+For config variables and file format: my-nimbie config --help""")
+    _p.add_argument("path", nargs="?", default=None, metavar="PATH",
+                    help=f"config file path (default: {DEFAULT_CONFIG_PATH})")
+    _p.epilog = _GLOBAL_EPILOG
+
+    # --- version: print version ---
+    sub.add_parser("version",
+                   formatter_class=_NimbieFormatter,
+                   help=argparse.SUPPRESS,
+                   description=f"""\
+Print version and copyleft information.
+
+  my-nimbie version
+  my-nimbie --version    (equivalent)
+
+{__version__}  {__copyleft__}  {__license__}""")
+
+    # --- help: show help ---
+    _p = sub.add_parser("help",
+                        formatter_class=_NimbieFormatter,
+                        help=argparse.SUPPRESS,
+                        description="""\
+Show help for my-nimbie or a specific command.
+
+  my-nimbie help              Show main help (same as my-nimbie --help)
+  my-nimbie help <command>    Show help for a specific command
+  my-nimbie <command> --help  Show full flag listing for a command""")
+    _p.add_argument("topic", nargs="?", default=None, metavar="<command>",
+                    help="command to show help for")
+
+    # --- test: run unit tests ---
+    sub.add_parser("test",
+                   formatter_class=_NimbieFormatter,
+                   help=argparse.SUPPRESS,
+                   description="""\
+Run the built-in unit tests. No hardware or config file needed.
+
+  my-nimbie test
+  my-nimbie --test    (equivalent)""")
 
     return parser
 
@@ -5635,40 +6845,76 @@ def main():
 
     signal.signal(signal.SIGINT, signal_handler)
 
-    # Pre-process argv: expand -DD → -D -D and hoist global flags before subcommand
-    argv = sys.argv[1:]
+    # All known subcommands (including command-style "commands")
+    _all_subcommands = {
+        "load", "eject", "reject", "unmount", "status", "next", "batch",
+        "reset", "cancel", "monitor", "accept", "retry", "stop", "probe",
+        "pause", "unpause", "continue", "config", "create-config",
+        "version", "help", "test",
+    }
 
-    # "--help <subcommand>" → show subcommand description without the argparse usage line.
-    # This gives a clean, readable overview (like "my-nimbie --help monitor") for every command.
-    # For the full flag listing, the user can run: my-nimbie <subcommand> --help
-    _all_subcommands = {"load", "eject", "reject", "unmount", "status", "next", "batch",
-                        "reset", "cancel", "monitor", "accept", "retry", "stop", "probe"}
-    if len(argv) >= 2 and argv[0] in ("--help", "-h") and argv[1] in _all_subcommands:
-        argv = [argv[1], "--help"] + argv[2:]
+    # Pre-process argv: normalize command-flags to subcommands, expand -DD → --deepdbg
+    argv = list(sys.argv[1:])
 
-    # Detect common mistake: "--batch", "--next", etc. instead of "batch", "next"
+    # 1a. Convert --help/-h at position 0 to "help" subcommand.
+    #     Subcommand-internal --help (e.g. "batch --help") stays for argparse auto-help.
+    if argv and argv[0] in ("--help", "-h"):
+        argv = ["help"] + argv[1:]
+
+    # 1b. Convert command-style flags that appear before the first subcommand.
+    #     --version/-v → version, --test → test, --create-config → create-config.
+    _flag_to_cmd = {
+        "--version": "version", "-v": "version",
+        "--test": "test",
+        "--create-config": "create-config",
+    }
+    new_argv = []
+    seen_subcmd = False
     for arg in argv:
-        if arg.startswith("--") and arg[2:] in _all_subcommands:
-            print(f"my-nimbie: error: unknown option '{arg}'\n"
-                  f"  Did you mean: my-nimbie {arg[2:]} ...\n"
-                  f"  Subcommands are used without '--'. Example: my-nimbie batch readdvd --offset 262",
-                  file=sys.stderr)
-            sys.exit(2)
+        if not seen_subcmd and arg in _all_subcommands:
+            seen_subcmd = True
+        if not seen_subcmd and arg in _flag_to_cmd:
+            new_argv.append(_flag_to_cmd[arg])
+        else:
+            new_argv.append(arg)
+    argv = new_argv
 
+    # 2. Special: "help --config" → "help config" (so --help --config shows config docs)
+    if len(argv) >= 2 and argv[0] == "help" and argv[1] == "--config":
+        argv = ["help", "config"] + argv[2:]
+
+    # 3. Convert --<subcommand> to <subcommand> before the first subcommand
+    #    (e.g. --batch → batch, --pause → pause). Excludes --config (global flag).
+    _skip_double_dash = {"config"}
+    new_argv = []
+    seen_subcmd = False
+    for arg in argv:
+        if not seen_subcmd and arg in _all_subcommands:
+            seen_subcmd = True
+        if (not seen_subcmd and arg.startswith("--") and arg[2:] in _all_subcommands
+                and arg[2:] not in _skip_double_dash):
+            new_argv.append(arg[2:])
+        else:
+            new_argv.append(arg)
+    argv = new_argv
+
+    # 3. Expand -DD/-DDD/... → --deepdbg (any -D repeated 2+ times)
     expanded = []
     for arg in argv:
         if re.match(r'^-D{2,}$', arg):
-            expanded.extend(["-D"] * len(arg[1:]))
+            expanded.append("--deepdbg")
         else:
             expanded.append(arg)
-    # Hoist global flags (-D, -v, -d, --debug, --verbose, --dry) before the subcommand
-    subcommands = {"load", "eject", "reject", "unmount", "status", "next", "batch", "reset", "cancel", "monitor"}
-    global_flags = {"-D", "-v", "-V", "-d", "--debug", "--verbose", "--dry", "--deepdbg"}
+    argv = expanded
+
+    # 4. Hoist global flags before the subcommand so argparse sees them first
+    global_flags = {"-D", "-V", "--debug", "--verbose", "--dry", "--deepdbg", "-DD",
+                    "-L", "--log", "-c", "--config"}
     hoisted = []
     rest = []
     found_subcmd = False
-    for arg in expanded:
-        if not found_subcmd and arg in subcommands:
+    for arg in argv:
+        if not found_subcmd and arg in _all_subcommands:
             found_subcmd = True
             rest.append(arg)
         elif found_subcmd and arg in global_flags:
@@ -5687,24 +6933,45 @@ def main():
     verbose = args.verbose or debug
     dry_run = args.dry
 
-    # --create-config: special action, no device needed
-    if args.create_config_path is not None:
-        # nargs="?" with const="" means: --create-config without value → "", with value → value
-        if args.create_config_path == "":
-            args.create_config_path = None  # use default path
-        cmd_create_config(args)
-        return
-
-    if args.test:
-        _run_tests()
-        return
-
     if not args.command:
         parser.print_help()
         sys.exit(1)
 
+    # Commands that need no config, no USB
+    if args.command == "version":
+        print(f"my-nimbie {__version__}")
+        print(__copyleft__)
+        print(__license__)
+        return
+
+    if args.command == "test":
+        _run_tests()
+        return
+
+    if args.command == "help":
+        cmd_help(None, None, args)
+        return
+
     config_path = find_config_file(args.config)
     config = load_config(config_path)
+
+    # Set up log tee: -L [FILE] or auto-enabled with -D / -DD.
+    # Must happen before any dispatch so all output (including debug) is captured.
+    _log_arg = getattr(args, "log", None)
+    _auto_log = args.debug >= 1 and _log_arg is None  # auto-enable on -D/-DD
+    if _log_arg is not None or _auto_log:
+        _logpath = (_log_arg or "") or config.get("batch", "log_file", fallback=DEFAULT_LOGFILE)
+        _setup_log_tee(_logpath)
+
+    # config / create-config — no USB needed, may show config info
+    if args.command == "config":
+        cmd_config(None, config, args)
+        return
+
+    if args.command == "create-config":
+        args.create_config_path = getattr(args, "path", None)
+        cmd_create_config(args)
+        return
 
     # Unmount command: no USB needed
     if args.command == "unmount":
@@ -5737,6 +7004,14 @@ def main():
             msg(f"Sent SIGTERM to on_load child PID {child_pid} (dvdbackup or similar).")
         except Exception:
             pass  # no child PID file, or child already gone — fine
+        return
+
+    # pause / unpause / continue — no USB needed
+    if args.command == "pause":
+        cmd_pause(None, config, args)
+        return
+    if args.command in ("unpause", "continue"):
+        cmd_unpause(None, config, args)
         return
 
     # Pause control commands: send command to paused batch/next process, no USB needed
