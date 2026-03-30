@@ -1712,13 +1712,32 @@ class NimbieDevice:
         except Exception as e:
             warn(f"drutil tray close failed: {e}")
 
-        # Poll until tray sensor reports closed.
-        # IMPORTANT: tray_out flips False almost immediately (firmware reports the command
-        # receipt, not physical completion). The tray motor takes ~4s to fully seat.
-        # Without this extra wait, a subsequent PLACE_DISC can drop a disc into the
-        # still-moving tray — confirmed cause of double-load incident 2026-03-30.
+        # Poll until tray sensor reports closed, then verify physical seat.
+        # IMPORTANT: tray_out flips False almost immediately (firmware reports command
+        # receipt, not physical completion — confirmed by log: sensor False at 0.5s,
+        # but tray motor takes ~4s to physically seat).
+        # Active detection: require tray_out=False continuously for _TRAY_SETTLE_S.
+        # If tray_out ever goes True again (unexpected reopen), reset and re-wait.
+        # Confirmed needed: 2026-03-30 double-load caused by PLACE_DISC into still-closing tray.
+        _TRAY_SETTLE_S = 4.0
         self._poll_state(lambda s: not s["tray_out"], "tray to close", timeout=15)
-        time.sleep(4)  # wait for tray to physically seat (motor takes ~4s after sensor flip)
+        dbg(f"close_tray: sensor closed — waiting {_TRAY_SETTLE_S:.0f}s for physical seat...")
+        settled_since = time.time()
+        settle_deadline = time.time() + 10
+        while time.time() < settle_deadline:
+            state = self.get_state(fatal=False)
+            if state is None:
+                time.sleep(0.5)
+                continue
+            if state["tray_out"]:
+                warn("close_tray: tray_out went True during settle — tray may have been interrupted; re-waiting...")
+                self._poll_state(lambda s: not s["tray_out"], "tray to re-close", timeout=15)
+                settled_since = time.time()
+            elif time.time() - settled_since >= _TRAY_SETTLE_S:
+                dbg("close_tray: tray physically seated (confirmed stable closed)")
+                return
+            time.sleep(0.5)
+        warn("close_tray: settle timeout — proceeding (tray may not be fully seated)")
 
     # -- Autoloader mechanism commands --
 
