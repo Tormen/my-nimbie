@@ -1604,6 +1604,10 @@ class NimbieDevice:
         # cause [Errno 60] which cascades to [Errno 5] killing the USB bus.
         # Hold _usb_lock for the entire query + recovery so the collector thread
         # cannot send its own GET_STATE while we are mid-read (or mid-reconnect).
+        if self.dev is None:
+            if not fatal:
+                return None
+            err("Not connected to Nimbie device")
         with self._usb_lock:
             responses = self._send_and_read(CMD_GET_STATE, "GET_STATE", timeout=20000)
             bits = self._find_state_string(responses)
@@ -2062,7 +2066,18 @@ class NimbieDevice:
             if at in (AT_OK, None):
                 # Poll until disc is lifted
                 time.sleep(1)
-                self._poll_state(lambda s: s["disc_lifted"], "disc to be lifted", timeout=15)
+                try:
+                    self._poll_state(lambda s: s["disc_lifted"], "disc to be lifted", timeout=15)
+                except SystemExit:
+                    # Timeout — check if disc_in_tray cleared (disc was picked up but
+                    # disc_lifted sensor didn't fire — sensor lie observed 2026-03-30).
+                    # Same as AT+S03 path: disc IS physically in the cam wheels.
+                    state = self.get_state(fatal=False)
+                    if state is not None and not state.get("disc_in_tray"):
+                        warn("lift_disc: disc_lifted sensor timeout but disc_in_tray=False "
+                             "— disc picked up, sensor lagging. Treating as lifted.")
+                        return True
+                    raise  # truly stuck — re-raise the SystemExit
                 return True
             elif at == AT_NO_DISC:
                 warn("No disc in tray to lift")
