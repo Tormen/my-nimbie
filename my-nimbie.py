@@ -1850,56 +1850,35 @@ class NimbieDevice:
                 self.open_tray()
                 time.sleep(1)
                 continue
-            # disc_lifted=False + disc_in_tray=False after 120s: the disc transited the
-            # cam wheels (they released it — disc_lifted went False) but got stuck in the
-            # chute between the cam wheels and the closed tray.
+            # disc_lifted=False + disc_in_tray=False after 120s: the disc may have
+            # transited the cam wheels but failed to land on the tray, OR a sensor glitch
+            # is hiding a disc that is actually in the tray.
             #
-            # Push-through recovery: close the tray, then send PLACE_DISC raw (no
-            # open_tray) so the next disc from the hopper pushes the stuck disc down
-            # through the closed-tray slot into the output bin. The physical separator on
-            # the Nimbie determines whether both discs fall to the accept or reject bin.
+            # SAFE STOP — do NOT drop another disc. Dropping a second disc (push-through)
+            # risks a double-load inside the optical drive which can cause physical damage.
+            # Confirmed incident 2026-03-30: push-through caused double-load requiring
+            # manual power-cycle to prevent drive damage.
             #
-            # IMPORTANT: the caller/operator must pre-position the physical separator to
-            # the desired output bin BEFORE the batch runs. USB CMD_REJECT/ACCEPT only
-            # act on a disc already in the cam wheels (disc_lifted=True) and cannot
-            # pre-position the separator for a falling disc.
-            warn(f"place_disc: disc stuck in transit chute (disc_lifted=False, "
-                 f"disc_in_tray=False) — attempt {attempt + 1}/3.")
-            warn("  Push-through recovery: closing tray, then sending next disc as pusher.")
-            warn("  Both discs (stuck + pusher) will fall to the output bin.")
-            warn("  Ensure the physical separator is set to the correct bin first.")
-            self.close_tray()
-            time.sleep(1)
-
-            state_pre = self.get_state(fatal=False)
-            if not state_pre or not state_pre.get("disc_available"):
-                warn("  No disc in hopper to use as pusher — manual intervention needed.")
-                warn("  Remove the stuck disc from the chute, then reload.")
-                self.open_tray()
-                time.sleep(1)
-                continue
-
-            warn("  Sending PLACE_DISC (tray stays CLOSED — pusher disc falls through chute)...")
-            # Send raw PLACE_DISC without open_tray() — tray must stay closed
-            # so both discs fall through the closed-tray slot to the output bin.
-            self._send_command(CMD_PLACE_DISC, "PLACE_DISC (push-through)")
-            time.sleep(10)  # wait for both discs to clear the mechanism
-
-            state_after = self.get_state(fatal=False)
-            if state_after and state_after.get("disc_in_tray"):
-                # Disc landed on tray unexpectedly (mechanism may have opened tray)
-                warn("  Push-through: disc on tray — proceeding with it.")
-                time.sleep(0.8)
-                return True
-            warn("  Push-through complete — stuck disc cleared.")
-            self.open_tray()
-            time.sleep(1)
-            # State after push-through: one disc was consumed (pusher).
-            # If hopper still has discs, retry normally.
-            if state_after and state_after.get("disc_available"):
-                continue
-            # Hopper empty after push-through
-            return False
+            # The operator must intervene manually.
+            err(
+                f"place_disc: disc did not land on tray after 120s "
+                f"(disc_lifted=False, disc_in_tray=False) — attempt {attempt + 1}/3.\n"
+                "\n"
+                "MANUAL INTERVENTION REQUIRED — do not drop another disc.\n"
+                "\n"
+                "Possible causes:\n"
+                "  - Disc is physically above the open tray (jam above cam wheels)\n"
+                "  - Disc fell past the tray (check reject/accept bin)\n"
+                "  - Sensor glitch — disc may actually be in the tray\n"
+                "\n"
+                "Recovery steps:\n"
+                "  1. Inspect the disc position visually.\n"
+                "  2. If disc is in the tray: run  my-nimbie next readdvd --use-loaded\n"
+                "  3. If hopper jam: clear it manually, then restart the batch.\n"
+                "  4. Power cycle the Nimbie (off → 5s → on), then:\n"
+                "       my-nimbie reset\n"
+                "       my-nimbie batch readdvd --offset <last_completed>\n"
+            )
 
         err(
             "place_disc: disc failed to land on tray after 3 attempts.\n"
