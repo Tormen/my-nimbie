@@ -319,6 +319,36 @@ The status file contains key=value pairs: `state`, `mode`, `pid`, `flavor`,
 
 ## Error Recovery
 
+### Double Disc Loading — Prevention
+
+The Nimbie has **no hardware detection** for double-loaded discs. Two discs can
+enter the drive simultaneously in two ways:
+
+**1. Software retry without state check (primary cause):** USB instability can
+cause the PLACE_DISC polling loop to miss the `disc_in_tray=True` transition —
+the mechanism fired and the disc landed, but USB dropped before the state could
+be read. Without a pre-retry state check, the next PLACE_DISC attempt drops a
+second disc onto the first.
+
+**Prevention:** my-nimbie checks `disc_in_tray` state before every PLACE_DISC
+retry. If the previous attempt physically succeeded (disc landed) but was missed
+due to USB instability, the retry is skipped. This guard is not present in the
+reference code (nimbiestatemachine, nimbie-driver.py).
+
+**2. Static cling (physical):** The lacquered surfaces of DVD/CD media can
+develop electrostatic charge, causing two discs to stick together in the hopper
+stack and drop as a unit when PLACE_DISC fires. The iromlab guide (Royal Dutch
+National Library's official Nimbie imaging tool) warns: *"Pay special attention
+to only load one disc at a time — look out for discs that are stuck together."*
+
+**Prevention:** Fan the discs before loading if static cling is suspected.
+
+**If two discs load:** Power off immediately — the rattling sound of two discs
+spinning against each other indicates double loading. Remove the extra disc before
+resuming.
+
+---
+
 ### Disc Stuck in Drive (after crash)
 
 ```bash
@@ -1150,3 +1180,87 @@ requests. The batch crashed mid-accept sequence.
 **Fix:** `unmount_disc()` now retries with `diskutil unmount force <path>` when
 the error contains "dissented" or "failed to unmount". Force unmount overrides
 the loginwindow veto. Confirmed working on subsequent discs.
+
+---
+
+## TODO / OPEN Research Questions
+
+### ERROR LED State — Not Yet Readable (2026-03-30)
+
+**Status:** OPEN
+
+The Nimbie ERROR LED turns on when the cam ring jams (PLACE_DISC fails). We
+confirmed this on 2026-03-30 (retainer wheel stuck, disc #346). `my-nimbie status`
+cannot report the ERROR LED state because `GET_STATE` (0x43) only returns 9 state
+bits, none of which are currently known to encode LED state.
+
+**What is known:**
+
+The `GET_STATE` response `{xxxxxxxxx}` has 4 confirmed bits and 5 unknown bits:
+
+| Bit | Name                  | Confirmed |
+| --- | --------------------- | --------- |
+| 0   | Unknown               | No        |
+| 1   | `disc_available`      | Yes       |
+| 2   | Unknown               | No        |
+| 3   | `disc_in_tray`        | Yes       |
+| 4   | `disc_lifted`         | Yes       |
+| 5   | `tray_out`            | Yes       |
+| 6   | Unknown (usually `1`) | No        |
+| 7   | Unknown               | No        |
+| 8   | Unknown               | No        |
+
+The ERROR LED state is almost certainly encoded in one of bits 0, 2, 6, 7, or 8 —
+but the observation window was missed. The ERROR LED was lit on 2026-03-30 but
+`reset --diagnostics` could not be run at that moment (USB was busy / batch had
+just crashed).
+
+**What to do next time the ERROR LED is on:**
+
+Run immediately, **before** power-cycling:
+
+```sh
+my-nimbie reset --diagnostics
+```
+
+Then power-cycle and run `reset --diagnostics` again. Compare the two raw state
+strings — the bit that flips between ERROR=on and ERROR=off is the ERROR LED bit.
+Record the result here.
+
+**Also check:** The monitor now logs the full raw state string to the JSON log
+(`"raw": "0100001xx"`). If the ERROR LED is on while the monitor is running, the
+raw string will be captured automatically in `/tmp/my-nimbie.status-log.json`.
+
+---
+
+### AT+I00 and AT+I99 — Unknown Commands (2026-03-30)
+
+**Status:** OPEN
+
+`strings BSUtility_3_0_0_1.exe` revealed two response codes not in any public
+documentation and not implemented in either reference driver:
+
+```text
+AT+I00
+AT+I99
+```
+
+These follow the `AT+%C%02X` format (`I` + two-digit hex). They appear for both
+NK50Y and NB11 models (the NB21 is the NB11 successor, same family). No binary
+command byte is known to trigger them.
+
+**Hypothesis:**
+- `AT+I` class = device Info queries (firmware version, hardware ID, etc.)
+- May be triggered by an undiscovered binary command byte (not in our 0x00-0xFF
+  scan results from bootloader mode — the scan was done in bootloader, not normal mode)
+
+**Next steps:**
+1. When Nimbie is idle (no batch), run a targeted probe of unknown command bytes
+   in normal firmware mode looking for `AT+I` responses:
+   ```sh
+   my-nimbie probe --scan 0x44 0x51   # range around known commands
+   ```
+2. Check if `AT+I00` / `AT+I99` appear in the monitor JSON log during normal
+   operation (if the device sends them unsolicited).
+3. Decompile `BSUtility_3_0_0_1.exe` with Ghidra to find what binary command
+   triggers the `AT+I` response handling code.

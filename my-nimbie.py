@@ -1506,6 +1506,8 @@ class NimbieDevice:
         """Place a disc from the hopper onto the open tray.
 
         Returns True if there are more discs in the hopper, False if this was the last one.
+        Retries up to 3 times if the disc doesn't land on the tray within the timeout
+        (the dropper mechanism can be slow or need a second attempt).
         """
         # CRITICAL: Do NOT read USB after PLACE_DISC.
         # The device is mechanically busy and doesn't respond to reads.
@@ -1515,28 +1517,83 @@ class NimbieDevice:
         # Reference: BS Utility / nimbiestatemachine uses 20s read timeout
         # and waits for the device to respond. We take a simpler approach:
         # just send the command, wait for the mechanism, and poll state bits.
-        self._send_command(CMD_PLACE_DISC, "PLACE_DISC")
+        for attempt in range(3):
+            # SAFETY: Before sending PLACE_DISC on retry attempts, re-check the state.
+            # USB instability can cause us to miss the disc_in_tray=True transition from
+            # the previous attempt — the mechanism DID fire, but we never saw the result.
+            # Sending PLACE_DISC again would drop a SECOND disc on top of the first.
+            if attempt > 0:
+                pre_state = self.get_state(fatal=False)
+                if pre_state is not None:
+                    if pre_state["disc_in_tray"]:
+                        dbg("place_disc: disc_in_tray=True before retry — previous attempt succeeded "
+                            "(USB was unstable and we missed it). Not sending another PLACE_DISC.")
+                        time.sleep(0.8)
+                        return True
+                    if not pre_state["disc_available"]:
+                        return False  # hopper empty
 
-        # Give the mechanism time to physically place the disc.
-        # The dropper picks up a disc and drops it on the tray — takes ~3-5 seconds.
-        dbg("place_disc: command sent, waiting 5s for mechanism...")
-        time.sleep(5)
+            self._send_command(CMD_PLACE_DISC, "PLACE_DISC")
 
-        # Confirm via state polling: disc_in_tray becomes True, or hopper empties.
-        dbg("place_disc: polling state to confirm...")
-        state = self._poll_state(
-            lambda s: s["disc_in_tray"] or not s["disc_available"],
-            "disc to be placed on tray (or hopper empty)",
-            timeout=30)
+            # Give the mechanism time to physically place the disc.
+            # The dropper picks up a disc and drops it on the tray — takes ~3-5 seconds.
+            dbg(f"place_disc: command sent (attempt {attempt + 1}/3), waiting 5s for mechanism...")
+            time.sleep(5)
 
-        if not state["disc_in_tray"] and not state["disc_available"]:
-            # Hopper ran empty during placement
-            return False
-        if not state["disc_in_tray"]:
-            warn("place_disc: disc_in_tray still False after polling — may have failed")
-            return False
-        time.sleep(0.8)  # Wait for dropper to retract (per reference code)
-        return True
+            # Confirm via state polling: disc_in_tray becomes True, or hopper empties.
+            # Use 60s timeout (was 30s) — mechanism can be slow on a full hopper.
+            dbg("place_disc: polling state to confirm...")
+            deadline = time.time() + 60
+            state = None
+            while time.time() < deadline:
+                state = self.get_state(fatal=False)
+                if state is None:
+                    time.sleep(0.5)
+                    continue
+                if state["disc_in_tray"] or not state["disc_available"]:
+                    break
+                time.sleep(0.5)
+
+            if state is None:
+                warn(f"place_disc: USB unresponsive during poll (attempt {attempt + 1}/3)")
+                time.sleep(3)
+                continue
+
+            if not state["disc_in_tray"] and not state["disc_available"]:
+                # Hopper ran empty during placement
+                return False
+            if state["disc_in_tray"]:
+                time.sleep(0.8)  # Wait for dropper to retract (per reference code)
+                return True
+
+            # Disc not on tray yet — retry
+            warn(f"place_disc: disc_in_tray still False after 60s (attempt {attempt + 1}/3) — retrying...")
+            time.sleep(3)
+
+        err(
+            "place_disc: disc failed to land on tray after 3 attempts.\n"
+            "\n"
+            "Likely cause: the 3 cam wheels that release discs from the hopper are\n"
+            "driven by a common ring. If the ring jams mid-rotation, the wheels stop\n"
+            "at different angles and the disc tilts and wedges instead of dropping.\n"
+            "\n"
+            "Fix:\n"
+            "  1. Power OFF the Nimbie.\n"
+            "  2. Remove the stuck disc:\n"
+            "       First try GENTLY pulling it UP out of the hopper.\n"
+            "       If it will not come up, carefully push it DOWN through onto the tray.\n"
+            "  3. If necessary, clean all 3 wheels with isopropyl alcohol (sticky label\n"
+            "     residue or dust is the most common cause of cam ring jamming).\n"
+            "  4. Power ON and wait. The ERROR LED should be OFF; the wheels will NOT\n"
+            "     rotate yet on this first power-on — that is normal.\n"
+            "  5. Power OFF again, then Power ON a second time. The wheels will now\n"
+            "     rotate back to their default (home) positions.\n"
+            "  6. Reload discs and resume the batch.\n"
+            "\n"
+            "If the wheel assembly is physically broken, Acronova sells it as a spare part.\n"
+            "Longer-term: apply a small amount of silicone lubricant (not oil) to the\n"
+            "cam pivot. Acronova recommends cleaning the wheel cams every 500 discs."
+        )
 
     def lift_disc(self):
         """Lift disc from open tray with the gripper mechanism. Returns True on success."""
@@ -3367,6 +3424,33 @@ def cmd_status(nimbie, config, _args):
                 msg(f"    my-nimbie reject   — open tray, lift disc, drop to reject bin")
             else:
                 msg(f"  No disc in drive.")
+                if state["disc_available"] and sf.get("current") == "loading":
+                    msg("")
+                    msg("  *** RETAINER WHEEL / CAM RING MAY BE STUCK — ERROR LED LIKELY LIT ***")
+                    msg("  Disc was available in the hopper but failed to drop onto the tray.")
+                    msg("  The 3 cam wheels are driven by a common ring. If the ring jams")
+                    msg("  mid-rotation, the wheels stop at different angles and the disc")
+                    msg("  tilts and wedges instead of dropping cleanly.")
+                    msg("")
+                    msg("  Fix:")
+                    msg("    1. Power OFF the Nimbie.")
+                    msg("    2. Remove the stuck disc:")
+                    msg("         First try GENTLY pulling it UP out of the hopper.")
+                    msg("         If it will not come up, carefully push it DOWN through onto the tray.")
+                    msg("    3. If necessary, clean all 3 wheels with isopropyl alcohol")
+                    msg("       (sticky label residue / dust is the most common cause).")
+                    msg("    4. Power ON and wait. ERROR LED should be OFF; the wheels")
+                    msg("       will NOT rotate yet on first power-on — that is normal.")
+                    msg("    5. Power OFF again, then Power ON a second time. The wheels")
+                    msg("       will now rotate back to their default (home) positions.")
+                    msg("    6. Reload discs and resume the batch.")
+                    msg("")
+                    msg("  Longer-term: apply a small amount of silicone lubricant (not oil)")
+                    msg("  to the cam pivot. Acronova recommends cleaning every 500 discs.")
+                    msg("")
+                    msg("  NOTE: The Nimbie ERROR LED state is not readable via USB —")
+                    msg("  my-nimbie cannot confirm it directly. Power cycling the device")
+                    msg("  (step 4+5 above) will reset both the cam ring and the ERROR LED.")
 
             if not disc_stuck:
                 # Safe to clean up stale status file
@@ -3643,6 +3727,9 @@ def cmd_status(nimbie, config, _args):
         result = subprocess.run(["drutil", "status"], capture_output=True, text=True)
         for line in result.stdout.strip().split("\n"):
             msg(f"    {line.strip()}")
+        msg("")
+        msg("  For full diagnostics (USB info, all state bits, counters, LEDs):")
+        msg("    my-nimbie reset --diagnostics")
 
 
 def cmd_next(nimbie, config, args):
@@ -4928,7 +5015,14 @@ def cmd_monitor(_nimbie, config, _args):
                     "disc_lifted":    state.get("disc_lifted"),
                     "tray_out":       state.get("tray_out"),
                 }})
-            except Exception as e:
+            except (Exception, SystemExit) as e:
+                # SystemExit can be raised by connect() → claim_interface() → err()
+                # (e.g. USB not yet claimable after power cycle). Treat as transient
+                # offline — write error entry and keep polling.
+                # BUT: if CTRL+C was pressed (interrupted=True), re-raise so the
+                # outer except KeyboardInterrupt / finally can clean up and exit.
+                if interrupted:
+                    raise
                 _write({"usb": "offline", "error": str(e)})
             finally:
                 try:
@@ -4938,7 +5032,7 @@ def cmd_monitor(_nimbie, config, _args):
 
             _time.sleep(0.1)
 
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         pass
     finally:
         try:
