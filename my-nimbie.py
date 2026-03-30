@@ -3461,6 +3461,58 @@ def _probe_send_and_read(dev, pkt_bytes, label="", timeout=3000, max_reads=10):
     return responses
 
 
+def _probe_init_scan(dev):
+    """Scan unexplored command bytes with a long timeout, looking for AT+I (init/home) responses.
+
+    Scans:
+      0x40-0x46, 0x48, 0x4B-0x51, 0x53-0x54, 0x57-0x60  (all unexplored, safe range)
+    Uses 10s timeout per command — enough for a homing spin to complete.
+    Skips 0x47/0x52 (known mechanical), 0x55/0x56 (dangerous/forbidden).
+    """
+    # Unexplored ranges: below known commands, gaps between, and just above 0x56
+    candidates = (
+        list(range(0x40, 0x43))   +  # 0x40-0x42
+        list(range(0x44, 0x47))   +  # 0x44-0x46
+        [0x48]                    +  # 0x48 (between LIFT_DISC and DIAGNOSTICS)
+        list(range(0x4B, 0x52))   +  # 0x4B-0x51
+        [0x53, 0x54]              +  # 0x53-0x54
+        list(range(0x57, 0x61))      # 0x57-0x60
+    )
+    found_init = []
+    found_other = []
+    msg(f"  Init-scan: {len(candidates)} unexplored command bytes, 10s timeout each")
+    msg(f"  Looking for AT+I (initialization/homing) and any other new responses.")
+    msg(f"  Watch the cam wheels — they should spin if the init command is found.")
+    msg(f"  (This will take ~{len(candidates) * 2 // 60 + 1} minutes)")
+    msg("")
+    for cmd in candidates:
+        label = f"0x{cmd:02X}"
+        resps = _probe_send_and_read(dev, [0x00, 0x00, cmd, 0x00], label,
+                                     timeout=10000, max_reads=20)
+        resp_str = " | ".join(resps) if resps else "(no response)"
+        has_init = any(r.startswith("AT+I") for r in resps)
+        if has_init:
+            msg(f"  *** INIT RESPONSE: 0x{cmd:02X} → {resp_str}  ← CANDIDATE HOMING COMMAND ***")
+            found_init.append((cmd, resp_str))
+        elif resps and resp_str != "(no response)":
+            found_other.append((cmd, resp_str))
+        time.sleep(0.3)
+    msg("")
+    msg("  === INIT-SCAN SUMMARY ===")
+    if found_init:
+        msg("  AT+I responses (homing/init candidates):")
+        for cmd, resp in found_init:
+            msg(f"    0x{cmd:02X}: {resp}")
+    else:
+        msg("  No AT+I responses found.")
+    if found_other:
+        msg("  Other new responses (potential recovery commands):")
+        for cmd, resp in found_other:
+            msg(f"    0x{cmd:02X}: {resp}")
+    if not found_init and not found_other:
+        msg("  Nothing new found. Init command may need a non-zero param or different packet layout.")
+
+
 def _probe_scan_commands(dev, start, end):
     """Scan Nimbie command bytes start–end and print results."""
     known = {0x43: "GET_STATE", 0x47: "LIFT_DISC", 0x49: "DIAGNOSTICS",
@@ -4012,7 +4064,10 @@ def cmd_probe(_nimbie, _config, args):
 
     dev, kd = _probe_connect()
     try:
-        if args.probe_raw:
+        if args.probe_init_scan:
+            _probe_init_scan(dev)
+
+        elif args.probe_raw:
             hex_str = args.probe_raw.replace(" ", "")
             raw_bytes = list(bytes.fromhex(hex_str))
             msg(f"  Sending raw bytes: {bytes(raw_bytes).hex()}")
@@ -6889,9 +6944,12 @@ Without flags: scans all command bytes 0x00-0xFF.
 
 Examples:
   my-nimbie probe                          scan all 0x00-0xFF
+  my-nimbie probe --init-scan              targeted scan for homing/init command (AT+I)
   my-nimbie probe --range 0x40-0x60        scan a specific range
   my-nimbie probe --cmd 0x52 --params      scan params for cmd 0x52
   my-nimbie probe --raw 000043000000       send raw hex bytes""")
+    probe_parser.add_argument("--init-scan", dest="probe_init_scan", action="store_true",
+                              help="scan unexplored bytes with 10s timeout, looking for AT+I (cam wheel homing)")
     probe_parser.add_argument("--range", dest="probe_range", metavar="RANGE",
                               help="command byte range to scan (e.g. 0x40-0x60)")
     probe_parser.add_argument("--cmd", dest="probe_cmd", metavar="CMD",
