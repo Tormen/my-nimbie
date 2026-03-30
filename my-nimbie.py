@@ -4456,7 +4456,7 @@ def cmd_status(nimbie, config, _args):
         _status_json_path = DEFAULT_STATUS_JSON
         with open(_status_json_path) as _f:
             _lines = [l.strip() for l in _f.readlines() if l.strip()]
-        _recent = _lines[-8:]
+        _recent = _lines[-1:]
         if _recent:
             msg(f"\n  Recent status-log entries (last {len(_recent)}):")
             msg(f"  Keys: T=disc_in_tray  A=disc_avail  L=disc_lifted  O=tray_out   ■=yes  □=no")
@@ -4577,9 +4577,10 @@ def cmd_next(nimbie, config, args):
     status.write_result_header()
     status.update("starting", disc_nr=disc_nr)
 
+    _collector_thread = None
     if not dry_run:
         msg(f"  Status log: {status_json}  (tail -f to watch)")
-        _start_status_json_collector(nimbie, status_json)
+        _collector_thread = _start_status_json_collector(nimbie, status_json)
 
     # Check if a disc is already in the drive (before printing startup info)
     use_loaded = getattr(args, "use_loaded", False)
@@ -4860,9 +4861,10 @@ def cmd_batch(nimbie, config, args):
     status.write_result_header()
     batch_status = status
 
+    _collector_thread = None
     if not dry_run:
         msg(f"  Status log: {status_json}  (tail -f to watch)")
-        _start_status_json_collector(nimbie, status_json)
+        _collector_thread = _start_status_json_collector(nimbie, status_json)
 
     # Install SIGUSR1 handler for live status queries
     signal.signal(signal.SIGUSR1, sigusr1_handler)
@@ -5131,6 +5133,12 @@ def cmd_batch(nimbie, config, args):
             if not has_more:
                 msg("  Hopper empty. Stopping.")
                 break
+
+        # Stop collector before summary — prevents USB calls after batch ends
+        # (collector calling get_state on a disconnected device can segfault in libusb)
+        if _collector_thread is not None:
+            _collector_thread.stop_event.set()
+            _collector_thread.join(timeout=1.0)
 
         # Summary
         final_state = "interrupted" if interrupted else "finished"
