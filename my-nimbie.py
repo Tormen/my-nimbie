@@ -3932,9 +3932,60 @@ def cmd_reset(_nimbie, _config, args):
         return
 
     if nimbie_dev:
-        msg("Nimbie is in normal mode — no recovery needed.")
+        # Hardware reset: close tray, drop any held disc, cycle mechanism to home position.
+        # Based on archive/nimbiestatemachine/scripts/reset_hardware_advanced.py
+        msg("Nimbie is in normal mode — running hardware reset sequence...")
+        msg("  (closes tray, drops any held disc, cycles cam wheels to home position)")
         msg("")
-        msg("  Use 'my-nimbie reset --diagnostics' to view device diagnostics.")
+        nimbie = NimbieDevice(NIMBIE_VID, NIMBIE_PID)
+        nimbie.connect()
+        try:
+            state = nimbie.get_state()
+            bits = state["raw"]
+            disc_lifted  = state["disc_lifted"]
+            tray_out     = state["tray_out"]
+            disc_in_tray = state["disc_in_tray"]
+            msg(f"  State: bits={{{bits}}}  disc_lifted={disc_lifted}  tray_out={tray_out}  disc_in_tray={disc_in_tray}")
+            msg("")
+
+            # Step 1: drop any held disc
+            if disc_lifted:
+                msg("  Disc is in gripper — dropping to reject pile...")
+                if tray_out:
+                    msg("  Closing tray first...")
+                    nimbie.close_tray()
+                nimbie.reject_disc()
+                msg("  Disc dropped.")
+            elif tray_out:
+                msg("  Tray is open — closing...")
+                nimbie.close_tray()
+                msg("  Tray closed.")
+
+            # Step 2: unconditional REJECT attempt to cycle mechanism to home position.
+            # After REJECT the cam wheels return to their disengaged/home position.
+            # AT+S03 (dropper error — nothing to drop) is expected and suppressed.
+            msg("  Cycling cam wheels to home position (unconditional REJECT)...")
+            responses = nimbie._send_and_read(CMD_REJECT, "REJECT (home)", timeout=5000,
+                                              max_reads=5, wait_for_at=False)
+            at = nimbie._find_at_response(responses)
+            if at in (AT_OK, None):
+                time.sleep(1)
+                msg("  Cam wheels cycled — mechanism at home position.")
+            elif at == AT_DROPPER_ERR:
+                msg("  AT+S03 (no disc to drop) — mechanism homed anyway.")
+            else:
+                warn(f"  Unexpected response from REJECT (home): {at}")
+
+            # Final state
+            state2 = nimbie.get_state()
+            bits2 = state2["raw"]
+            msg("")
+            msg(f"  Final state: {{{bits2}}}  disc_lifted={state2['disc_lifted']}  tray_out={state2['tray_out']}")
+            msg("")
+            msg("  Hardware reset complete.")
+            msg("  Use 'my-nimbie reset --diagnostics' to view full device diagnostics.")
+        finally:
+            nimbie.disconnect()
         return
 
     err(f"No Nimbie device found on USB.\n\n"
@@ -6781,7 +6832,7 @@ Detect and recover the Nimbie from various error states.
 
 Without flags, auto-detects the device state and recovers:
   - If in bootloader mode: sends RESET command (then you power cycle)
-  - If in normal mode: reports no recovery needed
+  - If in normal mode: closes tray, drops any held disc, cycles cam wheels to home position
 
 Standard recovery:
   --exit-bootloader     Send RESET_DEVICE (0x06) to bootloader, then power cycle

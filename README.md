@@ -463,8 +463,10 @@ All status responses are ASCII strings prefixed with `"AT+"`:
 |------|---------|
 | `AT+O` | Operation accepted / success (generic OK) |
 | `AT+S00` | No disc in tray (cannot lift) |
+| `AT+S01` | Error when drive picks up disc (multi-drive EXE context; meaning on NB21 unknown) |
 | `AT+S03` | Dropper/mechanism error (disc already lifted, or mechanism stuck) |
 | `AT+S07` | Disc successfully placed on tray |
+| `AT+S08` | Output bin not attached properly (BSUtility EXE; meaning on NB21 unknown) |
 | `AT+S10` | Tray is in the wrong state (e.g. tray closed when place_disc needs it open) |
 | `AT+S12` | Tray already has a disc |
 | `AT+S14` | Hopper is empty (no disc in input queue) |
