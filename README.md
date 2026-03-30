@@ -433,12 +433,23 @@ known command uses more than 2.
 | `0x52` | `0x02` | `ACCEPT` | Drop lifted disc into accept (done) pile | `"AT+O"` |
 | `0x52` | `0x03` | `REJECT` | Drop lifted disc into reject pile | `"AT+O"` |
 
+#### Hidden Commands (Discovered 2026-03-30 via Full Param Scan)
+
+Full param scan (`0x00`-`0xFF`) performed for all known command bytes on 2026-03-30
+(hopper empty, tray open, no disc in machine).
+
+| CMD | PARAM | Name | Response | Notes |
+|-----|-------|------|----------|-------|
+| `0x47` | `0x99` | `CAM_LOWER`? | `"OK"`, `"AT+O"` | **Caused physical movement** (observed). Returned AT+O with no disc — unlike LIFT_DISC (0x47,0x01) which returns AT+S00 with no disc. Likely runs cam wheels in the PLACE direction (downward) without hopper release. Opposite of LIFT_DISC. |
+| `0x52` | `0x90` | `QUERY_HOPPER`? | `"OK"`, `"AT+S14"` | Returns AT+S14 (hopper empty) as a query — no observed mechanical action. May be an alternate hopper-status query. |
+| `0x52` | `0x99` | unknown | `"OK"`, `"AT+S03"` | Returned AT+S03 (disc in gripper) with no disc present. Meaning unclear — may be a dropper mechanism query or a command that puts dropper in "gripped" state. |
+
 #### Dangerous Commands (Do Not Send)
 
 | CMD | PARAM | Effect |
 |-----|-------|--------|
-| `0x56` | `0x00` | **JUMPS TO BOOTLOADER** -- device re-enumerates as Microchip PIC HID bootloader (`0x04D8:0x000B`). Recoverable but requires power cycle. |
-| `0x55` | `0x00` | Returns `"OK"` / `"AT+O"` -- unknown side effect, avoid. |
+| `0x56` | `0x00` | **JUMPS TO BOOTLOADER** -- device re-enumerates as Microchip PIC HID bootloader (`0x04D8:0x000B`). Recoverable via power cycle. |
+| `0x55` | `0x00` | **ALSO JUMPS TO BOOTLOADER** -- confirmed 2026-03-30. Returns `"OK"` / `"AT+O"` then device re-enumerates as bootloader. Identical effect to `0x56`. |
 
 All other command bytes in the range `0x00`-`0xFF` either return no response or
 return `"AT+E09"` (unknown command error). Sending untested commands is strongly
@@ -637,37 +648,45 @@ Standard AN1388 commands that were NOT probed (destructive -- would brick the de
 | `0x02` | `ERASE_FLASH` | **Erases entire application flash → BRICK** |
 | `0x03` | `PROGRAM_FLASH` | **Writes to flash → BRICK if wrong data** |
 
-**RESET_DEVICE behavior:** Soft reset that maintains the USB connection briefly
-before going offline. Unlike a power cycle, the device stays in bootloader mode
-if the application validity signature has not been written.
+**RESET_DEVICE behavior:** Causes the device to self-reset and re-enumerate. If the
+application validity signature is valid, the device comes back in normal mode
+(VID=0x1723:0x0945) **without any hardware power disconnect**. If the signature is
+not valid (or not yet committed to NVM), it re-enumerates in bootloader mode again.
 
 Flash is read-protected on the Nimbie NB21: `GET_DATA` returns only the command echo
 byte with no actual flash data.
 
 ### Recovery Procedure
 
-**The confirmed working procedure** (verified after multiple failed attempts):
+**The confirmed working procedure** (verified 2026-03-30, confirmed no power disconnect needed):
 
 ```bash
 my-nimbie reset --sign-and-reset
-# Then: hardware switch OFF, wait 10 seconds, switch ON
 my-nimbie status                    # Verify device is back to normal mode
 ```
+
+**No hardware power switch needed.** The device self-resets after `RESET_DEVICE` once
+the validity signature has been written and committed to NVM.
 
 What this does:
 
 1. `PROGRAM_COMPLETE` (0x04) — signals to the bootloader that firmware programming
    is complete and a valid application should be present
 2. `SIGN_FLASH` (0x07) — writes the application validity CRC signature to NVM
-3. `SIGN_FLASH` (0x07) again — second write ensures the NVM write fully commits
-4. Wait 10 seconds before power cycle — critical: NVM write must complete
-5. Power cycle — bootloader re-checks the application CRC, finds it valid, runs firmware
+3. `SIGN_FLASH` (0x07) again — ensures the NVM write fully commits
+4. **Wait 60 seconds** — critical: NVM write must fully commit before RESET_DEVICE.
+   10 seconds is NOT enough. 30 seconds is marginal. 60 seconds is reliable.
+5. `RESET_DEVICE` (0x06) — device self-resets, bootloader checks CRC, finds it valid,
+   re-enumerates as normal Nimbie (VID=0x1723:0x0945). No power disconnect needed.
 
-**What did NOT work:**
+**What did NOT work (and why):**
 
-- `RESET_DEVICE` (0x06) alone + power cycle — signature not written, bootloader stays
+- `RESET_DEVICE` alone — signature not written yet, bootloader stays
+- `SIGN_FLASH` + 10s wait + `RESET_DEVICE` — NVM write not committed yet (too short)
+- `SIGN_FLASH` + immediate power off (no RESET_DEVICE) — also failed; power-off too fast
 - Framed Jump-to-App (0x05) — not processed; bootloader echoes the packet
-- Single `SIGN_FLASH` + immediate power cycle — NVM write may not have committed
+- **Sending RESET_DEVICE immediately after recovery** — re-enters bootloader! Do not
+  send any more USB commands after the device returns to normal mode.
 
 **Disc behavior after power cycle:** When the Nimbie powers on with a disc in an
 unknown state (disc was present during bootloader mode), it automatically rejects

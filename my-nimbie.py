@@ -97,6 +97,10 @@ _my-nimbie() {
 
     local -a commands
     commands=(
+        'open-tray:Open the optical drive tray'
+        'open:Open the optical drive tray (alias for open-tray)'
+        'close-tray:Close the optical drive tray'
+        'close:Close the optical drive tray (alias for close-tray)'
         'load:Load next disc from hopper into drive'
         'eject:Eject current disc to accept (done) bin'
         'reject:Reject current disc to reject bin (or tell paused process to reject)'
@@ -179,7 +183,7 @@ _my-nimbie() {
                         '--bl-read-addr[Read flash at hex address]:addr:' \
                         '--bl-read-len[Bytes to read (default 256)]:n:' \
                         '--bl-raw[Send raw hex bytes to bootloader]:hex:' \
-                        '--sign-and-reset[CONFIRMED recovery: PROGRAM_COMPLETE + SIGN_FLASH x2 + power cycle]'
+                        '--sign-and-reset[CONFIRMED recovery: PROGRAM_COMPLETE + SIGN_FLASH x2 + 60s + RESET_DEVICE (no power disconnect needed)]'
                     ;;
                 probe)
                     _arguments -s : \
@@ -251,6 +255,8 @@ CMD_PLACE_DISC = (0x52, 0x01)   # drop disc from hopper onto open tray
 CMD_ACCEPT     = (0x52, 0x02)   # drop lifted disc into accept pile
 CMD_REJECT     = (0x52, 0x03)   # drop lifted disc into reject pile
 CMD_LIFT_DISC  = (0x47, 0x01)   # lift disc from open tray with gripper
+CMD_CAM_LOWER  = (0x47, 0x99)   # engage/lower cam wheels (discovered 2026-03-30); may push
+                                 # a disc stuck just above the wheels down toward the tray
 
 # Microchip PIC HID Bootloader (entered via 0x56 command)
 BL_VID = 0x04D8
@@ -355,6 +361,7 @@ deepdebug = False
 dry_run = False
 interrupted = False
 batch_status = None  # set to BatchStatus instance during batch runs
+_debug_log_fh = None  # set when -DD active: dbg/ddbg write here only (not tee'd to terminal)
 _active_cmd_proc = None  # subprocess.Popen of the currently running on_load command
 
 
@@ -607,7 +614,7 @@ class BatchStatus:
         if self.dry_run:
             return
         try:
-            size_str = _format_size(entry["size"]) if entry["size"] else "?"
+            size_str = _format_size(entry["size"]) if entry["size"] else "n/a"
             cmd_str = self._fmt_elapsed(entry["elapsed"])
             total_str = self._fmt_elapsed(entry["total_elapsed"])
             fail_str = f"  [{entry['fail_reason']}]" if entry.get("fail_reason") else ""
@@ -852,11 +859,19 @@ def _ts():
 
 def dbg(text):
     if debug:
-        print(f"{_ts()}|  DBG: {text}", file=sys.stderr)
+        if _debug_log_fh:
+            _debug_log_fh.write(f"{_ts()}|  DBG: {text}\n")
+            _debug_log_fh.flush()
+        else:
+            print(f"{_ts()}|  DBG: {text}", file=sys.stderr)
 
 def ddbg(text):
     if deepdebug:
-        print(f"{_ts()}| DDBG: {text}", file=sys.stderr)
+        if _debug_log_fh:
+            _debug_log_fh.write(f"{_ts()}| DDBG: {text}\n")
+            _debug_log_fh.flush()
+        else:
+            print(f"{_ts()}| DDBG: {text}", file=sys.stderr)
 
 def err(text, code=1):
     print(f"\n  ERROR: {text}\n", file=sys.stderr)
@@ -1859,7 +1874,36 @@ class NimbieDevice:
                 if state2 and state2["disc_in_tray"]:
                     dbg("place_disc: disc_in_tray became True after disc_available=False — last disc did land")
                     return True  # disc landed, hopper now empty (has_more=False not correct here)
-                return False  # truly empty, no disc placed
+                # disc_available=False + disc_in_tray=False + disc_lifted=False:
+                # Disc passed the hopper sensor (it WAS dropped) but never reached the
+                # tray. Probe with LIFT_DISC (tray is open) — if the disc is physically
+                # on the tray or in the cam wheels with a lying sensor, grab and reject
+                # it to clear the mechanism automatically before stopping.
+                warn("place_disc: disc passed hopper sensor but did not land on tray — "
+                     "probing with LIFT_DISC to detect sensor lie...")
+                probe_resps = self._send_and_read(
+                    CMD_LIFT_DISC, "LIFT_DISC probe (hopper-empty, no disc on tray)",
+                    timeout=10000, max_reads=5, wait_for_at=False)
+                probe_at = self._find_at_response(probe_resps)
+                dbg(f"place_disc: LIFT_DISC probe (hopper-empty) response: {probe_at}")
+                if probe_at in (AT_OK, AT_DROPPER_ERR):
+                    # Disc found — sensor was lying. Close tray + REJECT to clear it.
+                    warn(f"  LIFT_DISC probe got {probe_at} — disc found. "
+                         "Closing tray + REJECT to auto-clear...")
+                    self.close_tray()
+                    self.reject_disc()
+                    time.sleep(1)
+                    state_clr = self.get_state(fatal=False)
+                    if state_clr and not state_clr.get("disc_lifted"):
+                        warn("  Disc auto-cleared to REJECT BIN — retrieve it and re-queue if needed.")
+                        self._hopper_empty_auto_cleared = True
+                    else:
+                        warn("  REJECT did not clear disc — manual inspection needed.")
+                elif probe_at == AT_NO_DISC:
+                    dbg("  LIFT_DISC probe (hopper-empty): AT+S00 — no disc at cam wheel level.")
+                else:
+                    warn(f"  LIFT_DISC probe (hopper-empty): unexpected response {probe_at!r}.")
+                return False  # hopper empty; disc auto-cleared or truly gone
             if state["disc_in_tray"]:
                 time.sleep(0.8)  # Wait for dropper to retract (per reference code)
                 return True
@@ -1887,14 +1931,72 @@ class NimbieDevice:
                 continue
             # disc_lifted=False + disc_in_tray=False after 120s: the disc may have
             # transited the cam wheels but failed to land on the tray, OR a sensor glitch
-            # is hiding a disc that is actually in the tray.
+            # is hiding a disc that is physically on the tray or in the cam wheels.
             #
-            # SAFE STOP — do NOT drop another disc. Dropping a second disc (push-through)
-            # risks a double-load inside the optical drive which can cause physical damage.
-            # Confirmed incident 2026-03-30: push-through caused double-load requiring
-            # manual power-cycle to prevent drive damage.
+            # Probe with LIFT_DISC before giving up: if the disc IS on the tray
+            # (disc_in_tray sensor lied), LIFT_DISC succeeds (AT+O). If it IS in the
+            # cam wheels (disc_lifted sensor lied), LIFT_DISC returns AT+S03 (already
+            # in gripper). Either way: close tray → REJECT → cleared → retry.
+            # Only stop if firmware confirms no disc (AT+S00).
             #
-            # The operator must intervene manually.
+            # SAFE: we are NOT dropping another disc. LIFT_DISC only engages the cam
+            # wheel mechanism — the same probe already used in load_disc() pre-check.
+            warn(f"place_disc: disc_lifted=False, disc_in_tray=False after 120s "
+                 f"(attempt {attempt + 1}/3) — probing with LIFT_DISC to detect sensor lie...")
+            probe_resps = self._send_and_read(
+                CMD_LIFT_DISC, "LIFT_DISC probe (timeout recovery)",
+                timeout=10000, max_reads=5, wait_for_at=False)
+            probe_at = self._find_at_response(probe_resps)
+            dbg(f"place_disc: LIFT_DISC probe response: {probe_at}")
+            if probe_at in (AT_OK, AT_DROPPER_ERR):
+                # AT+O  = disc was on tray (disc_in_tray sensor lied) → now lifted.
+                # AT+S03 = disc in cam wheels (disc_lifted sensor lied) → already in gripper.
+                # Either way: close tray + REJECT → disc goes to reject bin → retry.
+                warn(f"  LIFT_DISC probe got {probe_at} — disc found (sensor was lying). "
+                     "Closing tray + REJECT to clear stuck disc...")
+                self.close_tray()
+                self.reject_disc()
+                time.sleep(1)
+                state_after = self.get_state(fatal=False)
+                if state_after and not state_after.get("disc_lifted"):
+                    warn("  Stuck disc cleared to reject bin — retrying PLACE_DISC.")
+                    self.open_tray()
+                    time.sleep(1)
+                    continue
+                warn("  REJECT did not clear disc — manual intervention required.")
+            elif probe_at == AT_NO_DISC:
+                warn("  LIFT_DISC probe: AT+S00 — no disc at cam wheel level.")
+                # Last-resort: try CAM_LOWER (0x47,0x99) — lowers/engages the cam wheels.
+                # A disc stuck just above the wheel entry point may get pushed down to tray
+                # level by the downward wheel motion. Discovered 2026-03-30 via param scan.
+                warn("  Trying CAM_LOWER (0x47,0x99) to push stuck disc through cam wheels...")
+                for cam_attempt in range(2):
+                    self._send_command(CMD_CAM_LOWER, "CAM_LOWER")
+                    time.sleep(3)
+                    state_cam = self.get_state(fatal=False)
+                    if state_cam and state_cam.get("disc_in_tray"):
+                        warn(f"  CAM_LOWER attempt {cam_attempt+1}: disc landed on tray — retrying PLACE_DISC sequence.")
+                        continue   # outer attempt loop will re-check
+                    if state_cam and state_cam.get("disc_lifted"):
+                        warn(f"  CAM_LOWER attempt {cam_attempt+1}: disc now in gripper — rejecting to clear...")
+                        self.close_tray()
+                        self.reject_disc()
+                        time.sleep(1)
+                        self.open_tray()
+                        time.sleep(1)
+                        break
+                    warn(f"  CAM_LOWER attempt {cam_attempt+1}: no change in state.")
+                # Reset cam wheel state (REJECT resets to disengaged; already done above if disc_lifted)
+                state_post = self.get_state(fatal=False)
+                if state_post and state_post.get("disc_in_tray"):
+                    continue  # disc landed — continue outer retry loop
+            else:
+                warn(f"  LIFT_DISC probe: unexpected response {probe_at!r}.")
+            # Probe failed to recover — SAFE STOP. Do NOT drop another disc.
+            _write_result_recovery_note(
+                "disc did not land on tray (sensor glitch); "
+                "power cycle Nimbie → my-nimbie reset → restart batch"
+            )
             err(
                 f"place_disc: disc did not land on tray after 120s "
                 f"(disc_lifted=False, disc_in_tray=False) — attempt {attempt + 1}/3.\n"
@@ -2442,11 +2544,15 @@ def _verify_disc_read(mount_point, dir_name, source_size, strict=False):
         return True, ""   # for transcoding flavors: non-empty output is sufficient
 
     # Strict (mirror read): compare written bytes to disc bytes using the same
-    # measurement method on both sides (walk + getsize) — should be exactly equal.
+    # measurement method on both sides (walk + getsize).
+    # Allow 2 MB tolerance: dvdbackup omits .BUP files (redundant IFO backups) which
+    # are counted in the disc walk but never written — causing a phantom ~1 MB gap
+    # even on a perfect read.
+    _STRICT_TOLERANCE = 2 * 1024 * 1024  # 2 MB
     if mount_point and os.path.ismount(mount_point):
         disc_actual = _get_dir_size(mount_point)
         if disc_actual > 0:
-            if written >= disc_actual:
+            if written >= disc_actual - _STRICT_TOLERANCE:
                 return True, ""
             pct = written / disc_actual * 100
             missing = disc_actual - written
@@ -2933,6 +3039,28 @@ def _recover_drive_state(nimbie, mount_point):
 
     warn(f"Could not fully recover drive state: {state}")
     return False
+
+
+def cmd_open_tray(nimbie, _config, _args):
+    """Open the optical drive tray."""
+    state = nimbie.get_state(fatal=False)
+    if state and state.get("tray_out"):
+        msg("Tray is already open.")
+        return
+    msg("Opening tray...")
+    nimbie.open_tray()
+    msg("Tray open.")
+
+
+def cmd_close_tray(nimbie, _config, _args):
+    """Close the optical drive tray."""
+    state = nimbie.get_state(fatal=False)
+    if state and not state.get("tray_out"):
+        msg("Tray is already closed.")
+        return
+    msg("Closing tray...")
+    nimbie.close_tray()
+    msg("Tray closed.")
 
 
 def cmd_unmount(_nimbie, config, _args):
@@ -3521,13 +3649,10 @@ def cmd_reset(_nimbie, _config, args):
         return
 
     if args.sign_and_reset:
-        msg("PROGRAM_COMPLETE + SIGN_FLASH x2 — verified recovery procedure...")
+        msg("Bootloader recovery: PROGRAM_COMPLETE + SIGN_FLASH x2 + 60s wait + RESET_DEVICE")
         msg("")
-        msg("  This is the CONFIRMED working bootloader exit procedure:")
-        msg("  PROGRAM_COMPLETE (0x04) signals 'firmware is written'.")
-        msg("  SIGN_FLASH (0x07) x2 writes the application validity signature to NVM.")
-        msg("  The double SIGN_FLASH + 10-second wait allows NVM write to fully commit.")
-        msg("  After power cycle, bootloader finds valid app CRC and runs firmware.")
+        msg("  No hardware power disconnect needed — the device self-resets after RESET_DEVICE")
+        msg("  once the NVM write has fully committed (60 seconds required).")
         msg("")
         dev = _bl_require(bl_dev)
         try:
@@ -3536,13 +3661,16 @@ def cmd_reset(_nimbie, _config, args):
             if resp:
                 msg(f"    Response: {resp.hex()}")
             time.sleep(0.5)
-            msg("  Step 2: SIGN_FLASH (0x07) — first time...")
+            msg("  Step 2: SIGN_FLASH (0x07) — first write...")
             _bl_sign_flash(dev)
             time.sleep(1.0)
-            msg("  Step 3: SIGN_FLASH (0x07) — second time (NVM commit)...")
+            msg("  Step 3: SIGN_FLASH (0x07) — second write (NVM commit)...")
             _bl_sign_flash(dev)
-            time.sleep(10.0)
-            msg("  Step 4: RESET_DEVICE (0x06) — soft reset...")
+            msg("  Waiting 60 seconds for NVM write to fully commit...")
+            for remaining in range(60, 0, -10):
+                msg(f"    {remaining}s...")
+                time.sleep(10.0)
+            msg("  Step 4: RESET_DEVICE (0x06) — device will self-reset to normal mode...")
             _bl_exit_bootloader(dev)
         finally:
             try:
@@ -3550,12 +3678,11 @@ def cmd_reset(_nimbie, _config, args):
             except Exception:
                 pass
         msg("")
-        msg("  Commands sent. NVM write needs time to commit.")
+        msg("  Device is resetting. Wait a few seconds, then verify:")
+        msg("  my-nimbie status")
         msg("")
-        msg("  >>> NOW: Turn OFF the Nimbie hardware switch, wait 10 seconds, turn ON <<<")
-        msg("")
-        msg("  The Nimbie should come back in normal mode (VID=0x1723 PID=0x0945).")
-        msg("  Verify with: my-nimbie status")
+        msg("  The Nimbie should re-enumerate as VID=0x1723 PID=0x0945 (normal mode).")
+        msg("  Do NOT send any more USB commands — that can re-enter bootloader mode.")
         return
 
     # --- Standard recovery / diagnostics ---
@@ -4767,6 +4894,13 @@ def cmd_batch(nimbie, config, args):
     except Exception as e:
         warn(f"caffeinate failed to start: {e} — display sleep may cause mount failures")
 
+    # Close tray if open before starting batch
+    if not dry_run:
+        pre_state = nimbie.get_state(fatal=False)
+        if pre_state and pre_state.get("tray_out"):
+            msg("  Tray is open — closing before batch start...")
+            nimbie.close_tray()
+
     # Check if a disc is already in the drive (before printing startup info)
     use_loaded = getattr(args, "use_loaded", False)
     if not dry_run:
@@ -4795,6 +4929,7 @@ def cmd_batch(nimbie, config, args):
     msg(f"  Dir naming: {preview_dir_name}  (preview for disc #1)")
 
     first_disc_use_loaded = use_loaded
+    batch_exit_reason = ""   # set on abnormal exit; used for result trailer
 
     try:
         while not interrupted:
@@ -4819,11 +4954,15 @@ def cmd_batch(nimbie, config, args):
                 msg("  --use-loaded: processing disc already in drive")
                 has_more = True  # assume more in hopper
                 first_disc_use_loaded = False  # only skip loading for first disc
-                # Disc may not be mounted (e.g. unmounted before crash) — try to mount it
+                # Disc may not be mounted (e.g. unmounted before crash).
+                # macOS only mounts on a physical tray insertion — open + close tray to trigger it.
                 if not dry_run and not os.path.ismount(mount_point):
                     status.update("mounting", status.disc_nr)
-                    msg(f"  Disc not mounted — mounting...")
-                    subprocess.run(["diskutil", "mount", mount_point], capture_output=True, timeout=30)
+                    msg(f"  Disc not mounted — opening tray to re-trigger mount...")
+                    nimbie.open_tray()
+                    time.sleep(1)
+                    nimbie.close_tray()
+                    msg(f"  Tray closed — waiting for disc to mount...")
             else:
                 status.update("loading", status.disc_nr)
                 msg("  Loading disc from hopper...")
@@ -4842,8 +4981,9 @@ def cmd_batch(nimbie, config, args):
                         total_elapsed = status.get_disc_total_elapsed()
                         status.record_reject(index=index_val, dir_name="", source_size=0,
                                              elapsed=0.0, rc=1, total_elapsed=total_elapsed,
-                                             result="ABORTED", fail_reason="load failed — disc did not reach tray")
+                                             result="ABORTED", fail_reason="n/a")
                         msg("  Stopping batch — cannot continue without a disc in drive.")
+                        batch_exit_reason = "ABORTED: load failed — disc did not reach tray"
                         break
 
             if not dry_run:
@@ -4995,7 +5135,7 @@ def cmd_batch(nimbie, config, args):
         # Summary
         final_state = "interrupted" if interrupted else "finished"
         status.finish(final_state)
-        status.write_result_trailer("INTERRUPTED" if interrupted else "FINISHED")
+        status.write_result_trailer("INTERRUPTED" if interrupted else batch_exit_reason or "FINISHED")
 
         msg(f"\n{'=' * 60}")
         msg(f"  Batch {final_state} (flavor: {flavor_label})")
@@ -5311,7 +5451,7 @@ class TestArgvExpansion(unittest.TestCase):
                 expanded.extend(["-D"] * len(arg[1:]))
             else:
                 expanded.append(arg)
-        subcommands = {"load", "eject", "reject", "unmount", "status", "next", "batch", "reset", "cancel", "monitor"}
+        subcommands = {"load", "eject", "reject", "unmount", "status", "next", "batch", "reset", "cancel", "monitor", "open-tray", "open", "close-tray", "close"}
         global_flags = {"-D", "-v", "-V", "--debug", "--verbose", "--version", "--dry", "--deepdbg"}
         hoisted = []
         rest = []
@@ -6174,6 +6314,7 @@ def cmd_monitor(_nimbie, _config, args):
                 msg(f"    prg: {prog}")
         except (FileNotFoundError, OSError):
             pass
+        msg(f"  Keys : T=disc_in_tray  A=disc_avail  L=disc_lifted  O=tray_out   ■=yes  □=no")
         msg(f"  {'─' * 70}")
 
     # ── follow new entries ────────────────────────────────────────────────────
@@ -6395,6 +6536,18 @@ GLOBAL OPTIONS (place before or after subcommand):
         parser._action_groups.remove(parser._subparsers)
     except (ValueError, AttributeError):
         pass
+
+    for _alias in ("open-tray", "open"):
+        _p = sub.add_parser(_alias, formatter_class=_NimbieFormatter,
+                            help=argparse.SUPPRESS,
+                            description="Open the optical drive tray.")
+        _p.epilog = _GLOBAL_EPILOG
+
+    for _alias in ("close-tray", "close"):
+        _p = sub.add_parser(_alias, formatter_class=_NimbieFormatter,
+                            help=argparse.SUPPRESS,
+                            description="Close the optical drive tray.")
+        _p.epilog = _GLOBAL_EPILOG
 
     _p = sub.add_parser("load",
                         formatter_class=_NimbieFormatter,
@@ -6619,14 +6772,13 @@ Bootloader operations (device must be in bootloader mode — LED: ERROR=RED):
   --bl-read-addr ADDR   Read flash at specific hex address (e.g. 0x0000)
   --bl-read-len N       Bytes to read with --bl-read-addr (default: 256)
   --bl-raw HEX          Send raw hex bytes to bootloader (e.g. "0500")
-  --sign-and-reset      CONFIRMED recovery: PROGRAM_COMPLETE + SIGN_FLASH x2 + power cycle
+  --sign-and-reset      CONFIRMED recovery: PROGRAM_COMPLETE + SIGN_FLASH x2 + 60s + RESET_DEVICE
 
-Confirmed working recovery procedure:
+Confirmed working recovery procedure (NO power disconnect needed):
   my-nimbie reset --sign-and-reset
-  Then: hardware switch OFF → wait 10s → ON
-  Verify with: my-nimbie status""")
+  my-nimbie status      # device self-resets, verify normal mode""")
     reset_parser.add_argument("--exit-bootloader", action="store_true",
-                              help="send RESET_DEVICE to bootloader (then power cycle)")
+                              help="send RESET_DEVICE to bootloader (use --sign-and-reset instead)")
     reset_parser.add_argument("--diagnostics", action="store_true",
                               help="show device diagnostics (counters, timers, state)")
     reset_parser.add_argument("--jump-to-app", action="store_true",
@@ -6984,6 +7136,9 @@ def main():
     if _log_arg is not None or _auto_log:
         _logpath = (_log_arg or "") or config.get("batch", "log_file", fallback=DEFAULT_LOGFILE)
         _setup_log_tee(_logpath)
+        if deepdebug:
+            global _debug_log_fh
+            _debug_log_fh = open(_logpath, "a")  # noqa: SIM115
 
     # config / create-config — no USB needed, may show config info
     if args.command == "config":
@@ -7131,13 +7286,17 @@ def main():
 
     try:
         commands = {
-            "load":    cmd_load,
-            "eject":   cmd_eject,
-            "reject":  cmd_reject,
-            "status":  cmd_status,
-            "next":    cmd_next,
-            "batch":   cmd_batch,
-            "monitor": cmd_monitor,
+            "load":       cmd_load,
+            "eject":      cmd_eject,
+            "reject":     cmd_reject,
+            "status":     cmd_status,
+            "next":       cmd_next,
+            "batch":      cmd_batch,
+            "monitor":    cmd_monitor,
+            "open-tray":  cmd_open_tray,
+            "open":       cmd_open_tray,
+            "close-tray": cmd_close_tray,
+            "close":      cmd_close_tray,
         }
         commands[args.command](nimbie, config, args)
     finally:
