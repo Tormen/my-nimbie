@@ -374,15 +374,23 @@ def _start_status_json_collector(nimbie, status_json_path, interval=0.1):
                 snapshot = {}
                 snapshot["ts"] = _ts()
 
-                # Hardware state
+                # Hardware state — MUST use fatal=False to avoid crashing the process.
+                # The collector runs in a background thread that shares the USB device
+                # with the main thread. If both call get_state() simultaneously the
+                # collector may read an empty response (main thread drained the buffer).
+                # With fatal=False it gets None and skips the entry; with fatal=True it
+                # calls reconnect() which sets self.dev=None and breaks the main thread.
                 try:
-                    state = nimbie.get_state()
-                    snapshot["hw"] = {
-                        "disc_available": state.get("disc_available"),
-                        "disc_in_tray":   state.get("disc_in_tray"),
-                        "disc_lifted":    state.get("disc_lifted"),
-                        "tray_out":       state.get("tray_out"),
-                    }
+                    state = nimbie.get_state(fatal=False)
+                    if state is not None:
+                        snapshot["hw"] = {
+                            "disc_available": state.get("disc_available"),
+                            "disc_in_tray":   state.get("disc_in_tray"),
+                            "disc_lifted":    state.get("disc_lifted"),
+                            "tray_out":       state.get("tray_out"),
+                        }
+                    else:
+                        snapshot["hw"] = {"error": "transient: no state response"}
                 except Exception as e:
                     snapshot["hw"] = {"error": str(e)}
 
@@ -1101,6 +1109,9 @@ class NimbieDevice:
         self.dev = None
         self._kernel_detached = False
         self._drutil_drive_nr = None  # cached drutil drive number
+        # Mutex to prevent concurrent USB send+read from the status-JSON collector
+        # background thread and the main thread from interleaving their responses.
+        self._usb_lock = threading.Lock()
 
     def connect(self):
         """Find and claim the Nimbie USB device."""
@@ -1378,21 +1389,27 @@ class NimbieDevice:
 
         If fatal=True (default), attempts USB recovery then calls err() on failure.
         If fatal=False, returns None on failure (for use in polling loops).
+
+        Thread-safe: acquires _usb_lock so the background status-JSON collector
+        thread cannot interleave its GET_STATE with the main thread's operations.
         """
         # Use 20s read timeout (matching reference code) — shorter timeouts
         # cause [Errno 60] which cascades to [Errno 5] killing the USB bus.
-        responses = self._send_and_read(CMD_GET_STATE, "GET_STATE", timeout=20000)
-        bits = self._find_state_string(responses)
+        # Hold _usb_lock for the entire query + recovery so the collector thread
+        # cannot send its own GET_STATE while we are mid-read (or mid-reconnect).
+        with self._usb_lock:
+            responses = self._send_and_read(CMD_GET_STATE, "GET_STATE", timeout=20000)
+            bits = self._find_state_string(responses)
 
-        if bits is None and fatal:
-            # Attempt USB recovery before giving up
-            warn(f"No state response — attempting USB recovery...")
-            try:
-                self.reconnect()
-                responses = self._send_and_read(CMD_GET_STATE, "GET_STATE", timeout=20000)
-                bits = self._find_state_string(responses)
-            except (Exception, SystemExit):
-                pass
+            if bits is None and fatal:
+                # Attempt USB recovery before giving up
+                warn(f"No state response — attempting USB recovery...")
+                try:
+                    self.reconnect()
+                    responses = self._send_and_read(CMD_GET_STATE, "GET_STATE", timeout=20000)
+                    bits = self._find_state_string(responses)
+                except (Exception, SystemExit):
+                    pass
 
         if bits is None:
             if fatal:
@@ -1411,10 +1428,16 @@ class NimbieDevice:
         def bit(pos):
             return pos < len(bits) and bits[pos] == "1"
 
+        # AT+S07 ("disc placed on tray") can arrive as an unsolicited status mixed in
+        # with the GET_STATE response — the device holds the USB read open while
+        # mechanically dropping the disc, then sends AT+S07 when it lands.
+        # Treat it as authoritative: disc IS in tray even if the bit hasn't updated yet.
+        at_s07_seen = AT_PLACED in responses
+
         return {
             "raw":            bits,
             "disc_available":  bit(STATE_BIT_DISC_AVAILABLE),
-            "disc_in_tray":    bit(STATE_BIT_DISC_IN_TRAY),
+            "disc_in_tray":    bit(STATE_BIT_DISC_IN_TRAY) or at_s07_seen,
             "disc_lifted":     bit(STATE_BIT_DISC_LIFTED),
             "tray_out":        bit(STATE_BIT_TRAY_OUT),
         }
@@ -1530,6 +1553,15 @@ class NimbieDevice:
                             "(USB was unstable and we missed it). Not sending another PLACE_DISC.")
                         time.sleep(0.8)
                         return True
+                    if pre_state.get("disc_lifted"):
+                        # Previous recovery attempt didn't clear the stuck disc — try once more.
+                        warn("place_disc: pre-retry check: disc still stuck (disc_lifted=True) — REJECT again...")
+                        self.close_tray()
+                        self.reject_disc()
+                        time.sleep(1)
+                        self.open_tray()
+                        time.sleep(1)
+                        continue
                     if not pre_state["disc_available"]:
                         return False  # hopper empty
 
@@ -1541,9 +1573,11 @@ class NimbieDevice:
             time.sleep(5)
 
             # Confirm via state polling: disc_in_tray becomes True, or hopper empties.
-            # Use 60s timeout (was 30s) — mechanism can be slow on a full hopper.
+            # Use 120s timeout — mechanism can be slow when slightly stuck (observed 86s
+            # real-world drop time on 2026-03-30). get_state() also watches for the
+            # unsolicited AT+S07 "disc placed" signal which arrives when disc lands.
             dbg("place_disc: polling state to confirm...")
-            deadline = time.time() + 60
+            deadline = time.time() + 120
             state = None
             while time.time() < deadline:
                 state = self.get_state(fatal=False)
@@ -1560,35 +1594,103 @@ class NimbieDevice:
                 continue
 
             if not state["disc_in_tray"] and not state["disc_available"]:
-                # Hopper ran empty during placement
-                return False
+                # DOUBLE-LOAD PREVENTION: disc_lifted=True here means the disc moved
+                # past the hopper sensor but stalled at cam wheel level — it did NOT
+                # land. This is NOT hopper-empty. Retrying PLACE_DISC would spin the
+                # cam wheels again and pull a 2nd disc down (double load).
+                #
+                # Safe recovery: close tray → REJECT (deflector only, no cam wheels)
+                # → disc drops to reject bin → open tray → retry PLACE_DISC cleanly.
+                # Confirmed working on 2026-03-30: REJECT released disc 349 without
+                # turning the cam wheels, no double load.
+                if state.get("disc_lifted"):
+                    warn(f"place_disc: disc stuck in cam wheels (disc_lifted=True) — not hopper-empty "
+                         f"(attempt {attempt + 1}/3).")
+                    # Primary recovery: REJECT — deflector releases disc to reject bin, no cam wheels.
+                    # Confirmed working 2026-03-30 (disc 349). Firmware interlock prevents PLACE_DISC
+                    # (returns AT+S14) while disc_lifted=True, so only REJECT or ACCEPT can clear this.
+                    warn("  Recovering (primary): close tray → REJECT (deflector only, no cam wheels)...")
+                    self.close_tray()
+                    self.reject_disc()
+                    time.sleep(1)
+                    state_after = self.get_state(fatal=False)
+                    if state_after and not state_after.get("disc_lifted"):
+                        warn("  Stuck disc cleared to reject bin — retrying PLACE_DISC with next disc.")
+                        self.open_tray()
+                        time.sleep(1)
+                        continue
+                    # Secondary recovery: ACCEPT — cam wheels run BACKWARD (upward), disc ejected
+                    # to accept bin at top. Does NOT involve the deflector (upward path bypasses it).
+                    # Does NOT pull a new disc from hopper (wheels go up, not down). Retrieve
+                    # the disc from the accept bin and reload it.
+                    warn("  REJECT did not clear disc_lifted — trying ACCEPT (cam wheels backward → accept bin)...")
+                    self.accept_disc()
+                    time.sleep(1)
+                    state_after2 = self.get_state(fatal=False)
+                    if state_after2 and not state_after2.get("disc_lifted"):
+                        warn("  Stuck disc ejected to ACCEPT BIN — retrieve it manually and reload.")
+                        self.open_tray()
+                        time.sleep(1)
+                        continue
+                    warn("  WARNING: disc_lifted still True after REJECT + ACCEPT — manual intervention needed.")
+                    self.open_tray()
+                    time.sleep(1)
+                    continue
+                # Hopper sensor went empty — could be the last disc just fed through
+                # but disc_in_tray hasn't updated yet (timing race). Re-check once.
+                time.sleep(1.0)
+                state2 = self.get_state(fatal=False)
+                if state2 and state2["disc_in_tray"]:
+                    dbg("place_disc: disc_in_tray became True after disc_available=False — last disc did land")
+                    return True  # disc landed, hopper now empty (has_more=False not correct here)
+                return False  # truly empty, no disc placed
             if state["disc_in_tray"]:
                 time.sleep(0.8)  # Wait for dropper to retract (per reference code)
                 return True
 
-            # Disc not on tray yet — retry
-            warn(f"place_disc: disc_in_tray still False after 60s (attempt {attempt + 1}/3) — retrying...")
+            # Timeout: disc_in_tray still False, disc_available may still be True.
+            # DOUBLE-LOAD PREVENTION: same check — if disc_lifted=True the disc is
+            # stuck at cam level. Retrying PLACE_DISC would spin the wheels and pull
+            # a 2nd disc down. Recover via REJECT before retrying.
+            if state.get("disc_lifted"):
+                warn(f"place_disc: timeout with disc stuck in cam wheels (disc_lifted=True, "
+                     f"attempt {attempt + 1}/3).")
+                warn("  Recovering (primary): close tray → REJECT (deflector only, no cam wheels)...")
+                self.close_tray()
+                self.reject_disc()
+                time.sleep(1)
+                state_after = self.get_state(fatal=False)
+                if state_after and not state_after.get("disc_lifted"):
+                    warn("  Stuck disc cleared to reject bin — retrying PLACE_DISC with next disc.")
+                else:
+                    warn("  REJECT did not clear — trying ACCEPT (cam wheels backward → accept bin)...")
+                    self.accept_disc()
+                    time.sleep(1)
+                self.open_tray()
+                time.sleep(1)
+                continue
+            warn(f"place_disc: disc_in_tray still False after 120s (attempt {attempt + 1}/3) — retrying...")
             time.sleep(3)
 
         err(
             "place_disc: disc failed to land on tray after 3 attempts.\n"
             "\n"
-            "Likely cause: the 3 cam wheels that release discs from the hopper are\n"
-            "driven by a common ring. If the ring jams mid-rotation, the wheels stop\n"
-            "at different angles and the disc tilts and wedges instead of dropping.\n"
+            "The disc is stuck in the dropper mechanism (held by the cam wheel rollers\n"
+            "at the intermediate position between the hopper and the tray). This is the\n"
+            "'in transit' state: disc_lifted=1, disc_in_tray=0.\n"
             "\n"
-            "Fix:\n"
+            "Automatic recovery (run: my-nimbie reset --diagnostics):\n"
+            "  1. Close the tray (drutil tray close).\n"
+            "  2. Issue ACCEPT (0x52/0x02) — runs cam wheels in reverse (upward),\n"
+            "     ejecting the stuck disc to the accept output bin at the top.\n"
+            "  3. Retrieve the disc from the accept bin and reload it.\n"
+            "\n"
+            "If automatic recovery fails:\n"
             "  1. Power OFF the Nimbie.\n"
-            "  2. Remove the stuck disc:\n"
-            "       First try GENTLY pulling it UP out of the hopper.\n"
-            "       If it will not come up, carefully push it DOWN through onto the tray.\n"
-            "  3. If necessary, clean all 3 wheels with isopropyl alcohol (sticky label\n"
-            "     residue or dust is the most common cause of cam ring jamming).\n"
-            "  4. Power ON and wait. The ERROR LED should be OFF; the wheels will NOT\n"
-            "     rotate yet on this first power-on — that is normal.\n"
-            "  5. Power OFF again, then Power ON a second time. The wheels will now\n"
-            "     rotate back to their default (home) positions.\n"
-            "  6. Reload discs and resume the batch.\n"
+            "  2. Power ON and wait. The ERROR LED should be OFF; wheels will NOT rotate\n"
+            "     yet on first power-on — that is normal.\n"
+            "  3. Power OFF again, then Power ON a second time. Wheels rotate to home.\n"
+            "  4. Reload discs and resume the batch.\n"
             "\n"
             "If the wheel assembly is physically broken, Acronova sells it as a spare part.\n"
             "Longer-term: apply a small amount of silicone lubricant (not oil) to the\n"
@@ -2327,7 +2429,15 @@ def _detect_disc_in_drive(nimbie):
     state = nimbie.get_state()
 
     if state["disc_lifted"]:
-        return "disc in gripper (lifted)"
+        # disc_lifted=True has two meanings:
+        # 1. Disc in gripper (after LIFT_DISC): disc was on tray and lifted for accept/reject
+        # 2. Disc in dropper / in transit (after PLACE_DISC got stuck): disc is held by the
+        #    cam wheel rollers at the intermediate position between hopper and tray.
+        # Distinguish by tray_out and disc_available: if tray is open OR more discs are
+        # available in the hopper, the disc is most likely in the dropper.
+        if state["tray_out"] or state["disc_available"]:
+            return "disc in dropper / in transit (held by cam wheels, not yet on tray)"
+        return "disc in dropper or gripper (cam wheels holding disc, tray closed)"
     if state["disc_in_tray"]:
         if state["tray_out"]:
             return "disc on open tray"
@@ -2351,13 +2461,20 @@ def _recover_drive_state(nimbie, mount_point):
     """Ensure drive is in clean idle state before starting an operation.
 
     Handles all stuck states:
-    - Tray out (disc on open tray): close tray, try to eject disc to reject bin
+    - Disc lifted (gripper OR dropper): close tray, then ACCEPT to eject to accept bin
+    - Tray out (disc on open tray, no disc lifted): close tray, eject disc to reject bin
     - Disc in tray (closed): unmount, eject to reject bin
-    - Disc lifted (grabbed by gripper): drop to reject bin
     Returns True if recovery succeeded (drive is idle now).
 
     NOTE: Does NOT check drutil for disc in closed drive — the batch/next
     flows handle that case separately (to process the disc rather than eject it).
+
+    IMPORTANT: disc_lifted=True means either:
+    - Disc in gripper (after LIFT_DISC): tray closed, disc suspended above
+    - Disc in dropper (after PLACE_DISC got stuck): disc held by cam wheel rollers
+    In both cases, the recovery is: close tray → ACCEPT (0x52/0x02).
+    This was confirmed experimentally on 2026-03-30: ACCEPT with tray closed
+    runs the cam wheels and ejects the disc to the accept output bin.
     """
     state = nimbie.get_state()
     dbg(f"_recover_drive_state: {state}")
@@ -2368,8 +2485,21 @@ def _recover_drive_state(nimbie, mount_point):
     msg("  Recovering from stuck state...")
 
     if state["disc_lifted"]:
-        msg("  Disc in gripper — dropping to reject bin...")
-        nimbie.reject_disc()
+        # Disc is either in the gripper (after LIFT_DISC) or in the dropper (after
+        # a stuck PLACE_DISC). Close the tray first (required for ACCEPT to work),
+        # then issue ACCEPT to run the cam wheels and eject the disc to the accept bin.
+        if state["tray_out"]:
+            msg("  Disc in dropper/gripper (tray open) — closing tray first...")
+            nimbie.close_tray()
+        msg("  Disc in dropper/gripper — ejecting to accept bin (ACCEPT with tray closed)...")
+        nimbie.accept_disc()
+        time.sleep(2)
+        state = nimbie.get_state()
+        dbg(f"_recover_drive_state: after accept_disc: {state}")
+        if not state["disc_lifted"]:
+            msg("  Disc ejected to accept bin. Retrieve it and reload if needed.")
+            if not state["disc_in_tray"] and not state["tray_out"]:
+                return True
 
     if state["tray_out"]:
         msg("  Tray is open — closing tray...")
@@ -3131,7 +3261,14 @@ def cmd_reset(_nimbie, _config, args):
             msg(f"    Bit 1: {bits[1]}   disc_available   — {'YES: discs in input hopper' if state['disc_available'] else 'no: hopper empty'}")
             msg(f"    Bit 2: {bits[2]}   (unknown)")
             msg(f"    Bit 3: {bits[3]}   disc_in_tray     — {'YES: disc sitting on ejected tray' if state['disc_in_tray'] else 'no: tray empty'}")
-            msg(f"    Bit 4: {bits[4]}   disc_lifted      — {'YES: disc held by gripper' if state['disc_lifted'] else 'no: gripper empty'}")
+            if state["disc_lifted"]:
+                if state["tray_out"] or state["disc_available"]:
+                    lifted_label = "YES: disc in dropper/transit (held by cam wheels, NOT on tray yet)"
+                else:
+                    lifted_label = "YES: disc in dropper or gripper (cam wheels holding disc, tray closed)"
+            else:
+                lifted_label = "no: cam wheels empty"
+            msg(f"    Bit 4: {bits[4]}   disc_lifted      — {lifted_label}")
             msg(f"    Bit 5: {bits[5]}   tray_out         — {'YES: drive tray is ejected' if state['tray_out'] else 'no: tray closed'}")
             for i in range(6, len(bits)):
                 msg(f"    Bit {i}: {bits[i]}   (unknown)")
@@ -3839,11 +3976,24 @@ def cmd_next(nimbie, config, args):
     if use_loaded:
         msg("\n  --use-loaded: processing disc already in drive")
         has_more = True  # hopper status unknown, assume more discs
-        # Disc may not be mounted (e.g. unmounted before crash) — try to mount it
-        if not dry_run and not os.path.ismount(mount_point):
-            status.update("mounting")
-            msg(f"  Disc not mounted — mounting...")
-            subprocess.run(["diskutil", "mount", mount_point], capture_output=True, timeout=30)
+        if not dry_run:
+            hw = nimbie.get_state(fatal=False)
+            dbg(f"cmd_next --use-loaded: state={hw}")
+            if hw is None:
+                # USB may have been briefly busy (e.g. just released from another process).
+                # Default-safe action: close the tray. drutil tray close is harmless if
+                # the tray is already closed, and critical if it's open with a disc on it.
+                msg("  State read failed — closing tray as a precaution...")
+                nimbie.close_tray()
+            elif hw["disc_in_tray"] and hw["tray_out"]:
+                # Disc is on the open tray — close it first
+                msg("  Disc is on open tray — closing tray...")
+                nimbie.close_tray()
+            elif not os.path.ismount(mount_point):
+                # Disc is in closed drive but not mounted — try to mount it
+                status.update("mounting")
+                msg(f"  Disc not mounted — mounting...")
+                subprocess.run(["diskutil", "mount", mount_point], capture_output=True, timeout=30)
     else:
         # Load
         status.update("loading")
@@ -4673,7 +4823,7 @@ class TestStatusJsonCollector(unittest.TestCase):
         import tempfile, json, time
 
         class _FakeNimbie:
-            def get_state(self):
+            def get_state(self, fatal=False):
                 return {"disc_available": False, "disc_in_tray": True,
                         "disc_lifted": False, "tray_out": False}
 
@@ -4707,7 +4857,7 @@ class TestStatusJsonCollector(unittest.TestCase):
         import tempfile, json, time
 
         class _BrokenNimbie:
-            def get_state(self):
+            def get_state(self, fatal=False):
                 raise RuntimeError("USB error")
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
