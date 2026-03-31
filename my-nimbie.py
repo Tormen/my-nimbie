@@ -5,7 +5,7 @@ Controls the Nimbie loader/unloader mechanism via USB HID and orchestrates
 batch disc processing with configurable commands (e.g. my-handbrake).
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __copyleft__ = "Copyleft (ↄ) 2026 Tormen <tormen@mail.ch>"
 __license__ = "All rights reversed."
 
@@ -6936,7 +6936,6 @@ Without flags, auto-detects the device state and recovers:
 
 Standard recovery:
   --exit-bootloader     Send RESET_DEVICE (0x06) to bootloader, then power cycle
-  --usb-reset           USB device reset — re-enumerate; may trigger power-on cam wheel homing
   --diagnostics         Show device diagnostics (counters, state, bootloader info)
 
 Bootloader operations (device must be in bootloader mode — LED: ERROR=RED):
@@ -6954,8 +6953,6 @@ Confirmed working recovery procedure (NO power disconnect needed):
   my-nimbie status      # device self-resets, verify normal mode""")
     reset_parser.add_argument("--exit-bootloader", action="store_true",
                               help="send RESET_DEVICE to bootloader (use --sign-and-reset instead)")
-    reset_parser.add_argument("--usb-reset", dest="usb_reset", action="store_true",
-                              help="USB device reset — re-enumerate; may trigger power-on cam wheel homing spin")
     reset_parser.add_argument("--diagnostics", action="store_true",
                               help="show device diagnostics (counters, timers, state)")
     reset_parser.add_argument("--jump-to-app", action="store_true",
