@@ -5,7 +5,7 @@ Controls the Nimbie loader/unloader mechanism via USB HID and orchestrates
 batch disc processing with configurable commands (e.g. my-handbrake).
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 __copyleft__ = "Copyleft (ↄ) 2026 Tormen <tormen@mail.ch>"
 __license__ = "All rights reversed."
 
