@@ -10,7 +10,7 @@ shadowed-into-repo: /syst/global/src
 #     own live .git, which stays the authoritative history.
 
 first-shadowed: 2026-07-27T12:06:30Z
-last-shadowed: 2026-09-09T20:44:43Z
+last-shadowed: 2026-09-09T21:58:19Z
 
 branch: main
 commit: 7894561788cd3f532293eff59075aa99ad12d1e3
