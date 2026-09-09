@@ -184,9 +184,12 @@ mounted and my-nimbie waits for an interactive command (`accept`, `reject`, `ret
 
 Config file search order:
 
-1. `~/.my-nimbie.conf`
-2. `/etc/my-nimbie.conf`
-3. `/LINKS/default/my-nimbie`
+1. `/LINKS/default/my-nimbie.conf` — primary system-wide location
+2. `/LINKS/default/my-nimbie` — legacy, suffix-less name; kept so an existing
+   install keeps working
+3. `~/.my-nimbie.conf`
+4. `/etc/my-nimbie.conf`
+5. `/usr/local/etc/my-nimbie.conf`
 
 Or specify explicitly: `my-nimbie --config /path/to/config <command>`
 

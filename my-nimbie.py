@@ -335,12 +335,18 @@ DEFAULT_CONFIG = {
 }
 
 CONFIG_SEARCH_PATHS = [
+    # Primary system-wide location, searched FIRST. Spelled out on purpose: a
+    # search keyed on a value that lives inside a config file cannot find that
+    # file. The legacy suffix-less name is kept behind it so an existing
+    # install keeps working.
+    "/LINKS/default/my-nimbie.conf",
+    "/LINKS/default/my-nimbie",
     os.path.expanduser("~/.my-nimbie.conf"),
     "/etc/my-nimbie.conf",
-    "/LINKS/default/my-nimbie",
+    "/usr/local/etc/my-nimbie.conf",
 ]
 
-DEFAULT_CONFIG_PATH = CONFIG_SEARCH_PATHS[0]  # ~/.my-nimbie.conf
+DEFAULT_CONFIG_PATH = os.path.expanduser("~/.my-nimbie.conf")
 
 STATUS_FILE = "/tmp/my-nimbie.status"
 PROGRESS_FILE = "/tmp/my-nimbie.progress"
@@ -999,7 +1005,8 @@ def generate_example_config():
     return """\
 # my-nimbie configuration
 #
-# Search order: ~/.my-nimbie.conf, /etc/my-nimbie.conf, /LINKS/default/my-nimbie
+# Search order: /LINKS/default/my-nimbie.conf, ~/.my-nimbie.conf,
+#               /etc/my-nimbie.conf, /usr/local/etc/my-nimbie.conf
 # Or specify explicitly: my-nimbie --config /path/to/config <command>
 
 [nimbie]
