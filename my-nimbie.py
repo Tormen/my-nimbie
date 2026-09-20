@@ -12,8 +12,8 @@ batch disc processing with configurable commands (e.g. my-handbrake).
 # `my-nimbie stamp-version`, so a copy without a .git beside it can still say
 # what it is.
 __version__ = "v2.2"
-SCRIPT_COMMIT = "22a231e"
-SCRIPT_RELEASE = "v2.2-10-g22a231e"
+SCRIPT_COMMIT = "7980370"
+SCRIPT_RELEASE = "v2.2-11-g7980370"
 __copyleft__ = "Copyleft (ↄ) 2026 Tormen <tormen@mail.ch>"
 __license__ = "All rights reversed."
 
@@ -53,11 +53,14 @@ def _script_describe() -> str:
                      "cat-file", "-e", f"{SCRIPT_COMMIT}^{{commit}}"],
                     capture_output=True, text=True, timeout=5)
                 if own.returncode != 0:
-                    return SCRIPT_RELEASE
+                    return SCRIPT_RELEASE if SCRIPT_COMMIT else ""
             return desc
     except (OSError, subprocess.SubprocessError):
         pass
-    return SCRIPT_RELEASE
+    # The stamp is a PAIR, written together: without SCRIPT_COMMIT there is
+    # no stamp to fall back to, and a lone SCRIPT_RELEASE would be a release
+    # claim nothing backs -- an unstamped file says so.
+    return SCRIPT_RELEASE if SCRIPT_COMMIT else ""
 
 
 def _script_version_string() -> str:
