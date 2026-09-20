@@ -5,9 +5,128 @@ Controls the Nimbie loader/unloader mechanism via USB HID and orchestrates
 batch disc processing with configurable commands (e.g. my-handbrake).
 """
 
-__version__ = "2.2.0"
+# __version__ names the release these bytes are BASED on -- only a release
+# commit sets it.  SCRIPT_COMMIT is the commit this file was released from and
+# SCRIPT_RELEASE what `git describe --tags --long` said then (<nearest
+# tag>-<commits since it>-g<short sha>); both are written by
+# `my-nimbie stamp-version`, so a copy without a .git beside it can still say
+# what it is.
+__version__ = "v2.2"
+SCRIPT_COMMIT = "c2c611e"
+SCRIPT_RELEASE = "v2.2-9-gc2c611e"
 __copyleft__ = "Copyleft (ↄ) 2026 Tormen <tormen@mail.ch>"
 __license__ = "All rights reversed."
+
+
+def _script_build_id() -> str:
+    """First 12 hex of this file's own SHA-256: the value that identifies the
+    bytes, so two installs are compared by running --version on each."""
+    import hashlib
+    try:
+        with open(os.path.realpath(__file__), "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:12]
+    except OSError:
+        return "unknown"
+
+
+def _script_describe() -> str:
+    """git's own `describe --tags --long`, else the stamped value.  Git first:
+    in a checkout it is exact at every moment, while the stamp is written
+    BEFORE the release is tagged and so lags one release step.  A copy with no
+    git beside it has only the stamp."""
+    try:
+        r = subprocess.run(
+            ["git", "-c", "safe.directory=*", "-C",
+             os.path.dirname(os.path.realpath(__file__)),
+             "describe", "--tags", "--long"],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return SCRIPT_RELEASE
+
+
+def _script_version_string() -> str:
+    """What these bytes are: the release they are based on, whether they ARE
+    it, and the id of the bytes themselves.
+
+        my-nimbie v2.2 (v2.2-0-gbf287af: the v2.2 tag, build 1a2b3c4d5e6f)
+        my-nimbie v2.2+8 (v2.2-8-gbf287af: 8 commit(s) past v2.2, unreleased,
+                          build 1a2b3c4d5e6f)
+    """
+    build = _script_build_id()
+    desc = _script_describe()
+    head, _sep, sha = desc.rpartition("-g")
+    tag, _sep2, count = head.rpartition("-")
+    if sha and tag and count.isdigit():
+        n = int(count)
+        if n == 0:
+            return f"my-nimbie {__version__} ({desc}: the {tag} tag, build {build})"
+        return (f"my-nimbie {__version__}+{n} ({desc}: {n} commit(s) past {tag}, "
+                f"unreleased, build {build})")
+    if SCRIPT_COMMIT:
+        return f"my-nimbie {__version__} (commit {SCRIPT_COMMIT}, build {build})"
+    return f"my-nimbie {__version__} (build {build}, unstamped)"
+
+
+def _stamp_version() -> None:
+    """Record HEAD and git's describe string in this file, then AMEND the
+    commit they belong to, so the released bytes carry them.  Run it after
+    committing and BEFORE pushing -- the amend rewrites the commit -- and tag
+    afterwards, or the tag lands on the commit the amend replaced.  The
+    stamped sha lags HEAD by one: a commit cannot contain its own sha."""
+    import re as _re
+    import tempfile
+    self_path = os.path.realpath(__file__)
+    here = os.path.dirname(self_path)
+    rel = os.path.basename(self_path)
+
+    def git(*a: str):
+        return subprocess.run(["git", "-C", here, *a], capture_output=True, text=True)
+
+    def fail(msg: str) -> None:
+        print(f"stamp-version: {msg}", file=sys.stderr)
+        sys.exit(1)
+
+    if git("rev-parse", "--git-dir").returncode != 0:
+        fail("not a git checkout -- nothing to stamp.")
+    sha = git("rev-parse", "--short", "HEAD").stdout.strip()
+    if not sha:
+        fail("no commit to stamp from.")
+    if (git("rev-parse", "--abbrev-ref", "@{upstream}").returncode == 0
+            and git("merge-base", "--is-ancestor", "HEAD", "@{upstream}").returncode == 0):
+        fail("HEAD is already pushed -- amending it would rewrite published history. "
+             "Commit, stamp, THEN push.")
+    staged = git("diff", "--cached", "--name-only").stdout.split()
+    if staged:
+        fail(f"something is staged -- the amend would fold it in: {' '.join(staged)}")
+    if git("diff", "--quiet", "--", rel).returncode != 0:
+        fail("this script has uncommitted edits -- commit them first.")
+
+    desc = git("describe", "--tags", "--long").stdout.strip()
+    with open(self_path) as f:
+        src = f.read()
+    new_src, n1 = _re.subn(r'^SCRIPT_COMMIT\s*=.*$', f'SCRIPT_COMMIT = "{sha}"',
+                           src, count=1, flags=_re.MULTILINE)
+    new_src, n2 = _re.subn(r'^SCRIPT_RELEASE\s*=.*$', f'SCRIPT_RELEASE = "{desc}"',
+                           new_src, count=1, flags=_re.MULTILINE)
+    if n1 != 1 or n2 != 1:
+        fail("could not find the stamp lines.")
+    fd, tmp = tempfile.mkstemp(dir=here, prefix=".my-nimbie.stamp.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(new_src)
+        shutil.copymode(self_path, tmp)
+        os.replace(tmp, self_path)
+    except OSError as e:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        fail(f"could not install the stamped file: {e}")
+    if git("add", "--", rel).returncode != 0 or git("commit", "--amend", "--no-edit").returncode != 0:
+        fail("git add/amend failed.")
+    print(f"stamped SCRIPT_COMMIT={sha} SCRIPT_RELEASE={desc or '<no tag yet>'} -- "
+          f"HEAD is now {git('rev-parse', '--short', 'HEAD').stdout.strip()}")
 
 # ---------------------------------------------------------------------------
 # Venv bootstrap: ensure we run inside a venv with pyusb installed.
@@ -7161,6 +7280,17 @@ For config variables and file format: my-nimbie config --help""")
     _p.epilog = _GLOBAL_EPILOG
 
     # --- version: print version ---
+    sub.add_parser("stamp-version",
+                   formatter_class=_NimbieFormatter,
+                   help=argparse.SUPPRESS,
+                   description="""\
+Record this commit and 'git describe' in the script, then amend that commit,
+so a copy with no git beside it can still say what it is.
+
+  my-nimbie stamp-version
+
+Run it after committing and BEFORE pushing; tag afterwards.""")
+
     sub.add_parser("version",
                    formatter_class=_NimbieFormatter,
                    help=argparse.SUPPRESS,
@@ -7297,9 +7427,13 @@ def main():
 
     # Commands that need no config, no USB
     if args.command == "version":
-        print(f"my-nimbie {__version__}")
+        print(_script_version_string())
         print(__copyleft__)
         print(__license__)
+        return
+
+    if args.command == "stamp-version":
+        _stamp_version()
         return
 
     if args.command == "test":
