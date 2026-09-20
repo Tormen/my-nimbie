@@ -12,8 +12,8 @@ batch disc processing with configurable commands (e.g. my-handbrake).
 # `my-nimbie stamp-version`, so a copy without a .git beside it can still say
 # what it is.
 __version__ = "v2.2"
-SCRIPT_COMMIT = "c2c611e"
-SCRIPT_RELEASE = "v2.2-9-gc2c611e"
+SCRIPT_COMMIT = "22a231e"
+SCRIPT_RELEASE = "v2.2-10-g22a231e"
 __copyleft__ = "Copyleft (ↄ) 2026 Tormen <tormen@mail.ch>"
 __license__ = "All rights reversed."
 
@@ -41,7 +41,20 @@ def _script_describe() -> str:
              "describe", "--tags", "--long"],
             capture_output=True, text=True, timeout=5)
         if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.strip()
+            desc = r.stdout.strip()
+            # describe answers about WHERE this file sits, not about what it
+            # is: a copy dropped in a foreign repo gets THAT repo's tags
+            # (/LINKS/global is one, and it holds the copies update-LINKS
+            # promotes).  The stamped commit is the proof -- a repo that does
+            # not have it is not this tool's repo.
+            if SCRIPT_COMMIT:
+                own = subprocess.run(
+                    ["git", "-c", "safe.directory=*", "-C", os.path.dirname(os.path.realpath(__file__)),
+                     "cat-file", "-e", f"{SCRIPT_COMMIT}^{{commit}}"],
+                    capture_output=True, text=True, timeout=5)
+                if own.returncode != 0:
+                    return SCRIPT_RELEASE
+            return desc
     except (OSError, subprocess.SubprocessError):
         pass
     return SCRIPT_RELEASE
