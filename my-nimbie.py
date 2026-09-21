@@ -12,8 +12,8 @@ batch disc processing with configurable commands (e.g. my-handbrake).
 # `my-nimbie stamp-version`, so a copy without a .git beside it can still say
 # what it is.
 __version__ = "v2.2"
-SCRIPT_COMMIT = "7980370"
-SCRIPT_RELEASE = "v2.2-11-g7980370"
+SCRIPT_COMMIT = "8997c6e"
+SCRIPT_RELEASE = "v2.2-12-g8997c6e"
 __copyleft__ = "Copyleft (ↄ) 2026 Tormen <tormen@mail.ch>"
 __license__ = "All rights reversed."
 
@@ -114,6 +114,12 @@ def _stamp_version() -> None:
             and git("merge-base", "--is-ancestor", "HEAD", "@{upstream}").returncode == 0):
         fail("HEAD is already pushed -- amending it would rewrite published history. "
              "Commit, stamp, THEN push.")
+    # The repo may be SHARED -- other sessions commit here too -- and an amend
+    # rewrites whatever HEAD happens to be.  Stamp only the commit that
+    # carries THIS file: if HEAD does not touch it, HEAD is someone else's.
+    if not git("show", "--name-only", "--format=", "HEAD", "--", rel).stdout.strip():
+        fail("HEAD does not touch this file -- it is not this file's commit "
+             "(commit it first; in a shared repo the amend would rewrite someone else's).")
     staged = git("diff", "--cached", "--name-only").stdout.split()
     if staged:
         fail(f"something is staged -- the amend would fold it in: {' '.join(staged)}")
