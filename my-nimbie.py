@@ -44,7 +44,7 @@ def _script_describe() -> str:
             desc = r.stdout.strip()
             # describe answers about WHERE this file sits, not about what it
             # is: a copy dropped in a foreign repo gets THAT repo's tags
-            # (/LINKS/global is one, and it holds the copies update-LINKS
+            # (/LINKS/global is one, and it holds the copies my-rollout
             # promotes).  The stamped commit is the proof -- a repo that does
             # not have it is not this tool's repo.
             if SCRIPT_COMMIT:
