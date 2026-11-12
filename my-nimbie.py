@@ -518,22 +518,34 @@ _SITE_KEYS: dict[str, str] = {
     "CONFIG_OFFER_NOTE": "config_offer_note"}
 
 
+# python: the text, or None when plainly not there; anything else raises OSError
+def site_conf_text(path: str) -> str | None:
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except FileNotFoundError:
+        if os.path.lexists(path):
+            raise                                # a link to nothing
+        return None
+
+
 def read_site(path: str = SITE_CONF) -> Site:
     """The site's values from the site file, read before the tool's config;
-    the neutral ones (Site()) when it is not there.  The file is PARSED --
-    plain KEY="value" lines, the form a shell tool sources and this one
-    reads alike -- and the environment is never consulted.  There but
-    unreadable is an error: the neutral values would split this user's
-    setup from everyone else's."""
-    if not os.path.lexists(path):
-        return Site()
+    the neutral ones (Site()) when it is plainly not there.  The file is
+    PARSED -- plain KEY="value" lines, the form a shell tool sources and
+    this one reads alike -- and the environment is never consulted.  There
+    but unreadable -- or cannot tell: a folder on the way it cannot search,
+    a link to nothing -- is an error: the neutral values would split this
+    user's setup from everyone else's."""
     try:
-        with open(path, encoding="utf-8") as f:
-            lines = f.read().splitlines()
+        text = site_conf_text(path)
     except OSError as e:
         user = pwd.getpwuid(os.getuid()).pw_name
         err(f"cannot read '{path}' ({e.strerror}) -- the site's directories "
             f"for every tool; its group must include {user}")
+    if text is None:
+        return Site()
+    lines = text.splitlines()
     values: dict[str, str] = {}
     for nr, raw in enumerate(lines, 1):
         line = raw.strip()
@@ -6670,6 +6682,28 @@ class TestSiteConf(unittest.TestCase):
             self.skipTest("running as root: mode 000 is still readable")
         out = self._fails(lambda: find_config_file(self.site, self.site))
         self.assertIn(f"cannot read '{self.site}'", out)
+
+    def test_cannot_tell_is_an_error_absent_is_neutral(self) -> None:
+        # behind a folder it cannot search, "does it exist?" answers no --
+        # the error, never the neutral values; so is a link to nothing
+        locked = os.path.join(self.dir, "locked")
+        os.mkdir(locked)
+        hidden = os.path.join(locked, "site.conf")
+        with open(hidden, "w", encoding="utf-8") as f:
+            f.write('DATA_BASE_DIR="/srv/data"\n')
+        os.chmod(locked, 0)
+        try:
+            if os.access(hidden, os.R_OK):
+                self.skipTest("running as root: mode 000 is still searchable")
+            out = self._fails(lambda: read_site(hidden))
+            self.assertIn(f"cannot read '{hidden}'", out)
+        finally:
+            os.chmod(locked, 0o700)
+        os.symlink(os.path.join(self.dir, "nowhere"), self.site)
+        out = self._fails(lambda: read_site(self.site))
+        self.assertIn(f"cannot read '{self.site}'", out)
+        os.remove(self.site)
+        self.assertEqual(read_site(self.site), Site())
 
     def test_shell_expansion_is_an_error_not_a_literal(self) -> None:
         # a shell tool would expand these; parsed literally they would name a
