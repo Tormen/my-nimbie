@@ -12,8 +12,8 @@ batch disc processing with configurable commands (e.g. my-handbrake).
 # `my-nimbie stamp-version`, so a copy without a .git beside it can still say
 # what it is.
 __version__ = "v2.2"
-SCRIPT_COMMIT = "4247b91"
-SCRIPT_RELEASE = "v2.2-14-g4247b91"
+SCRIPT_COMMIT = "a9c8aca"
+SCRIPT_RELEASE = "v2.2-15-ga9c8aca"
 __copyleft__ = "Copyleft (ↄ) 2026 Tormen <tormen@mail.ch>"
 __license__ = "All rights reversed."
 
@@ -200,9 +200,19 @@ def _bootstrap_venv():
     os.execv(VENV_PYTHON, [VENV_PYTHON] + sys.argv)
 
 
+def _needs_usb(argv: list[str]) -> bool:
+    """Whether this command line can reach the hardware -- the venv exists
+    only for pyusb.  Help, version and --create-config only print or write a
+    file, so they answer even where no venv can be created (a daemon asking
+    --help whether the tool has tests)."""
+    if any(a in ("-h", "--help", "--create-config") for a in argv[1:]):
+        return False
+    return not (len(argv) > 1 and argv[1] in ("help", "version", "--version"))
+
+
 # If we're not already running inside our venv, bootstrap it.
 # Check sys.prefix — inside a venv it points to the venv dir, outside it points to the system python.
-if "--create-config" not in sys.argv:
+if _needs_usb(sys.argv):
     if os.path.realpath(sys.prefix) != os.path.realpath(VENV_DIR):
         if not _venv_has_deps():
             _bootstrap_venv()
@@ -381,7 +391,10 @@ _my-nimbie "$@"
         return  # already configured (by my-plex or earlier run)
 
 
-_install_zsh_completions()
+try:
+    _install_zsh_completions()
+except OSError:
+    pass   # best-effort: a HOME that cannot be written never fails the run
 
 # ---------------------------------------------------------------------------
 # USB constants for Nimbie NB21 (NT21 autoloader controller)
@@ -6658,6 +6671,27 @@ class TestSiteConf(unittest.TestCase):
             self.assertIn("line 1: not a plain KEY=", out, value)
 
 
+class TestNoVenvNeeded(unittest.TestCase):
+    """Help and version answer, rc 0, where no venv can be created: a daemon
+    asks --help whether the tool has tests, as a user whose venv may not
+    exist.  Run with the python BEHIND the venv and a HOME that is a file,
+    so a bootstrap would fail at once (and never reach the network)."""
+
+    def test_help_and_version_need_no_venv(self) -> None:
+        base = getattr(sys, "_base_executable", "") or sys.executable
+        with tempfile.TemporaryDirectory() as d:
+            home = os.path.join(d, "home-is-a-file")
+            open(home, "w").close()
+            env = {"HOME": home, "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+            me = os.path.realpath(__file__)
+            for args in (["--help"], ["-h"], ["help"], ["status", "--help"], ["--version"]):
+                r = subprocess.run([base, "-B", me, *args], capture_output=True, text=True,
+                                   env=env, timeout=60)
+                self.assertEqual(r.returncode, 0, f"{args}: rc {r.returncode}: {r.stderr[:300]}")
+                self.assertNotIn("Creating python virtualenv", r.stdout + r.stderr, args)
+                self.assertIn("my-nimbie", r.stdout, args)
+
+
 def _run_tests():
     """Run unit tests."""
     loader = unittest.TestLoader()
@@ -6683,6 +6717,7 @@ def _run_tests():
         TestCheckExistingDir,
         TestVerifyDiscRead,
         TestSiteConf,
+        TestNoVenvNeeded,
     ]
     for cls in test_classes:
         suite.addTests(loader.loadTestsFromTestCase(cls))
