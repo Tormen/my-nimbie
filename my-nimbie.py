@@ -5,6 +5,10 @@ Controls the Nimbie loader/unloader mechanism via USB HID and orchestrates
 batch disc processing with configurable commands (e.g. my-handbrake).
 """
 
+# Annotations are not evaluated at run time: help and version also run
+# outside the venv, on whatever python3 is first on the PATH.
+from __future__ import annotations
+
 # __version__ names the release these bytes are BASED on -- only a release
 # commit sets it.  SCRIPT_COMMIT is the commit this file was released from and
 # SCRIPT_RELEASE what `git describe --tags --long` said then (<nearest
@@ -12,8 +16,8 @@ batch disc processing with configurable commands (e.g. my-handbrake).
 # `my-nimbie stamp-version`, so a copy without a .git beside it can still say
 # what it is.
 __version__ = "v2.2"
-SCRIPT_COMMIT = "a9c8aca"
-SCRIPT_RELEASE = "v2.2-15-ga9c8aca"
+SCRIPT_COMMIT = "9009705"
+SCRIPT_RELEASE = "v2.2-16-g9009705"
 __copyleft__ = "Copyleft (ↄ) 2026 Tormen <tormen@mail.ch>"
 __license__ = "All rights reversed."
 
@@ -210,17 +214,18 @@ def _needs_usb(argv: list[str]) -> bool:
     return not (len(argv) > 1 and argv[1] in ("help", "version", "--version"))
 
 
-# If we're not already running inside our venv, bootstrap it.
+# Run inside our venv whenever it is there -- every command then runs on the
+# same python -- and create it only for a command that needs USB.
 # Check sys.prefix — inside a venv it points to the venv dir, outside it points to the system python.
-if _needs_usb(sys.argv):
-    if os.path.realpath(sys.prefix) != os.path.realpath(VENV_DIR):
-        if not _venv_has_deps():
-            _bootstrap_venv()
-        # Venv exists and has deps — re-exec inside it
+if os.path.realpath(sys.prefix) != os.path.realpath(VENV_DIR):
+    if not _venv_has_deps() and _needs_usb(sys.argv):
+        _bootstrap_venv()
+    if _venv_has_deps():
         os.execv(VENV_PYTHON, [VENV_PYTHON] + sys.argv)
 
 # ---------------------------------------------------------------------------
-# From here on we are guaranteed to run inside the venv with pyusb available
+# From here on we run inside the venv with pyusb available -- or, where there
+# is no venv, a command that needs no USB, on whatever python3 started us
 # ---------------------------------------------------------------------------
 
 import argparse
@@ -5588,19 +5593,23 @@ NAMING_VARS_HELP = """\
 class _NimbieFormatter(argparse.RawDescriptionHelpFormatter):
     """Custom formatter: short options same cyan as long options; command names green in description."""
 
-    def _set_color(self, color):
-        super()._set_color(color)
-        import dataclasses
-        self._theme = dataclasses.replace(
-            self._theme,
-            short_option=self._theme.long_option,
-            summary_short_option=self._theme.summary_long_option,
-        )
+    def _set_color(self, *args: object, **kwargs: object) -> None:
+        super()._set_color(*args, **kwargs)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]  # argparse's private API, 3.14+
+        # argparse's theme is private: only where it is a plain dataclass
+        # attribute (3.14) is it recoloured; elsewhere (3.15 computes it
+        # lazily) the default colours stay
+        theme = self.__dict__.get("_theme")
+        if dataclasses.is_dataclass(theme) and not isinstance(theme, type):
+            self._theme = dataclasses.replace(
+                theme,
+                short_option=getattr(theme, "long_option"),
+                summary_short_option=getattr(theme, "summary_long_option"),
+            )
 
     def _format_text(self, text):
         result = super()._format_text(text)
-        t = self._theme
-        if not t.action:
+        t = getattr(self, "_theme", None)   # none before 3.14: no colours at all
+        if t is None or not t.action:
             return result
         # Colorize non-indented section headings (lines containing ':') with heading color
         result = re.sub(
@@ -6672,24 +6681,45 @@ class TestSiteConf(unittest.TestCase):
 
 
 class TestNoVenvNeeded(unittest.TestCase):
-    """Help and version answer, rc 0, where no venv can be created: a daemon
-    asks --help whether the tool has tests, as a user whose venv may not
-    exist.  Run with the python BEHIND the venv and a HOME that is a file,
-    so a bootstrap would fail at once (and never reach the network)."""
+    """Help and version answer, rc 0, where no venv can be created -- on
+    every python3 a PATH may hold: a daemon asks --help whether the tool has
+    tests, as a user whose venv may not exist.  A HOME that is a file makes a
+    bootstrap fail at once (and never reach the network).  Where the venv IS
+    there, help runs in it, like every other command."""
 
-    def test_help_and_version_need_no_venv(self) -> None:
+    ARGS = (["--help"], ["-h"], ["help"], ["status", "--help"], ["--version"])
+
+    def _run(self, py: str, home: str, args: list[str]) -> subprocess.CompletedProcess[str]:
+        env = {"HOME": home, "PATH": "/usr/bin:/bin"}
+        return subprocess.run([py, "-B", os.path.realpath(__file__), *args],
+                              capture_output=True, text=True, env=env, timeout=60)
+
+    def test_help_and_version_need_no_venv_on_any_python(self) -> None:
         base = getattr(sys, "_base_executable", "") or sys.executable
+        pythons = [base] + [p for p in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+                                        "/usr/bin/python3") if os.access(p, os.X_OK)]
         with tempfile.TemporaryDirectory() as d:
             home = os.path.join(d, "home-is-a-file")
             open(home, "w").close()
-            env = {"HOME": home, "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
-            me = os.path.realpath(__file__)
-            for args in (["--help"], ["-h"], ["help"], ["status", "--help"], ["--version"]):
-                r = subprocess.run([base, "-B", me, *args], capture_output=True, text=True,
-                                   env=env, timeout=60)
-                self.assertEqual(r.returncode, 0, f"{args}: rc {r.returncode}: {r.stderr[:300]}")
-                self.assertNotIn("Creating python virtualenv", r.stdout + r.stderr, args)
-                self.assertIn("my-nimbie", r.stdout, args)
+            for py in pythons:
+                for args in self.ARGS:
+                    r = self._run(py, home, args)
+                    self.assertEqual(r.returncode, 0, f"{py} {args}: rc {r.returncode}: {r.stderr[-400:]}")
+                    self.assertNotIn("Creating python virtualenv", r.stdout + r.stderr, (py, args))
+                    self.assertIn("my-nimbie", r.stdout, (py, args))
+
+    def test_help_runs_in_the_venv_when_it_is_there(self) -> None:
+        base = getattr(sys, "_base_executable", "") or sys.executable
+        with tempfile.TemporaryDirectory() as home:
+            venv = os.path.join(home, ".python.venv", "my-nimbie")
+            os.makedirs(os.path.join(venv, "lib", "python3", "site-packages", "usb"))
+            os.makedirs(os.path.join(venv, "bin"))
+            fake = os.path.join(venv, "bin", "python3")
+            with open(fake, "w") as f:
+                f.write('#!/bin/sh\necho "the venv ran: $*"\n')
+            os.chmod(fake, 0o755)
+            r = self._run(base, home, ["--help"])
+            self.assertIn("the venv ran:", r.stdout, r.stderr[-400:])
 
 
 def _run_tests():
