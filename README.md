@@ -182,14 +182,20 @@ mounted and my-nimbie waits for an interactive command (`accept`, `reject`, `ret
 
 ## Configuration
 
-Config file search order:
+Config file search order (first found wins):
 
-1. `/LINKS/default/my-nimbie.conf` — primary system-wide location
-2. `/LINKS/default/my-nimbie` — legacy, suffix-less name; kept so an existing
-   install keeps working
-3. `~/.my-nimbie.conf`
-4. `/etc/my-nimbie.conf`
-5. `/usr/local/etc/my-nimbie.conf`
+1. `$CONFIG_SEARCH_DIR/my-nimbie.conf`, then `$CONFIG_SEARCH_DIR/my-nimbie`
+2. `~/.my-nimbie.conf`
+3. `/etc/my-nimbie.conf`
+4. `/usr/local/etc/my-nimbie.conf`
+
+`/LINKS/default/site.conf`, when it exists, is read first — plain
+`KEY="value"` lines, parsed, never executed. It gives `CONFIG_SEARCH_DIR`
+(without the file, no such directory is searched), and `CONFIG_OFFER_DIR`
+with `CONFIG_OFFER_NOTE`: when no config is found, the tool offers to write
+one there (only while `CONFIG_SEARCH_DIR` is searched), then in `/etc`, then
+in `~`. There but unreadable is an error. Environment variables are never
+read for any of this.
 
 Or specify explicitly: `my-nimbie --config /path/to/config <command>`
 

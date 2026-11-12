@@ -1,6 +1,7 @@
 # my-nimbie configuration
 #
-# Search order: ~/.my-nimbie.conf, /etc/my-nimbie.conf, /LINKS/default/my-nimbie
+# Search order: $CONFIG_SEARCH_DIR/my-nimbie.conf (from /LINKS/default/site.conf),
+#   ~/.my-nimbie.conf, /etc/my-nimbie.conf, /usr/local/etc/my-nimbie.conf
 # Or specify explicitly: my-nimbie --config /path/to/config <command>
 
 [nimbie]

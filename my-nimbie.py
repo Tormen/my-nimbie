@@ -12,8 +12,8 @@ batch disc processing with configurable commands (e.g. my-handbrake).
 # `my-nimbie stamp-version`, so a copy without a .git beside it can still say
 # what it is.
 __version__ = "v2.2"
-SCRIPT_COMMIT = "8997c6e"
-SCRIPT_RELEASE = "v2.2-12-g8997c6e"
+SCRIPT_COMMIT = "4247b91"
+SCRIPT_RELEASE = "v2.2-14-g4247b91"
 __copyleft__ = "Copyleft (ↄ) 2026 Tormen <tormen@mail.ch>"
 __license__ = "All rights reversed."
 
@@ -215,12 +215,15 @@ if "--create-config" not in sys.argv:
 
 import argparse
 import configparser
+import dataclasses
 import datetime
+import pwd
 import re
 import shutil
 import signal
 import threading
 import time
+from typing import Callable, NoReturn
 
 # ---------------------------------------------------------------------------
 # Zsh completions: install/update on every run (fast no-op if unchanged)
@@ -475,17 +478,105 @@ DEFAULT_CONFIG = {
     },
 }
 
-CONFIG_SEARCH_PATHS = [
-    # Primary system-wide location, searched FIRST. Spelled out on purpose: a
-    # search keyed on a value that lives inside a config file cannot find that
-    # file. The legacy suffix-less name is kept behind it so an existing
-    # install keeps working.
-    "/LINKS/default/my-nimbie.conf",
-    "/LINKS/default/my-nimbie",
-    os.path.expanduser("~/.my-nimbie.conf"),
-    "/etc/my-nimbie.conf",
-    "/usr/local/etc/my-nimbie.conf",
-]
+SITE_CONF = "/LINKS/default/site.conf"   # the ONE site path in this tool: read_site()
+
+_SITE_LINE = re.compile(
+    r"""^([A-Z_][A-Z0-9_]*)=(?:"([^"$`\\]*)"|'([^']*)'|([^\s"'$`\\#]*))\s*(?:\#.*)?$""")
+
+
+@dataclasses.dataclass(frozen=True)
+class Site:
+    """The site's values for every tool.  Empty search/offer dir: none."""
+    data_base_dir: str = "/var/db"
+    log_base_dir: str = "/var/log"
+    config_search_dir: str = ""
+    config_offer_dir: str = ""
+    config_offer_note: str = ""
+
+
+_SITE_KEYS: dict[str, str] = {
+    "DATA_BASE_DIR": "data_base_dir", "LOG_BASE_DIR": "log_base_dir",
+    "CONFIG_SEARCH_DIR": "config_search_dir", "CONFIG_OFFER_DIR": "config_offer_dir",
+    "CONFIG_OFFER_NOTE": "config_offer_note"}
+
+
+def read_site(path: str = SITE_CONF) -> Site:
+    """The site's values from the site file, read before the tool's config;
+    the neutral ones (Site()) when it is not there.  The file is PARSED --
+    plain KEY="value" lines, the form a shell tool sources and this one
+    reads alike -- and the environment is never consulted.  There but
+    unreadable is an error: the neutral values would split this user's
+    setup from everyone else's."""
+    if not os.path.lexists(path):
+        return Site()
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        user = pwd.getpwuid(os.getuid()).pw_name
+        err(f"cannot read '{path}' ({e.strerror}) -- the site's directories "
+            f"for every tool; its group must include {user}")
+    values: dict[str, str] = {}
+    for nr, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _SITE_LINE.match(line)
+        if m is None:
+            err(f"'{path}' line {nr}: not a plain KEY=\"value\" line "
+                f"(no $, no backquote): {line}")
+        field = _SITE_KEYS.get(m.group(1))
+        if field is not None:   # a key only other tools read is not this one's business
+            values[field] = next(g for g in m.groups()[1:] if g is not None)
+    return Site(**values)
+
+
+def config_search_paths(site: Site) -> list[str]:
+    """Where the config is searched, first found wins: the site's search
+    directory (<tool>.conf, then the bare <tool>), then ~, /etc,
+    /usr/local/etc."""
+    paths: list[str] = []
+    if site.config_search_dir:
+        paths += [os.path.join(site.config_search_dir, "my-nimbie.conf"),
+                  os.path.join(site.config_search_dir, "my-nimbie")]
+    return paths + [os.path.expanduser("~/.my-nimbie.conf"),
+                    "/etc/my-nimbie.conf", "/usr/local/etc/my-nimbie.conf"]
+
+
+def config_offer_paths(site: Site) -> list[str]:
+    """Where "no config found" offers to write one, most common place first,
+    naming only paths the search reads: the site's offer directory -- only
+    while the site's search directory is searched, which a file there
+    reaches as its note says; never the search directory itself, a
+    generated farm -- then /etc, then ~."""
+    offers: list[str] = []
+    if site.config_offer_dir and site.config_search_dir:
+        offers.append(os.path.join(site.config_offer_dir, "my-nimbie.conf"))
+    searched = config_search_paths(site)
+    return offers + [p for p in ("/etc/my-nimbie.conf", os.path.expanduser("~/.my-nimbie.conf"))
+                     if p in searched]
+
+
+def no_config_offer(site: Site) -> str:
+    """The "no config found" text: each offered place a paste-ready line,
+    the site's note beside its own place."""
+    lines = ["No config file found -- write one, most common place first:"]
+    for path in config_offer_paths(site):
+        note = ""
+        if site.config_offer_note and os.path.dirname(path) == site.config_offer_dir:
+            note = f"   ({site.config_offer_note})"
+        lines.append(f"    > my-nimbie --create-config {path}{note}")
+    lines.append("  (--help: the full search order)")
+    return "\n".join(lines)
+
+
+# The search order for --help, `config` and the example config: one text.
+CONFIG_SEARCH_ORDER_HELP = f"""\
+  --config FILE; else the first found of $CONFIG_SEARCH_DIR/my-nimbie.conf,
+  $CONFIG_SEARCH_DIR/my-nimbie, ~/.my-nimbie.conf, /etc/my-nimbie.conf,
+  /usr/local/etc/my-nimbie.conf.
+  {SITE_CONF}, when there, is read first: it gives CONFIG_SEARCH_DIR
+  (not searched without the file). There but unreadable: an error."""
 
 DEFAULT_CONFIG_PATH = os.path.expanduser("~/.my-nimbie.conf")
 
@@ -1020,7 +1111,7 @@ def ddbg(text):
         else:
             print(f"{_ts()}| DDBG: {text}", file=sys.stderr)
 
-def err(text, code=1):
+def err(text: str, code: int = 1) -> NoReturn:
     print(f"\n  ERROR: {text}\n", file=sys.stderr)
     sys.exit(code)
 
@@ -1106,24 +1197,21 @@ def _setup_log_tee(logpath):
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-def find_config_file(explicit_path=None):
-    """Find config file. Explicit path > search paths."""
+def find_config_file(explicit_path: str | None = None, site_conf: str = SITE_CONF) -> str:
+    """Find config file. Explicit path > search paths.  The site file is
+    read first either way, so an unreadable one is never silently skipped."""
+    site = read_site(site_conf)
     if explicit_path:
         if not os.path.isfile(explicit_path):
             err(f"Config file not found: {explicit_path}")
         return explicit_path
 
-    for path in CONFIG_SEARCH_PATHS:
+    for path in config_search_paths(site):
         if os.path.isfile(path):
             dbg(f"Using config: {path}")
             return path
 
-    search_list = "\n".join(f"    - {p}" for p in CONFIG_SEARCH_PATHS)
-    err(f"No config file found.\n\n"
-        f"  Searched:\n{search_list}\n\n"
-        f"  Create one with:\n"
-        f"    my-nimbie --create-config                  → {DEFAULT_CONFIG_PATH}\n"
-        f"    my-nimbie --create-config /custom/path")
+    err(no_config_offer(site))
 
 
 def load_config(config_path):
@@ -1143,12 +1231,12 @@ def load_config(config_path):
 
 def generate_example_config():
     """Return the example config file content as a string."""
+    order = "\n".join("#" + line[1:] for line in CONFIG_SEARCH_ORDER_HELP.splitlines())
     return """\
 # my-nimbie configuration
 #
-# Search order: /LINKS/default/my-nimbie.conf, ~/.my-nimbie.conf,
-#               /etc/my-nimbie.conf, /usr/local/etc/my-nimbie.conf
-# Or specify explicitly: my-nimbie --config /path/to/config <command>
+# Search order:
+""" + order + """
 
 [nimbie]
     # USB device identifiers (use system_profiler SPUSBDataType to verify)
@@ -6470,6 +6558,106 @@ class TestVerifyDiscRead(unittest.TestCase):
             os.unlink(rf)
 
 
+class TestSiteConf(unittest.TestCase):
+    """The site file: its values when it is there, the neutral ones when it
+    is not -- an exported variable never in their place -- an error when it
+    is there but unreadable or not plain; the search reads its directory
+    first, both names; the offer names only searched paths -- the site's
+    offer directory with its note, never the farm."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = self._tmp.name
+        self.site = os.path.join(self.dir, "site.conf")
+        self.farm = os.path.join(self.dir, "farm")
+        self.offer = os.path.join(self.dir, "global")
+        os.mkdir(self.farm)
+
+    def tearDown(self) -> None:
+        if os.path.exists(self.site):
+            os.chmod(self.site, 0o600)
+        self._tmp.cleanup()
+
+    def _write(self, *lines: str) -> None:
+        with open(self.site, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def _fails(self, fn: Callable[[], object]) -> str:
+        """Run fn, which must end in err(); return what err printed."""
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf), self.assertRaises(SystemExit) as cm:
+            fn()
+        self.assertEqual(cm.exception.code, 1)
+        return buf.getvalue()
+
+    def test_no_file_neutral_values_never_the_environment(self) -> None:
+        old = os.environ.get("DATA_BASE_DIR")
+        os.environ["DATA_BASE_DIR"] = "/elsewhere"
+        try:
+            site = read_site(self.site)
+        finally:
+            if old is None:
+                del os.environ["DATA_BASE_DIR"]
+            else:
+                os.environ["DATA_BASE_DIR"] = old
+        self.assertEqual(site, Site("/var/db", "/var/log", "", "", ""))
+        self.assertEqual(config_search_paths(site)[0], os.path.expanduser("~/.my-nimbie.conf"))
+
+    def test_file_values_and_search_finds_the_bare_name(self) -> None:
+        self._write("# a comment", 'DATA_BASE_DIR="/srv/data"', "LOG_BASE_DIR='/srv/log'",
+                    f'CONFIG_SEARCH_DIR="{self.farm}"', f'CONFIG_OFFER_DIR="{self.offer}"  # trailing',
+                    'CONFIG_OFFER_NOTE="linked there by a run"', 'OTHER_TOOLS_KEY="ignored"',
+                    '# CONFIG_SEARCH_DIR="/commented/out"')
+        site = read_site(self.site)
+        self.assertEqual(site, Site("/srv/data", "/srv/log", self.farm, self.offer, "linked there by a run"))
+        self.assertEqual(config_search_paths(site)[:2],
+                         [f"{self.farm}/my-nimbie.conf", f"{self.farm}/my-nimbie"])
+        open(f"{self.farm}/my-nimbie", "w").close()
+        self.assertEqual(find_config_file(None, self.site), f"{self.farm}/my-nimbie")
+
+    def test_offer_names_only_searched_paths_never_the_farm(self) -> None:
+        for case in ("site", "offer-only", "none"):
+            if case == "site":
+                self._write(f'CONFIG_SEARCH_DIR="{self.farm}"', f'CONFIG_OFFER_DIR="{self.offer}"',
+                            'CONFIG_OFFER_NOTE="linked there by a run"')
+            elif case == "offer-only":   # a file written there would be read from nowhere
+                self._write(f'CONFIG_OFFER_DIR="{self.offer}"')
+            else:
+                os.remove(self.site)
+            site = read_site(self.site)
+            searched = config_search_paths(site)
+            for path in config_offer_paths(site):
+                self.assertFalse(path.startswith(self.farm + "/"), f"{case}: offered the farm {path}")
+                if path != f"{self.offer}/my-nimbie.conf":
+                    self.assertIn(path, searched, f"{case}: offered, not searched")
+                else:
+                    self.assertIn(f"{self.farm}/my-nimbie.conf", searched, f"{case}: offer reaches nothing")
+            self.assertEqual(f"{self.offer}/my-nimbie.conf" in config_offer_paths(site), case == "site", case)
+        self._write(f'CONFIG_SEARCH_DIR="{self.farm}"', f'CONFIG_OFFER_DIR="{self.offer}"',
+                    'CONFIG_OFFER_NOTE="linked there by a run"')
+        text = no_config_offer(read_site(self.site))
+        self.assertIn(f"    > my-nimbie --create-config {self.offer}/my-nimbie.conf   (linked there by a run)", text)
+        self.assertIn("    > my-nimbie --create-config /etc/my-nimbie.conf\n", text)
+
+    def test_unreadable_is_an_error_even_with_config(self) -> None:
+        self._write(f'CONFIG_SEARCH_DIR="{self.farm}"')
+        os.chmod(self.site, 0)
+        if os.access(self.site, os.R_OK):
+            self.skipTest("running as root: mode 000 is still readable")
+        out = self._fails(lambda: find_config_file(self.site, self.site))
+        self.assertIn(f"cannot read '{self.site}'", out)
+
+    def test_shell_expansion_is_an_error_not_a_literal(self) -> None:
+        # a shell tool would expand these; parsed literally they would name a
+        # directory no shell tool sees -- refused, never silently different
+        for value in ('"$HOME/conf"', '"$(id -un)"', '`id -un`', '$HOME'):
+            self._write(f"CONFIG_SEARCH_DIR={value}")
+            out = self._fails(lambda: read_site(self.site))
+            self.assertIn("line 1: not a plain KEY=", out, value)
+
+
 def _run_tests():
     """Run unit tests."""
     loader = unittest.TestLoader()
@@ -6494,6 +6682,7 @@ def _run_tests():
         TestLiftDiscAt_S03Recovery,
         TestCheckExistingDir,
         TestVerifyDiscRead,
+        TestSiteConf,
     ]
     for cls in test_classes:
         suite.addTests(loader.loadTestsFromTestCase(cls))
@@ -6684,9 +6873,7 @@ def cmd_monitor(_nimbie, _config, args):
 
 CONFIG_VARS_HELP = f"""\
 Config file locations (searched in order):
-  1. {CONFIG_SEARCH_PATHS[0]}
-  2. {CONFIG_SEARCH_PATHS[1]}
-  3. {CONFIG_SEARCH_PATHS[2]}
+{CONFIG_SEARCH_ORDER_HELP}
 
 Create a template:
   my-nimbie create-config               → {DEFAULT_CONFIG_PATH}
@@ -6803,9 +6990,7 @@ EXAMPLES:
   my-nimbie create-config                 Create example config at {DEFAULT_CONFIG_PATH}
 
 CONFIG FILE SEARCH ORDER:
-  1. {CONFIG_SEARCH_PATHS[0]}
-  2. {CONFIG_SEARCH_PATHS[1]}
-  3. {CONFIG_SEARCH_PATHS[2]}
+{CONFIG_SEARCH_ORDER_HELP}
 
 BATCH FLAVORS:
   ripdvd      → [commands] on_load_RIP_DVD      [target_dirs] rip_dvd
